@@ -137,7 +137,26 @@ Windows 宽屏三栏 ↔ Android 单栏堆叠，用响应式断点 + 路由布�
 
 ---
 
-## 复审条件
+## 后续偏离（2026-10-30）
+
+本 ADR 的**核心决策**（Tauri 2 + React 19 + TypeScript，业务逻辑全在 Rust 侧）**不变且成立**。
+但**具体的前端选型在实际推进中被偏离**——记录在这里，避免后来人按上面的文字去找不存在的依赖：
+
+| 原决策 | 实际 | 原因 |
+|---|---|---|
+| TanStack Query / Router / Zustand | **都没用**，状态用 React 内置 state | 「前端不加第三方依赖」+ 单人维护节奏 |
+| Tailwind CSS 4 + shadcn/ui (Radix) | **都没用**，样式用原生 CSS | 同上 |
+| TanStack Virtual | **没用**，邮件列表未虚拟化 | 同上；代价是万级列表会卡（待补） |
+| TipTap (ProseMirror) | **没用**，自写 `contentEditable` + `document.execCommand` | 同上；代价是编辑器功能有限 |
+| SMTP 用 `lettre` | **没用**，自研 SMTP 协议层（rustls + x509-parser） | 需要探证书链、探能力集、控制提交路径的每一步 |
+| HTML 邮件在 sandbox iframe 中渲染 | **未实现**，后端消毒后直接渲染进 DOM | 原始 HTML 不出后端 + CSP `img-src` 不含远程来源；代价是消毒器一旦漏网就直接在应用上下文生效（见 [SECURITY §3.0](../SECURITY.md)） |
+
+**这不代表 ADR 被推翻**：选 Tauri + React 的理由（§理由 1–5）依然成立。
+变的是「具体用哪个 UI 库」，而那部分本来就写着「前端栈锁定」——
+锁定的是**方向**（Web 生态），不是**清单**。
+当前实际依赖见 [README 技术栈表](../../README.md)。
+
+---
 
 出现以下任一情况时重新评估：
 

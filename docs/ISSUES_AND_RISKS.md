@@ -6,20 +6,20 @@
 
 ## 1. 事实、推断、待验证
 
-- **仓库事实**（2026-10-23）：workspace 有 10 个 crate——`xremail-core` / `xremail-store` /
+- **仓库事实**（2026-10-30）：workspace 有 10 个 crate——`xremail-core` / `xremail-store` /
   `xremail-crypto` / `xremail-api` / `xremail-sync` / `xremail-protocol-imap` /
-  `xremail-message` / `xremail-testkit` / `xremail-diagnostics` + Tauri shell。
-  SQLite 迁移与 DAO、同步引擎的**拉取与回写**链路、IMAP 协议层、假 IMAP 服务器均已落地；
-  **收发仍未实现**（SMTP 一行没写）。
+  `xremail-protocol-smtp` / `xremail-message` / `xremail-testkit` / `xremail-diagnostics` + Tauri shell。
+  SQLite 迁移与 DAO、同步引擎的**拉取与回写**链路、IMAP 与 SMTP 协议层、假 IMAP / SMTP 服务器、
+  FTS5 全文索引、HTML 消毒均已落地；**收发均已实现**（163 ↔ QQ 真实收发往返已验收）。
 - **实测事实**：163 / QQ / 沃三家真实邮箱均已只读实测（TLS、能力集、IDLE/MOVE/CONDSTORE、
   UID 空间、字符集、文件夹角色），记录见 [PROTOCOLS.md](PROTOCOLS.md)。
   30 封真实邮件用 `xremail-message` 解析，**解码零错误**。
-- **规划**：发送（P3）、平台适配（P4）、标签/规则（P5）、L2 远端同步（P6）**都不是已交付功能**。
-- **外部未知**：SMTP 服务器参数与提交行为、并发连接限制、Android 后台行为——
+- **规划**：平台适配（P4）、标签/规则（P5）、L2 远端同步（P6）**都不是已交付功能**。
+- **外部未知**：并发连接限制、Android 后台行为——
   必须用注明环境的实测建立证据。
-- `cargo test` 现在有 **387 个用例**（2026-10-23），六关本地全绿。
-  但**本地全绿 ≠ CI 跑绿**：仓库有 13 个提交**从未推送**，
-  CI 从未在这批代码上执行过（见 R14、R17）。
+- `cargo test` 现在有 **687 个用例**（2026-10-30），六关本地全绿；
+  前端另有 **67 个用例**（12 个文件）。
+  CI **四个 job 全绿**（Rust ubuntu / Rust windows / Frontend / Docs sanity），R17 已处理。
 - 2026-10-20 复核：Rust 1.99.1 / Node 22.21.0 / 本机仅 JDK 8 且无 Android SDK → **Android 构建在本机暂不可行**（P4 需先装 JDK 17 + SDK/NDK）。
 
 ## 2. 对上一版审查的纠错
@@ -59,7 +59,7 @@
 | R11 | 范围治理 | 文档把计划当事实，旧策略与新范围冲突 | 中 | ROADMAP 为执行范围入口；旧报告标废止；变更附验收证据 | 本轮修订 |
 | R12 | 可选扩展 | L2 接口过早冻结、远端冲突与密钥恢复未定义 | 中 | P0 最小契约 + mock；P6 前另做威胁模型，不承诺零返工 | **部分实现**（契约 + CAS mock + 双设备竞争用例已就位；远端密钥恢复仍未定义，P6 前另做威胁模型） |
 | R13 | 运行平台 | release profile 用 `panic = "abort"`，后台同步任务 panic 会杀掉整个应用 | 中 | **已决策（2026-10-22）**：改为 `unwind`；配套要求后台 task 边界 `catch_unwind`，待 `xremail-sync` 落地时实现 | **部分实现**：profile 已改 `unwind`；**后台 task 边界还没建**（调度器未开始），`catch_unwind` 暂无落点 |
-| R14 | 工程验证 | CI 无业务测试，静态检查通过不代表行为正确 | 高 | 按 [TESTING_STRATEGY §5](TESTING_STRATEGY.md) 的 T1–T10 顺序扩写用例；每阶段出口要求对应测试；用例数作为进度指标写入 CHANGELOG | **进行中**：T1–T5 已扩写（421 个用例），T7 的假服务器已就位；CI 已在 2026-10-26 的代码上**跑绿**（R17 已处理） |
+| R14 | 工程验证 | CI 无业务测试，静态检查通过不代表行为正确 | 高 | 按 [TESTING_STRATEGY §5](TESTING_STRATEGY.md) 的 T1–T10 顺序扩写用例；每阶段出口要求对应测试；用例数作为进度指标写入 CHANGELOG | **进行中**：T1–T8 已扩写（Rust **687** 个用例，2026-10-30）、T6 / T7 转完成、T9 部分（前端 **67** 个用例 / 12 个文件，**Playwright E2E 未开始**）、T10 fuzz 未开始；CI 四个 job 全绿（R17 已处理） |
 | R17 | 工程交付 | 13 个提交**从未推送到 GitHub**：全部成果只在本机磁盘上 | 高 | 推送前做 `git ls-remote` / `gh auth status` 连通性探测（本机 github.com 的 DNS 常被劫持到 127.0.0.1）；推送后核对远端提交号 | **已处理**（2026-10-26）：推送前探测通过（`git ls-remote` + `gh auth status`），推送后核对远端提交号 = 本地 HEAD；CI 在 `975ffda` 上**四个 job 全绿** |
 | R18 | 外部接入 | 三家的 **SMTP** 服务器参数与提交行为未实测 | 高 | 同 R01/R02；重点测授权码认证、`STARTTLS` 语义、`8BITMIME`、发信后的 `APPEND` 行为 | **已实测**（2026-10-29，**真发了信**）：163 ✅（TLS 1.3、`AUTH LOGIN` 成功，`250 Mail OK queued as …`）、QQ ✅（TLS 1.2、`AUTH LOGIN` 成功，`250 OK: queued as.`——**queue id 是空的**）、沃 ❌（**服务器只收静态 RSA 套件，rustls 连不上**）、126 ⏳（本机无 126 账号）。**双向真发信已跑通**（163 → QQ、QQ → 163）：对方都收到了，正文标记核对一致。**「发信后存副本」已探明并实现**（2026-10-30）：**两家服务器都自己存副本**——163 提交后几乎立刻可见，QQ 要 **30–90 秒**才落盘（第一次实测查得太早，误记成「QQ 不存」）；QQ 还会**改写 `Message-ID`**（原值挪到 `X-OQ-MSGID`）。协议层 `APPEND` **已实现**（`crates/xremail-protocol-imap/src/append.rs`），服务层按「先查、没有才 `APPEND`」自适应执行，QQ 拒绝重复 `APPEND` 时按「已有一份」处理。验收用例 `apps/shell/src-tauri/tests/real_mail_roundtrip.rs` 断言**两个方向的「已发送」都正好一份**（轮询等满 120 秒） |
 | R21 | 外部接入 | 沃邮箱的 **SMTP 侧在 rustls 上不可用**：服务器只接受静态 RSA 密钥交换套件（`TLS_RSA_WITH_*`），rustls 只支持 ECDHE/PSK | 中 | 换 TLS 栈：可选的系统原生 TLS 后端（SChannel / OpenSSL）或 `native-tls` 单独一个 SMTP 后端；**不得**用「跳过证书校验」来绕过 | **待决策**（2026-10-28 实测确认，交叉验证：openssl 协商出 `TLS_RSA_WITH_AES_128_GCM_SHA256`）。P3 首发只做 163 / QQ；沃的发信单列。**「换 TLS 版本」这条路已排除**：发信路径里的 TLS 1.3→1.2 回退对沃无效——问题在**密钥交换套件**，不在版本 |
@@ -67,7 +67,7 @@
 | R20 | 协议层 | 两个**只有真实邮箱才暴露**的 IMAP 陷阱：① `EXAMINE` 只认**线路原名**（modified UTF-7），拿解码后的名字去访问会得到 `NO EXAMINE Folder not exist`；② **UID 是邮箱作用域**的，会话停在另一个文件夹时 `UID FETCH <uid>` 返回**空结果**而不是报错 | 高 | 库里存线路原名、显示时再解码（`FolderDto`）；拉正文前先 `EXAMINE` 对应文件夹；两条都有回归用例 | 已缓解（2026-10-26，均由真实 163/QQ/沃 同步暴露） |
 | R16 | 协议层 | imap-proto 0.17 **不认识** `MODIFIED` 这个 response code（它的 `ResponseCode` 枚举里没有），且对未知 code 用 `opt()` 解析——整个 `[MODIFIED] …` 会落进 information 文本。所以条件写失败只能**按文本判别**，拿不到结构化的 code | 中 | 协议层新增 `ProtocolError::ConditionFailed`，按文本判别并写进注释；将来升级 imap-proto 时复核 | 已缓解 |
 | R15 | 协议层 | async-imap 0.12 **吞掉**服务器回的 `NO` / `BAD`：`uid_fetch` / `uid_store` / `uid_search` 在服务器拒绝时返回 `Ok`（只是结果为空），同步引擎会把「服务器拒绝了」当成「写成功了」，本地状态与远端悄悄分叉 | **高** | 新增安全命令层 `xremail_protocol_imap::run_checked`（自己读响应、自己判定 OK/NO/BAD，错误带 response code）；**同步引擎一律用它，不用 async-imap 的同名方法**；已用假服务器把该行为钉成用例 | 已缓解（同步引擎已全面改用 `run_checked`；用例：`server_rejection_is_an_error_not_a_mass_delete`） |
-| R23 | 协议层 | **163 的 IMAP 只支持 `UID SEARCH ALL`**：`SUBJECT` / `HEADER` / `TEXT` 等条件**静默返回空结果**，连 `NO` 都不回——看起来像「没搜到」，实际是「不支持这种搜法」（实测 2026-10-29，QQ 上同样的命令正常） | 中 | 依赖服务端搜索的功能**不能假定三家一致**：要么在客户端做（拉下来本地搜），要么先探测服务器支持哪些搜索键、不支持就**明确报错**而不是假装没结果 | **待处理**：同步引擎**不受影响**（走 `UID FETCH <UID 区间>`，从不用 `SEARCH`）；但任何「服务器端搜索」功能在 163 上都会**静默失效**——这是最难查的一类问题 |
+| R23 | 协议层 | **163 的 IMAP 只支持 `UID SEARCH ALL`**：`SUBJECT` / `HEADER` / `TEXT` 等条件**静默返回空结果**，连 `NO` 都不回——看起来像「没搜到」，实际是「不支持这种搜法」（实测 2026-10-29，QQ 上同样的命令正常） | 中 | 依赖服务端搜索的功能**不能假定三家一致**：要么在客户端做（拉下来本地搜），要么先探测服务器支持哪些搜索键、不支持就**明确报错**而不是假装没结果 | **已缓解**（2026-10-30）：同步引擎**不受影响**（走 `UID FETCH <UID 区间>`，从不用 `SEARCH`）；**搜索改为落在本地**——`message_search_doc` + FTS5（trigram）全文索引，1~2 字符退化成 `LIKE` 子串扫描，因此**不依赖服务端搜索**（163 上也能搜）。**残余**：将来若用服务端搜索做补集或按服务器能力优化，必须先探测它支持哪些搜索键、不支持就**明确报错**，不能静默返回空 |
 | R24 | 协议层 | **「存副本」可能补成两份**（残余风险，2026-10-30）：沉降窗口只有 2.5 秒，而 QQ 的副本要 30–90 秒才落盘；当前靠**服务器拒绝重复 `APPEND`**（QQ 的措辞 `[CANNOT] Mail already saved to Sent by SMTP…`）兜底。若某个服务器**既慢存副本、又接受 `APPEND`**，就会存成两份 | 低（163 / QQ 不触发） | 把沉降窗口做成**按账户自适应**（记住上次服务器落盘耗时），或改成「`APPEND` 后回读计数，多于一份就删掉多出来的」 | **已知残余**（实测两家都不会触发：163 立刻可查，QQ 拒重复 `APPEND`） |
 | R22 | 产品可用性 | **写信面板的已知缺口**（2026-10-28）：① 没有「草稿箱」列表，面板关掉再打开会**新建**一份草稿而不是接着上次那份改（`list_drafts` 未接）；② 没有富文本编辑器，正文只能是纯文本（`bodyHtml` 恒为 `null`）；③ `uncertain` 时只能「重新写一封」，**没有二次确认的重发 / 撤回流**；④ 附件**没有大小、数量、类型上限**，整个文件读成 `number[]` 进 IPC 参数——几十 MB 的文件会让参数体积爆炸；⑤ 收件人只做分隔与 trim，不校验地址合法性 | 中 | 补草稿箱列表与回填；附件上限（后端也要有对应上限）；地址校验；`uncertain` 的二次确认流 | **待补**（前四项均为已知缺口，接口已留好位置） |
 
@@ -92,5 +92,6 @@
 | 2026-10-23 | 全部 13 个本地提交、10 个 crate、387 个用例 | R01/R02/R03 转为已实测/已实现；新增 R17（提交未推送）与 R18（SMTP 未实测）；修正 §1 里「workspace 只有 core 与 shell」等已过时的描述；为每条状态变更附上用例或提交名作为证据 |
 | 2026-10-26 | 同步引擎接进应用后的代码与文档、397 个用例 | 新增 R19（凭据只驻内存，每次同步要重填）与 R20（真实邮箱才暴露的两个协议陷阱：EXAMINE 必须用 UTF-7 原名、UID 是邮箱作用域的）；R06 确认仍为安全状态（HTML 只当源码显示） |
 | 2026-10-30 | P3 发信链路、本地全文搜索、HTML 正文消毒与派生 | R05 转为已实现（FTS 投影 + 触发器维护 + 重建/一致性检查 + 短词 `LIKE` 回退）；R06 转为已实现（后端消毒、原始 HTML 不出后端、链接交给系统浏览器、CSP 禁远程图片）；**残余**：真实 WebView 里的渲染与网络行为尚未在宿主上验证 |
+| 2026-11-02 | 全量文档与代码对齐审计（未改代码） | R14 的用例数更新为 687 + 67；R23 转为已缓解（搜索落在本地，不依赖服务端 `SEARCH`）；**残余**：Playwright E2E 与 fuzz 仍未开始 |
 
 相关：[架构](ARCHITECTURE.md) · [路线图](ROADMAP.md) · [测试策略](TESTING_STRATEGY.md)

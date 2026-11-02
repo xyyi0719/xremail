@@ -186,6 +186,35 @@
 - **`xremail-testkit` 的邮件夹具支持原始字节**（`with_raw`）：
   用于测非 UTF-8 编码（GBK 正文）
 
+### Changed
+- **文档与代码对齐**（2026-11-02）：一次全量审计，把文档里**与实际代码不符**的表述改掉。
+  审计的标准是「文档说的能不能在代码里找到对应的东西」，不是「读起来顺不顺」
+  - **README**：技术栈表改成**实际用的**——原生 CSS、React 内置 `state`、自写 `contentEditable`、
+    自研 SMTP 协议层；**没有** TanStack Query / Zustand / Tailwind / shadcn / TipTap / lettre
+    （TanStack 兄弟只是「与 SQLite 的取舍」里的参照物，**没进依赖**）
+    - 摘要与状态表从「P0 / P1」更新到「P0–P3 已出关」
+    - 用例数 397 → **687**（Rust）+ **67**（前端，12 个文件）
+    - 架构图重排（原来那幅连边框都对不齐），并标出 `xremail-provider` 与 `apps/sync-server`
+      **尚未创建**
+  - **CONTRIBUTING**：前端约定里「用 TanStack Query / Zustand / Tailwind / 虚拟列表」改成实际做法
+    （**不引入第三方前端依赖**，唯一例外是 Tauri 官方插件 `@tauri-apps/plugin-dialog`）
+  - **SECURITY §3**：补 **§3.0 实现现状**，把与规范的**偏离**写明——
+    **未用 sandbox iframe**（消毒后直接渲染进 DOM，代价是消毒器漏网就直接生效）、
+    未实现「显示图片」与追踪器面板、未实现重定向警告页、`ammonia` 未引入
+  - **PROTOCOLS**：删掉「尚无本项目真实账号的完整验证记录」这句自相矛盾的话；
+    「还没用真实测试账户真的发过一封」等**已被 2026-10-29 实测推翻**的表述改成实测结论
+  - **ARCHITECTURE**：`xremail-provider` 标注尚未创建
+  - **ADR-0001**：补「后续偏离」小节（决策本身不变），记下前端选型实际被偏离的部分
+  - **PLAN.md**：顶部横幅补一句「原文的前端依赖清单也已过时」
+  - **ENVIRONMENT**：`rust-version` 1.88 → **1.94**；补一条本机 **`python3` 是 Microsoft Store 空壳**
+    （直接退出 49、什么都不输出）——本地跑 `scripts/check_doc_links.py` 得用 `python`
+  - **ISSUES_AND_RISKS / ROADMAP / TESTING_STRATEGY**：用例数与「收发未实现」的表述更新为当前事实；
+    R14 的用例数更新为 687 + 67；**R23 转为已缓解**——搜索落在本地 FTS，**不依赖服务端 `SEARCH`**
+    （163 上也能搜）；ROADMAP 的 T6–T8 补上 SMTP 侧假服务器与 T8 的覆盖边界
+  - **顺手修掉两个 markdown 表格的渲染缺陷**（都是**老问题**，不是这次改出来的）：
+    README 的阶段表表头只有一列（数据行却是两列）；`docs/ENVIRONMENT.md` 的「坑」表里
+    `cmd` 那行的 `|` **没转义**——GFM 会把这一行拆成四列
+
 ### Fixed
 - **163 的 IMAP `SEARCH` 只支持 `ALL`**（实测 2026-10-29）：
   `SUBJECT` / `HEADER` / `TEXT` 等条件**静默返回空结果**，连 `NO` 都不回——

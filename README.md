@@ -3,37 +3,40 @@
 **多端、多账号、隐私优先的邮件客户端。** 核心用 Rust 写，界面用 Web 技术，Windows / Android 优先，iOS / macOS / Linux 随后。
 > 维护者：xyyi0719
 
-计划先接入 163、QQ 与沃邮箱，保留通用 IMAP/SMTP 手动配置；Gmail 暂缓，其他服务商后续评估。目前尚不能实际收发邮件。
+计划先接入 163、QQ 与沃邮箱，保留通用 IMAP/SMTP 手动配置；Gmail 暂缓，其他服务商后续评估。**已能实际收发邮件**（163 / QQ 的真实收发往返已验收），但凭据不落盘、无后台调度。
 **L1 邮件状态由 IMAP 服务器同步**，时效受网络、服务商和平台后台限制；本地设置等 L2 数据暂不跨端。
 
 ---
 
 ## 当前状态
 
-> **v0.1.0 · P0 已出关 / P1 读信链路已接进应用**（2026-10-26）
+> **v0.3.0 · P0–P3 已出关 / P4 平台化未开始**（2026-10-30）
 >
 > 架构持续复核。当前设计见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
-> 2026-10-26 验证：`cargo fmt` / `cargo clippy -D warnings` / `cargo test`（397 个用例）/ `npm typecheck` / `npm build` 均通过。
+> 2026-10-30 验证：`cargo fmt` / `cargo clippy -D warnings` / `cargo test`（**687 个 Rust 用例**）/
+> `npm typecheck` / `npm test`（**67 个前端用例**）/ `npm build` / `cargo sqlx prepare --check` 均通过，
+> CI 四个 job 全绿。
 >
-> **已落地**：存储层（`xremail-store`）、密文封装（`xremail-crypto`）、L2 契约（`xremail-api`）、
-> 同步引擎（`xremail-sync`）、IMAP 协议层（`xremail-protocol-imap`）、
-> 内容解析（`xremail-message`）、假服务器（`xremail-testkit`）。
-> 同步引擎的**拉取**与**回写**两条链路已打通（头随拉取、正文按需、标记回读确认）。
+> **已落地**：存储层（`xremail-store`，含 FTS5 全文索引）、密文封装（`xremail-crypto`）、
+> L2 契约（`xremail-api`）、同步引擎（`xremail-sync`）、IMAP / SMTP 协议层
+> （`xremail-protocol-imap` / `xremail-protocol-smtp`）、内容解析（`xremail-message`）、
+> HTML 消毒（`xremail-core::html`）、假服务器（`xremail-testkit`）、诊断工具（`xremail-diagnostics`）。
 >
-> **UI 里能看到真实邮箱的邮件**（2026-10-26）：三家真实账号各跑通一次——
-> 163（6 文件夹 / 4 封 / utf-8）、QQ（6 文件夹 / 71 封 / gb2312）、沃（6 文件夹 / 6 封 / gbk），
-> 正文解码零错误。协议事实见 [docs/PROTOCOLS.md](docs/PROTOCOLS.md)。
+> **能读、能搜、能写、能发**（2026-10-30）：UI 里能看真实邮箱的邮件（正文经**后端消毒**后渲染），
+> 本地**全文搜索**可用（命中带片段），撰写面板可发信（草稿 / 撤回 / 发送，校验以后端为准）。
+> 163 / QQ 两家的**真实收发往返**已实测通过；30 封真实邮件解码零错误。
+> 协议事实见 [docs/PROTOCOLS.md](docs/PROTOCOLS.md)。
 >
 > **还缺**：凭据不落盘（每次同步要重填授权码）、无调度器（要手动点同步）、
-> 发信（SMTP）未开始、HTML **不渲染**（只显示源码，HTML 清洗器属 P2）。
+> 邮件列表未虚拟化、无 P4 的 Android 前台服务与跨端推送。
 > 想看进度：[docs/ROADMAP.md](docs/ROADMAP.md)
 
-| 状态 |
+| 阶段 | 状态 |
 |---|---|
 | P0 骨架与地基 | ✅ 已出关 |
-| P1 账户接入与收信 | 🟡 只读链路完成，未接入应用 |
-| P2 同步引擎与阅读 | 🟡 引擎已完成，缺调度器与 HTML 安全门 |
-| P3 发信与草稿 | ⬜ |
+| P1 账户接入与收信 | ✅ 已出关（真实邮箱接入应用，UI 里能看） |
+| P2 同步引擎与阅读 | 🟡 引擎与 HTML 安全门已完成，缺调度器与列表虚拟化 |
+| P3 发信与草稿 | ✅ 已出关（真实邮箱收发往返已验收） |
 | P4 平台化与实时推送 | ⬜ |
 | P5 增值功能 | ⬜ |
 | P6 跨端账号信息同步（可选） | ⬜ |
@@ -45,23 +48,24 @@
 ## 架构
 
 ```
-┌────────────────────────────────────────────────────────┐
-│  React 19 + TypeScript          仅渲染，无业务逻辑          │
-└───────────────────▲────────────────────────────────────┘
-                    │ Tauri Command（请求/响应）
-                    │ Tauri Event（增量推送）
-┌───────────────────┴────────────────────────────────────┐
-│  src-tauri (Rust)                 托盘 / Android 前台服务   │
-├────────────────────────────────────────────────────────┤
-│  crates/                          全部业务逻辑在 Rust 侧    │
-│  xremail-core       领域模型       xremail-sync   同步引擎    │
-│  xremail-store     SQLite + FTS   xremail-crypto 加密/密钥派生│
-│  xremail-protocol-* IMAP/SMTP/OAuth                     │
-│  xremail-api       领域服务接口    xremail-provider 厂商预设  │
-└────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  React 19 + TypeScript             仅渲染，无业务逻辑    │
+└────────────────────────▲─────────────────────────────────┘
+                         │ Tauri Command（请求/响应）
+                         │ Tauri Event（增量推送）
+┌────────────────────────┴─────────────────────────────────┐
+│  src-tauri (Rust)               托盘 / Android 前台服务  │
+├──────────────────────────────────────────────────────────┤
+│  crates/                     全部业务逻辑在 Rust 侧      │
+│  xremail-core    领域模型 + HTML 消毒                    │
+│  xremail-store  SQLite + FTS5  xremail-crypto 加密封装   │
+│  xremail-sync   同步引擎        xremail-message MIME 解析│
+│  xremail-protocol-imap / -smtp   IMAP / SMTP 协议层      │
+│  xremail-api    领域服务接口    xremail-diagnostics 诊断 │
+└──────────────────────────────────────────────────────────┘
 ```
 
-**目标架构：UI 经 Rust 服务查询 SQLite，持久化写入只走 Rust。** 事件用于刷新提示，漏事件后可重新查询；上图中除 core/store/crypto/api/shell 外的模块仍为规划。
+**目标架构：UI 经 Rust 服务查询 SQLite，持久化写入只走 Rust。** 事件用于刷新提示，漏事件后可重新查询；上图中**除 `xremail-provider`（厂商预设）与平台 SecretStore 适配器（钥匙串）外均已创建**——这两块还没开工。
 
 ---
 
@@ -69,20 +73,25 @@
 
 | 层 | 选型 | 版本 |
 |---|---|---|
-| 外壳 | Tauri | 2.12 |
+| 外壳 | Tauri（Rust） | 2.12 |
 | 前端 | React + TypeScript + Vite | 19 / 6.x / 8.x |
-| 状态 | TanStack Query + TanStack Router + Zustand | 5.x |
-| UI 基座 | Tailwind CSS + shadcn/ui (Radix) | 4.x |
-| 长列表 | TanStack Virtual | 3.x |
-| 富文本 | TipTap (ProseMirror) | 2.x |
+| 前端测试 | Vitest + Testing Library | 5.x |
+| 前端样式 | **原生 CSS**（无 Tailwind / shadcn） | — |
+| 前端状态 | **React 内置 state**（无 TanStack / Zustand） | — |
+| 富文本 | **自写**（contentEditable + `document.execCommand`） | — |
 | 运行时 | tokio | 1.54 |
 | IMAP | async-imap + imap-proto | 0.12 / 0.17 |
-| SMTP | lettre | 0.11 |
+| SMTP | **自研协议层**（rustls + x509-parser，**未用 lettre**） | 0.23 / 0.16 |
 | 存储 | SQLite (sqlx, WAL) + FTS5 | 0.9 |
-| 密钥库 | 平台 SecretStore（后端待验证） | 待定 |
+| 全文索引 | FTS5 **trigram**（外部内容表 + 触发器维护） | — |
+| 密钥库 | 平台 SecretStore（**尚未接入**） | 待定 |
 | 密码学 | argon2 + chacha20poly1305 | 0.6 / 0.11 |
 
-> 此表混合已使用与计划依赖；实际版本以 Cargo.lock/package-lock.json 为准。TanStack、编辑器、协议/存储/密码学库尚未接入，不代表已验证兼容性；依赖维护状态应在引入时复核。
+> **与早期规划不同**：原计划里的 TanStack Query / Router / Zustand、Tailwind + shadcn/ui、
+> TanStack Virtual、TipTap、lettre **都没有引入**。原因有二：一条是「前端不加第三方依赖」
+> 的约束，一条是单人维护的实际节奏——富文本用 `contentEditable` 自写、SMTP 协议层自己实现、
+> 样式用原生 CSS。代价是**邮件列表未虚拟化**、编辑器功能有限。
+> 实际版本以 Cargo.lock / package-lock.json 为准。
 
 ---
 
@@ -90,15 +99,19 @@
 
 ```
 xremail/
-├─ crates/                 Rust 库：core / store / crypto / api / provider / protocol-*
+├─ crates/                 Rust 库：
+│  └─ core / store / crypto / api / sync / message
+│     protocol-imap / protocol-smtp / testkit / diagnostics
 ├─ apps/
-│  ├─ shell/               Tauri 应用（桌面 + 移动）
-│  │  ├─ src/              React 前端
-│  │  └─ src-tauri/        Rust 外壳 + Command + Event
-│  └─ sync-server/         可选：自建 E2EE 同步服务（P6）
+│  └─ shell/               Tauri 应用（桌面 + 移动）
+│     ├─ src/              React 前端
+│     └─ src-tauri/        Rust 外壳 + Command + Event
 ├─ docs/                   本文档集
-└─ .github/workflows/      CI
+└─ .github/workflows/      CI（Rust / Frontend / Docs sanity）
 ```
+
+> P6 的自建 E2EE 同步服务（`apps/sync-server`）**尚未创建**；`crates/xremail-provider`
+> （厂商预设）同样还没开工。
 
 ---
 
@@ -106,7 +119,7 @@ xremail/
 
 | 依赖 | 版本 | 说明 |
 |---|---|---|
-| Rust | ≥ 1.88 | `rustup update stable` |
+| Rust | ≥ 1.94 | `rustup update stable`（MSRV 是 1.94：sqlx 0.9.0 的下限） |
 | Node.js | ≥ 20 | 建议用 fnm / nvm |
 | Android 端 | Android Studio + NDK + JDK 17 | 仅编译 Android 需要 |
 | 平台工具 | Tauri 2 的 [前置依赖](https://v2.tauri.app/start/prerequisites/) | Windows 需 WebView2 + MSVC Build Tools |

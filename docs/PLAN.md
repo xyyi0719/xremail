@@ -4,6 +4,9 @@
 > **本文件保留原始方案供参考，不再是当前执行基线。** 当前范围与门槛以 [ROADMAP](ROADMAP.md) 为准，技术语义以 [ARCHITECTURE](ARCHITECTURE.md)、安全以 [SECURITY](SECURITY.md)、验证以 [TESTING_STRATEGY](TESTING_STRATEGY.md) 为准。
 > 用户最新决策：个人研究、AI 编码、国内邮箱优先、Gmail 暂缓。原文的 OAuth 关键路径、固定工期、全部平台支持与“不返工”承诺均已撤回。原文 SQL/伪代码不是可直接执行的迁移或实现规范。
 > 实际前端版本以 package.json/lock 为准：TypeScript 6、Vite 8；旧文中的 TS 5.9/Vite 7 是早期选型参考。
+> 实际前端**依赖清单**也与原文不同：TanStack Query / Router / Zustand、Tailwind + shadcn/ui、
+> TanStack Virtual、TipTap **都没有引入**，SMTP 也不是原文的 `lettre` 而是自研协议层——
+> 原因与代价见 [ADR-0001 的后续偏离](adr/0001-ui-stack-tauri-react.md)。
 > 维护者：xyyi0719
 
 ---

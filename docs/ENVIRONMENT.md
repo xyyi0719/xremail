@@ -13,10 +13,10 @@
 
 | 工具 | 版本 | 备注 |
 |---|---|---|
-| rustc / cargo | 1.99.1 | 满足 `rust-version = 1.88` |
+| rustc / cargo | 1.99.1 | 满足 `rust-version = 1.94` |
 | Node.js | 22.21.0 | |
 | npm | 随 Node | `package-lock.json` 已提交 |
-| Python | 3.11.0 | CI 的 docs job 用它跑脚本 |
+| Python | 3.11.0（可执行文件是 **`python`**，在 `C:\Python311`） | ⚠️ 本机的 **`python3` 是 Microsoft Store 的空壳**（`…\WindowsApps\python3`）：直接退出 49、什么都不输出。**本地跑 `scripts/check_doc_links.py` 要用 `python`**；CI（ubuntu）上的 `python3` 是真的 |
 | OpenJDK | **17.0.20.1**（`~/.jdks/jdk-17.0.20.1+1`） | 2026-10-21 装的 Microsoft OpenJDK 17，**免安装 zip**，装在用户目录无需管理员。机器级另有 Corretto **1.8.0_502**（`JAVA_HOME` 用户级已指向 17） |
 | Android SDK | cmdline-tools 13.0，`%LOCALAPPDATA%\Android\Sdk` | 含 platform-tools 37.0.1、platforms android-36 / 37.0、build-tools 36.0.0 / 37.0.0 |
 | Android NDK | **27.2.12479018**（side by side） | Tauri v2 + cargo-ndk 的稳妥组合 |
@@ -61,7 +61,7 @@
 | `curl -w "%{http_code}"` | `%{` 被外层展开 → 输出 `%{http_code}` 字面量 | 用 `\n__CODE__%{http_code}` 之类**无歧义标记**，再正则提取 |
 | `grep -c ": test$"` | `$` 被外层吞掉 | 单引号包裹整个 pattern |
 | 命令里含 `'`（如 `don't`） | 提前闭合引号 | 改用双引号或转义 |
-| `cmd` 中的 `&` `|` `>` | 被当作管道/重定向 | 引号包裹整条命令 |
+| `cmd` 中的 `&` `\|` `>` | 被当作管道/重定向 | 引号包裹整条命令 |
 
 > **原则**：需要精确控制时，**用脚本文件**（写入临时 `.py`/`.js` 再执行），
 > 不要把复杂逻辑塞进单行命令字符串。
@@ -505,7 +505,7 @@ sandbox iframe + CSP + `srcdoc`。这些行为在 **WebKitGTK 上与 Chromium �
 | binutils | 2.42 | 2.46 | |
 | LLVM / Clang | 18 | **21.1** | `ring` / `bindgen` 需匹配 |
 | Python | 3.12 | **3.14** | CI docs job 用 `python3` |
-| Rust（发行版包） | 1.75 | **1.93.1** | 满足 `rust-version = 1.88`，但发行版包滞后 → 用 rustup |
+| Rust（发行版包） | 1.75 | **1.93.1** | **不满足** `rust-version = 1.94`，发行版包滞后 → 用 rustup |
 | OpenJDK（默认） | 21 | **25** | Android 工具链要 **17** → 额外装 `openjdk-17-jdk` |
 | Kernel / GNOME | | 7.0.0 / 50 | |
 

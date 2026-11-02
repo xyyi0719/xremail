@@ -28,7 +28,7 @@
 | xremail-protocol-smtp | SMTP 提交与分阶段结果 | 不保证 exactly-once。**只读探测**（EHLO / STARTTLS / AUTH / 证书体检）与**提交路径**（`submit_message`：MAIL FROM / RCPT TO / DATA / QUIT）均已实现；提交路径只做 ASCII 信封地址 + RFC 2047 编码的标题（不做 SMTPUTF8） |
 | xremail-sync | 账户调度、IMAP 同步、操作恢复 | 依赖 store/protocol/message/core，不认识 Tauri |
 | xremail-message | MIME 结构、charset 解码、RFC 5322 头 | 不落库、不加载远程资源；**不做 HTML 清洗**（清洗在 `xremail-core::html`，见 §9.1） |
-| xremail-provider | 可覆盖预设、接入诊断 | 企业邮箱需管理员配置，不能按品牌猜服务器 |
+| xremail-provider | 可覆盖预设、接入诊断 | 企业邮箱需管理员配置，不能按品牌猜服务器。**尚未创建**（服务器地址目前由用户手填） |
 | xremail-crypto | 成熟密码库封装、版本化密文格式 | 不自行实现密码算法；不承担所有平台钥匙串职责 |
 | 平台 SecretStore 适配器 | Windows/Android 等安全存储 | 与可选远端 VaultStore 分离 |
 | xremail-testkit | 假服务器、合成样本、故障注入 | 测试专用；生产代码不得依赖 |

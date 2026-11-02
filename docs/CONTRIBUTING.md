@@ -94,10 +94,11 @@ SQLX_OFFLINE=false DATABASE_URL="sqlite://target/xremail-dev.db" \
 
 - `strict: true`，禁止 `any`（实在不行用 `unknown` + 收窄）
 - 组件用函数式 + Hooks；**不写 class 组件**
-- 数据获取统一用 TanStack Query；UI 局部状态用 Zustand
+- **不引入第三方前端依赖**（当前唯一的例外是 Tauri 官方插件 `@tauri-apps/plugin-dialog`）：
+  状态用 React 内置 `useState` / `useReducer`，样式用原生 CSS，
+  富文本用 `contentEditable` 自写（见 `src/components/RichTextEditor.tsx`）
 - **禁止在 React 里直接调 `invoke` 之外的方式取数据**；所有数据经 `xremail-api` 的 Tauri Command
-- 样式用 Tailwind 原子类；组件样式用 `shadcn/ui` 变体
-- 列表一律虚拟化（TanStack Virtual）
+- 邮件列表**目前未虚拟化**（原因见 README「与早期规划不同」）：数据量到万级前不值得为此加依赖
 - 可访问性：交互元素必须有 `aria-label` 或可见文本
 
 ### 命名

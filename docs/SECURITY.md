@@ -71,7 +71,35 @@
 
 这是邮件客户端最大的攻击面。渲染路径必须严格按下述四层执行：
 
-### 第 1 层：Rust 侧清洗（`xremail-message`）
+### 3.0 实现现状（2026-10-30）与本规范的偏离
+
+**已实现的部分**：
+
+- 第 1 层的清洗在 `xremail-core::html::sanitize_html`——**不是 ammonia**，是手写的白名单消毒器：
+  标签 / 属性白名单，删 `script` / `style` / `iframe` / `on*` 事件属性、
+  `javascript:` / `data:` 协议，删**远程图片**（跟踪像素与信息泄露的通道）；
+  **未知标签只删标签、留着内容**——真实邮件的正文全被 `html` / `body` 包着，
+  连内容一起删整封信就没了。
+- **原始 HTML 不出后端**：`MessageBodyView` 只带 `htmlSafe`，前端拿不到 `html_raw`。
+- 链接：正文里的链接**交给系统浏览器**（`@tauri-apps/plugin-opener`），
+  应用窗口不被那个网页顶掉；危险协议在渲染前就被删掉。
+- 远程图片两道闸：清洗时删 `<img src="http...">`，且 `tauri.conf.json` 的 CSP
+  `img-src` **不含 http/https**。
+
+**与本规范的偏离（已知，未消）**：
+
+1. **没有用 sandbox iframe**：消毒过的 HTML 直接渲染进 DOM
+   （`dangerouslySetInnerHTML`，见 `src/components/MessageView.tsx`）。
+   偏离的理由是「清洗在后端完成 + 原始 HTML 不出后端 + CSP 不含远程来源」；
+   **代价**：一旦消毒器漏掉一个危险构造，它就直接在应用上下文里生效。
+   ⇒ 真实 WebView 里的渲染与网络行为**尚未在宿主上验证**（见 R06 残余风险）。
+2. **「显示图片」按钮与追踪器面板未实现**：远程图片一律阻断，没有逐域放行名单。
+3. **重定向警告页未实现**：链接直接交给系统浏览器，没有本应用内的警告页。
+4. `ammonia` 未引入；CSS 的处理是**整块丢弃** `<style>`，不保留任何内联样式。
+
+### 第 1 层：Rust 侧清洗（`xremail-core::html`）
+
+> 下面写的是**规范**；实际实现见 §3.0（手写消毒器，不用 ammonia）。
 
 用 `ammonia` 清洗原始 HTML：
 
@@ -83,6 +111,9 @@
 - `<a href>` 保留原 URL 供 UI 展示"真实链接"提示
 
 ### 第 2 层：sandbox iframe（前端组件 `<SafeEmailFrame>`）
+
+> ⚠️ **未实现**（2026-10-30）：当前渲染路径是「后端消毒 + 直接渲染进 DOM」，
+> 见 §3.0 的偏离说明。
 
 - iframe 使用空 sandbox，不授予 allow-scripts、allow-same-origin 或弹窗逃逸权限；referrerpolicy=no-referrer。
 - srcdoc 自身不阻止网络请求。宿主构造固定文档壳，把 CSP meta 放在所有不可信内容之前；不依赖支持不一致的 iframe csp 属性。
