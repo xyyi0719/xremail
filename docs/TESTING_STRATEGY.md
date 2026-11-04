@@ -105,8 +105,9 @@ Mock 通过不能证明服务商兼容。Playwright 浏览器通过不能证明 
 | **T9** | 前端组件与 E2E | 界面层，先保证后端语义正确再投入 | T5 | P3+ | 🟡 **部分**：前端组件用例 **12 个文件 / 67 个**（Vitest + Testing Library）；**Playwright E2E 未开始** |
 | **T10** | fuzz（MIME / HTML / IMAP 响应解析） | 防御性加固，非功能正确性 | T5/T6 | P2+ | ⬜ 未开始 |
 
-**Rust 用例总数：4 → 790**（2026-10-30 达 687；2026-11-03 随调度器 700、
-移动/删除写路径 747、崩溃恢复 778、IDLE 客户端侧与调度器接线 790）；
+**Rust 用例总数：4 → 792**（2026-10-30 达 687；2026-11-03 随调度器 700、
+移动/删除写路径 747、崩溃恢复 778、IDLE 客户端侧与调度器接线 790、
+认证失败终态 792）；
 **前端用例 0 → 67**（12 个文件）。
 
 ### 5.1.1 一条新规矩：用**变异测试**证明用例有效
@@ -122,6 +123,9 @@ Mock 通过不能证明服务商兼容。Playwright 浏览器通过不能证明 
 | 拉取链路 | 7 | 7/7 |
 | 标记回写 | 8 | 8/8（其中 1 条**第一版没被抓住**——用例查的是本地标记，\n  改成查服务器上的真实状态后才抓住） |
 | 头与正文 | 7 | 7/7 |
+| 认证失败终态（`reap_finished`） | 1 | 1/1（把 `reap_finished` 改成空操作后
+  `a_reauth_required_account_can_be_started_again` 确实失败：`tx.send` 到已死的
+  actor 不报错，重启只是叫醒尸体——这类「静默停止同步」只能靠变异测试挡住） |
 
 变异脚本在 `target/mutate*.js`（不入库）。
 
@@ -142,7 +146,11 @@ cargo test --workspace -- --list | grep -c ': test$'
 该数字随每次提交变化，写入 CHANGELOG。**用例数本身不是质量证明**——它只用于回答「比上次多了多少」。
 CI 已在 `Test` 步骤后输出该计数（见 `.github/workflows/ci.yml`）。
 
-计数：**544**（Windows：本地与 CI 一致）+ **538**（Linux CI，差 6 条是 Windows 专属用例）。上一次记录是 421（2026-10-28 早）。
+计数：**792**（Windows：本地与 CI 一致）+ **544**（Linux CI，差 6 条是 Windows 专属用例）。
+上一次记录是 790（2026-11-03 认证失败终态之前）。
+
+> 注：括号里的 Linux 数字自 2026-10-28 起没再更新，只作参考；
+> 以 `cargo test --workspace` 在本机的实测输出为准。
 新增 103 条 Rust 用例的分布：发信服务层 8、存储层 `send_queue` 18、协议层 SMTP 提交 12、
 MIME 构建（`xremail-message::compose`）、假服务器故障注入与端到端同步、IPC 线格式。
 
@@ -167,6 +175,31 @@ npm run typecheck --prefix apps/shell
 npm test --prefix apps/shell        # vitest run
 npm run build --prefix apps/shell
 ```
+
+### 6.1 本地改一行就跑全量是浪费：用 `scripts/test_changed.py`
+
+全量是 **792 个用例**，改一段注释也跑一遍，等于把最贵的一步做成最高频的一步。
+本地日常改成：
+
+```bash
+python scripts/test_changed.py            # 只跑受本次改动影响的包
+python scripts/test_changed.py --dry-run  # 只看计划
+python scripts/test_changed.py --all      # 发版 / 推 PR 前跑全量
+```
+
+判据是**反向依赖**，不是目录名：改了 `xremail-store`，所有 `use xremail_store`
+的包都跟着重测（它们吃它的 API）；只改叶子包就没人陪跑。细节：
+
+- 改动落在根 `Cargo.toml` / `Cargo.lock` → **自动退化成全量**（依赖换版本，影响面是整个 workspace）
+- 只改 `docs/**` / `*.md` → **一行测试也不跑**，只跑文档链接检查
+- 改 `apps/shell/src/**` 或 Tauri 侧 → `tsc` + `vitest` + `build`；
+  Tauri 侧一定连前端一起跑，因为 IPC 的线格式两边共享，字段名漂移只会静默拿到 `undefined`
+- 未跟踪的新文件也算改动（否则新加的用例文件会被漏掉）
+
+**它不能替代什么**：增量只看「改了哪些文件」，看不出「这次改动破坏了
+别的 crate 的语义假设」。所以**发版与推 PR 必须跑 `--all`**。
+另外 `cargo test -p` 仍然要编译上游依赖，「省」的是**用例执行**与无关包的链接，
+不是编译。
 
 2026-10-30 实测：以上六条在本机全部通过；`cargo test --workspace` 实际执行 **544** 个 Rust 用例
 （0 失败），CI 上 Linux 是 **538**（少 6 条 Windows 专属用例），`npm test` 跑 **27** 个前端用例（5 个文件，0 失败）。

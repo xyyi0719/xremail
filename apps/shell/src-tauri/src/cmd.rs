@@ -679,7 +679,7 @@ async fn flush_transfer_intents(
 /// 失败只记日志：**后台同步起不来不该让「本次手动同步」失败**——
 /// 用户点的是「现在同步一下」，那件事已经做完了。
 fn ensure_scheduled(state: &AppState, account: &Account) {
-    if state.scheduler.is_scheduled(&account.id) {
+    if state.scheduler.is_running(&account.id) {
         return;
     }
 

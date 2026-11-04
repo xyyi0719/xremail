@@ -156,6 +156,12 @@ pub enum AccountEvent {
     },
     /// 连续 panic 太多次，放弃这个账户。
     Abandoned { account_id: String, message: String },
+    /// 服务器拒绝了凭据——**要人动手**，actor 已自行停掉。
+    ///
+    /// 与 [`AccountEvent::Failed`] 的区别是「要不要人管」：
+    /// `Failed` 是「等会儿自己会再试」，这个是「你不换密码就永远好不了」。
+    /// 分开它是为了**不让无限重连掩盖一个假授权码**（ARCHITECTURE §4 第 8 步）。
+    NeedsReauth { account_id: String, message: String },
     /// actor 退出（正常停止，或放弃之后）。
     Stopped { account_id: String },
 }
@@ -169,6 +175,7 @@ impl AccountEvent {
             | AccountEvent::Failed { account_id, .. }
             | AccountEvent::Panicked { account_id, .. }
             | AccountEvent::Abandoned { account_id, .. }
+            | AccountEvent::NeedsReauth { account_id, .. }
             | AccountEvent::Stopped { account_id } => account_id,
         }
     }
@@ -262,10 +269,17 @@ impl RetryPolicy {
 }
 
 /// 一轮同步失败的原因。
-#[derive(Debug, Clone)]
+///
+/// 不实现 `Clone`：`AppError` 本身不是 `Clone`（它包 `Box<dyn Error>` 之类的载荷），
+/// 而这里也确实不需要复制——它只在 `run` 里被消费一次。
+#[derive(Debug)]
 enum TickFailure {
-    /// 连接失败、服务器拒绝、落库出错……可以重试。
-    Failed(String),
+    /// 连接失败、服务器拒绝、落库出错……
+    ///
+    /// **保留 `AppError` 而不是提前压成 `String`**：
+    /// 这里要分辨的是「能不能重试」——`AppError::Auth` 重试一万次也不会成功，
+    /// 压成字符串后只能靠比对错误文本，那是脆的。
+    Failed(AppError),
     /// panic 了。已经被边界拦住。
     Panicked(String),
 }
@@ -284,6 +298,15 @@ enum Command {
 struct ActorHandle {
     tx: mpsc::UnboundedSender<Command>,
     join: JoinHandle<()>,
+}
+
+/// 把已经退出的 actor 从表里清掉。
+///
+/// `tx.send` 到一个死任务不会报错（通道还在），所以光看句柄存在与否
+/// 分不清「在跑」和「跑完了」。清掉之后 `start` 才会真的重新起一个：
+/// 否则认证被拒后用户改完授权码，`start` 只会叫醒一具尸体，账户再也不同步。
+fn reap_finished(actors: &mut HashMap<String, ActorHandle>) {
+    actors.retain(|_, handle| !handle.join.is_finished());
 }
 
 /// 单个账户的 actor。
@@ -356,7 +379,7 @@ impl AccountActor {
                 }
                 Ok(summary)
             }
-            Ok(Err(error)) => Err(TickFailure::Failed(error.to_string())),
+            Ok(Err(error)) => Err(TickFailure::Failed(error)),
             Err(payload) => Err(TickFailure::Panicked(panic_message(payload.as_ref()))),
         }
     }
@@ -447,6 +470,9 @@ impl AccountActor {
         let mut timeout_reason = WakeReason::Poll;
         let mut backoff = self.policy.min_backoff;
         let mut panics: u32 = 0;
+        // 因为「要人重新授权」退出时，不要再报 `Stopped`——
+        // 那会把 UI 上的「需要重新授权」盖成「空闲」，等于把要人管的状态藏起来。
+        let mut stopped_for_reauth = false;
 
         loop {
             // ---------- 1. 等到该跑的时刻 ----------
@@ -500,6 +526,24 @@ impl AccountActor {
                     );
                 }
                 Err(TickFailure::Failed(error)) => {
+                    // 认证被拒是**终态**，不是「再等等就好」。
+                    //
+                    // 重试一个错密码永远不会成功，只会把日志刷满、
+                    // 并在 UI 上一直显示「正在重连」——把「要人管」伪装成「会自愈」。
+                    // 所以这里直接停掉 actor：用户改完授权码后重新保存，
+                    // 会重新 `start` 一个 actor。
+                    if matches!(error, AppError::Auth(_)) {
+                        emit(
+                            &self.sink,
+                            AccountEvent::NeedsReauth {
+                                account_id: account_id.clone(),
+                                message: error.to_string(),
+                            },
+                        );
+                        stopped_for_reauth = true;
+                        break;
+                    }
+
                     let retry_in = backoff;
                     backoff = self.policy.grow(backoff);
                     timeout_reason = WakeReason::Retry;
@@ -509,7 +553,7 @@ impl AccountActor {
                         AccountEvent::Failed {
                             account_id: account_id.clone(),
                             reason,
-                            error,
+                            error: error.to_string(),
                             retry_in,
                         },
                     );
@@ -549,12 +593,14 @@ impl AccountActor {
             }
         }
 
-        emit(
-            &self.sink,
-            AccountEvent::Stopped {
-                account_id: account_id.clone(),
-            },
-        );
+        if !stopped_for_reauth {
+            emit(
+                &self.sink,
+                AccountEvent::Stopped {
+                    account_id: account_id.clone(),
+                },
+            );
+        }
     }
 }
 
@@ -630,7 +676,8 @@ impl Scheduler {
         let account_id = account.id.clone();
 
         {
-            let actors = self.lock()?;
+            let mut actors = self.lock()?;
+            reap_finished(&mut actors);
             if let Some(handle) = actors.get(&account_id) {
                 let _ = handle.tx.send(Command::Sync(WakeReason::Manual));
                 return Ok(());
@@ -653,24 +700,12 @@ impl Scheduler {
         Ok(())
     }
 
-    /// 这个账户是否已在调度中。
-    ///
-    /// 应用层靠它判断「要不要起 actor」而**不去叫醒**——
-    /// 调 [`Self::start`] 在已启动时会顺手叫醒一轮，
-    /// 对「刚手动同步完」的场景就是白跑两次。
-    ///
-    /// 锁中毒时返回 `false`：宁可多起一个（`start` 是幂等的）也不要漏起。
-    pub fn is_scheduled(&self, account_id: &str) -> bool {
-        self.lock()
-            .map(|actors| actors.contains_key(account_id))
-            .unwrap_or(false)
-    }
-
     /// 叫醒某个账户，立刻同步一轮（用户点「刷新」）。
     ///
     /// 账户没在调度里 → 报错，而不是静默什么都不做。
     pub fn wake(&self, account_id: &str) -> AppResult<()> {
-        let actors = self.lock()?;
+        let mut actors = self.lock()?;
+        reap_finished(&mut actors);
         let handle = actors
             .get(account_id)
             .ok_or_else(|| AppError::Invalid(format!("账户 {account_id} 没有在调度中")))?;
@@ -694,7 +729,8 @@ impl Scheduler {
     /// 正在调度的账户。
     pub fn running(&self) -> Vec<String> {
         match self.lock() {
-            Ok(actors) => {
+            Ok(mut actors) => {
+                reap_finished(&mut actors);
                 let mut ids: Vec<String> = actors.keys().cloned().collect();
                 ids.sort();
                 ids
@@ -704,9 +740,16 @@ impl Scheduler {
     }
 
     /// 某个账户是否在调度中。
+    ///
+    /// **已经退出的 actor 不算在调度中**：认证被拒、连续 panic 放弃之后，
+    /// 任务已经结束了，但句柄还留在表里。不清掉的话，
+    /// 用户改完授权码再 `start` 只会叫醒一个死 actor，账户从此再不同步。
     pub fn is_running(&self, account_id: &str) -> bool {
         self.lock()
-            .map(|a| a.contains_key(account_id))
+            .map(|mut actors| {
+                reap_finished(&mut actors);
+                actors.contains_key(account_id)
+            })
             .unwrap_or(false)
     }
 

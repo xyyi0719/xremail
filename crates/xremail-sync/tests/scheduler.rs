@@ -96,6 +96,8 @@ struct TestConnector {
     always_panic: Vec<String>,
     /// 每次 `connect` 都返回错误（不 panic）。
     always_fail: bool,
+    /// 每次 `connect` 都回「认证被拒」（授权码被改掉 / 过期）。
+    always_auth_fail: bool,
     /// 被调用了几次。
     attempts: AtomicU32,
 }
@@ -108,12 +110,19 @@ impl TestConnector {
             panics_left: AtomicU32::new(0),
             always_panic: Vec::new(),
             always_fail: false,
+            always_auth_fail: false,
             attempts: AtomicU32::new(0),
         }
     }
 
     fn panicking(mut self) -> Self {
         self.always_fail = true;
+        self
+    }
+
+    /// 连上就回 `Auth`（等价于服务器回 `NO [AUTHENTICATIONFAILED]`）。
+    fn auth_rejected(mut self) -> Self {
+        self.always_auth_fail = true;
         self
     }
 
@@ -135,6 +144,9 @@ impl AccountConnector for TestConnector {
             if self.panics_left.load(Ordering::Relaxed) > 0 {
                 self.panics_left.fetch_sub(1, Ordering::Relaxed);
                 panic!("测试要求：这一次连接 panic");
+            }
+            if self.always_auth_fail {
+                return Err(AppError::Auth("测试要求：服务器拒绝了这个授权码".into()));
             }
             if self.always_fail {
                 return Err(AppError::Protocol("测试要求：连接失败".into()));
@@ -552,6 +564,117 @@ async fn connection_failures_back_off_and_retry() {
         !events
             .iter()
             .any(|event| matches!(event, AccountEvent::Abandoned { .. }))
+    );
+
+    scheduler.shutdown();
+    fixture.server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// 认证被拒：终态，不是「再等等就好」
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn auth_rejection_stops_the_actor_instead_of_retrying_forever() {
+    let fixture = Fixture::start(0).await;
+    let account = account("acct-1", 3600);
+    let pool = local_store(std::slice::from_ref(&account)).await;
+
+    let connector =
+        Arc::new(TestConnector::new(fixture.imap.clone(), fixture.trust.clone()).auth_rejected());
+    let recorder = Arc::new(Recorder::default());
+    let scheduler = Scheduler::with_options(
+        pool,
+        connector.clone(),
+        recorder.clone(),
+        fast_policy(),
+        Arc::new(|| 1_792_658_000_000),
+    );
+
+    scheduler.start(account).expect("应当能启动");
+
+    let events = wait_until(&recorder, "一次认证被拒", |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, AccountEvent::NeedsReauth { .. }))
+    })
+    .await;
+
+    // 报的是「要人管」，不是「可重试」。
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AccountEvent::Failed { .. })),
+        "认证被拒不该报成可重试失败：{events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AccountEvent::Stopped { .. })),
+        "退出原因是「要重新授权」时不该再报 Stopped——那会把 UI 上的\
+         ReauthRequired 盖成 Idle：{events:?}"
+    );
+
+    // 关键断言：**只试了一次**。错密码重试一万次也不会对。
+    // 给足时间（远超过退避的 20ms / 40ms）仍应停在 1。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        connector.attempts(),
+        1,
+        "认证被拒后不应再重试，实际连接了 {} 次",
+        connector.attempts()
+    );
+
+    // actor 已经退出，调度表里不该再留着它。
+    assert!(
+        !scheduler.is_running("acct-1"),
+        "认证被拒后 actor 已退出，不应还算在调度中"
+    );
+
+    scheduler.shutdown();
+    fixture.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_reauth_required_account_can_be_started_again() {
+    // 这条用例锁的是 `reap_finished`：actor 退出后句柄还留在表里的话，
+    // 用户改完授权码再 `start` 只会叫醒一具尸体，账户从此再不同步——
+    // 而且**没有任何报错**，是最难查的那类故障。
+    let fixture = Fixture::start(0).await;
+    let account = account("acct-1", 3600);
+    let pool = local_store(std::slice::from_ref(&account)).await;
+
+    let connector =
+        Arc::new(TestConnector::new(fixture.imap.clone(), fixture.trust.clone()).auth_rejected());
+    let recorder = Arc::new(Recorder::default());
+    let scheduler = Scheduler::with_options(
+        pool,
+        connector.clone(),
+        recorder.clone(),
+        fast_policy(),
+        Arc::new(|| 1_792_658_000_000),
+    );
+
+    scheduler.start(account.clone()).expect("应当能启动");
+    wait_until(&recorder, "第一次认证被拒", |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, AccountEvent::NeedsReauth { .. }))
+    })
+    .await;
+
+    // 模拟「用户重新保存了授权码」：再 start 一次。
+    scheduler.start(account).expect("重启应当成功");
+
+    wait_until(&recorder, "第二次也真的连了", |_| {
+        connector.attempts() >= 2
+    })
+    .await;
+
+    assert!(
+        connector.attempts() >= 2,
+        "重启后应当真的重新去连服务器，实际只连了 {} 次",
+        connector.attempts()
     );
 
     scheduler.shutdown();

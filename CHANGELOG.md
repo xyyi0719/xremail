@@ -7,6 +7,20 @@
 ## [Unreleased]
 
 ### Added
+- **认证失败成为终态，不再无限重试**（2026-11-03）
+  - `SyncState::ReauthRequired` 从 2026-10-26 就声明好了（`crates/xremail-core/src/model.rs:566`，
+    注释写「a human has to act」），但**全仓没有任何地方发它**——实际行为是
+    `actor.rs` 里所有错误一律进 `Failed` 分支退避重试，于是一个错授权码会被
+    **永久重试**，UI 一直显示「正在重连」，把「要人管」伪装成「会自愈」
+  - `TickFailure::Failed` 从 `String` 改回保留 `AppError`：压成字符串后就只能
+    比对错误文本，那是脆的；新增 `AccountEvent::NeedsReauth`，`AppError::Auth`
+    发事件后**直接退出** actor；`TauriSink` 映射成 `ReauthRequired` + `SyncError`
+  - 修掉一个会造成**静默停止同步**的 bug：actor 退出后句柄仍留在 `Scheduler`
+    表里，而 `tx.send` 到死任务不报错，于是用户改完授权码再 `start` 只会叫醒
+    一具尸体。新增 `reap_finished`（按 `join.is_finished()` 清）
+  - 用例 790 → **792**：`auth_rejection_stops_the_actor_instead_of_retrying_forever`、
+    `a_reauth_required_account_can_be_started_again`；后者用变异测试验证
+    （把 `reap_finished` 改成空操作后该用例必失败）
 - **假 IMAP 服务器的 `IDLE` 与主动推送**（2026-11-03）
   - `crates/xremail-testkit/src/server.rs`：`IDLE` 命令（回 `+ idling` → 等
     `DONE` → 用**原 tag** 回 `OK`）、服务器级 `PushRegistry`（登记

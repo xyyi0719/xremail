@@ -399,6 +399,10 @@ Gmail 将来有需求再开独立决策：授权流程、scope、个人使用与
 3. ~~**调度器**（AccountActor）~~ **已完成（2026-11-03）**：`crates/xremail-sync/src/actor.rs`。
    - 一个账户一个 actor；启动即同步 → 按 `poll_interval_secs` 轮询；`wake` 插队
    - 失败退避 `min_backoff` → `max_backoff`，成功即重置
+   - **认证失败是终态（2026-11-03）**：`AppError::Auth` → 发 `AccountEvent::NeedsReauth`
+     后直接退出 actor，不进退避循环（错授权码重试一万次也不会对）；
+     应用层映射成 `SyncState::ReauthRequired`，用户重存授权码后再 `start` 即可。
+     同时补上 `reap_finished`：actor 退出后要清句柄，否则重启只是叫醒一具尸体
    - R13 的 `catch_unwind` 边界已在这一层落地（每轮同步一个边界）
    - **`IDLE` 长连接推送已实现（2026-11-03）**：`crates/xremail-protocol-imap/src/idle.rs`
      （`idle_once`，由 `crates/xremail-sync/src/actor.rs` 的 `wait_for_change` 调用）；

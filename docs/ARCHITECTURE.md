@@ -78,6 +78,10 @@ trait 放在使用方或低层契约模块；不因“只有 trait”就允许�
 - 用户操作到达：请求退出 IDLE → 发送 DONE → 等 tagged completion → 执行命令 → 返回 IDLE。
 - IDLE 仅监听被选中的 mailbox；其他文件夹需轮询或调度切换，不能声称监听 INBOX 覆盖全账户。
 - 无 IDLE 时轮询；认证失败进入待重新授权，不用无限重连掩盖问题。
+  （2026-11-03 落地：`crates/xremail-sync/src/actor.rs` 里 `AppError::Auth` 是**终态**——
+  发 `AccountEvent::NeedsReauth` 后直接退出 actor，不再退避重试；
+  应用层映射成 `SyncState::ReauthRequired`。所以错授权码不会把日志刷满、
+  也不会把「要人管」伪装成「正在重连」。用户重新保存授权码后再 `start` 即可）
 - SMTP 可独立连接；操作 worker 按账户/文件夹身份顺序执行，不能与 Actor 争用 IMAP 流。
 - SQLite WAL、有界连接池、busy timeout；所有业务写入由 Rust 协调，不等于只有一个连接或一个 task。
 - 退出、账户删除、网络切换均传播取消；后台任务应被监督并回收。

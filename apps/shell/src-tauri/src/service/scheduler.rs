@@ -139,6 +139,18 @@ impl<R: Runtime> EventSink for TauriSink<R> {
                     ),
                 });
             }
+            AccountEvent::NeedsReauth {
+                account_id,
+                message,
+            } => {
+                // 「服务器拒了凭据」—→ UI 上必须是一个**停在那里等人**的状态，
+                // 不是「正在重连」。重试一个错密码永远不会成功。
+                self.state(&account_id, SyncState::ReauthRequired);
+                self.send(AppEvent::SyncError {
+                    account_id,
+                    message: format!("授权码被拒绝，已暂停自动同步，请重新保存授权码：{message}"),
+                });
+            }
             AccountEvent::Abandoned {
                 account_id,
                 message,
