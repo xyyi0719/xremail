@@ -82,6 +82,11 @@ trait 放在使用方或低层契约模块；不因“只有 trait”就允许�
   发 `AccountEvent::NeedsReauth` 后直接退出 actor，不再退避重试；
   应用层映射成 `SyncState::ReauthRequired`。所以错授权码不会把日志刷满、
   也不会把「要人管」伪装成「正在重连」。用户重新保存授权码后再 `start` 即可）
+  （**2026-11-03 补正**：上面这条在此之前只对「登录路径」成立——命令层的 `NO`
+  曾被误判成认证失败（删掉一个文件夹就能把整个账户判死并停在待重新授权），
+  而外壳层的 `connect` 又把真·登录被拒拍平成协议错（错授权码被永久重试）。
+  两处均已修：命令错误一律走 `connection::classify_imap_error`，只有登录路径
+  才能产出 `ProtocolError::Auth`；外壳层改走 `xremail_sync::map_protocol_error`。见 R25）
 - SMTP 可独立连接；操作 worker 按账户/文件夹身份顺序执行，不能与 Actor 争用 IMAP 流。
 - SQLite WAL、有界连接池、busy timeout；所有业务写入由 Rust 协调，不等于只有一个连接或一个 task。
 - 退出、账户删除、网络切换均传播取消；后台任务应被监督并回收。

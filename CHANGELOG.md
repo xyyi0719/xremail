@@ -310,6 +310,27 @@
   用于测非 UTF-8 编码（GBK 正文）
 
 ### Fixed
+- **认证失败的分类在两个方向上都错，其中一处让「认证终态」从未生效**（R25，2026-11-03）
+  - `crates/xremail-protocol-imap/src/command.rs` 的 `classify_imap_error` 把
+    **任意命令**的 `NO` 判成 `ProtocolError::Auth`。但 `EXAMINE` / `SELECT` 回 `NO`
+    的原因绝大多数与凭据无关：文件夹在 `LIST` 与 `EXAMINE` 之间被别的客户端删掉/改名、
+    变成 `\Noselect`、没有权限、`NO [INUSE] mailbox locked`、单连接邮箱数超限。
+    经 `pull::map_protocol_error` 翻成 `AppError::Auth` 后，`actor` **直接退出**
+    并把账户停在 `ReauthRequired`——**删掉一个文件夹就等于把整个账户判死**，
+    而重新授权多少次都不会好
+  - 反方向也错：`apps/shell/src-tauri/src/service/sync.rs:61` 的 `connect` 把
+    **所有**连接/登录错误拍平成 `AppError::Protocol`，`connection.rs:261` 已经
+    正确判出的 `ProtocolError::Auth` 在这里被抹掉，于是**错授权码被永久重试**、
+    UI 一直显示「正在重连」——「认证失败终态」在产品路径上其实从未生效。
+    `service/sent_copy.rs:147` 的「存副本」连接路径有同一问题
+  - 修法：命令层的 `NO` 一律走 `connection::classify_imap_error`（`No` / `Bad` →
+    `ProtocolError::Imap`，`Io` / `ConnectionLost` → `Io`），**只有登录路径才能产出
+    `Auth`**；`pull::map_protocol_error` 改 `pub` 并由外壳层复用，保住
+    「要人管」与「可重试」的区分
+  - 用例 797 → **802**：`command_no_is_not_an_auth_failure`、
+    `connection_lost_is_a_retryable_io_failure`、`map_protocol_error_keeps_auth`、
+    `map_protocol_error_keeps_command_no_as_protocol`、
+    `map_protocol_error_maps_transport_to_network`
 - **`COPY` 重发会在目标文件夹多出副本**（2026-11-03，审计发现）
   - `crates/xremail-sync/src/transfer_push.rs` 的 `SubmitError::Uncertain` 分支用
     `update_operation_state` 收尾，**不自增 `attempts`**；而 `claim_for_push` 靠

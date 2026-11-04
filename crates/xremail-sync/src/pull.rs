@@ -79,7 +79,11 @@ impl FolderSyncReport {
 ///
 /// 保留「可重试 / 需用户处理」的分类：
 /// 认证失败要用户处理，网络抖动可以重试。
-pub(crate) fn map_protocol_error(error: ProtocolError) -> AppError {
+///
+/// **公开**是有意的：外壳层的「连接并登录」也要走这里。那里曾把登录错误
+/// 一律拍平成 `AppError::Protocol`，结果「授权码错了」被当成了可重试的协议错，
+/// 永久重连。见 `docs/ISSUES_AND_RISKS.md` 的 R25。
+pub fn map_protocol_error(error: ProtocolError) -> AppError {
     match error {
         ProtocolError::Auth(detail) => AppError::Auth(detail),
         ProtocolError::Io(detail) => AppError::Network(detail),
@@ -376,6 +380,41 @@ pub fn protected_uids() -> BTreeSet<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ProtocolError::Auth` 必须原样变成 `AppError::Auth`。
+    ///
+    /// `actor` 靠 `AppError::Auth` 判定「要人管」并退出（停到 `ReauthRequired`）。
+    /// 它一旦被压成 `Protocol`，一个错授权码就会被**永久重试**。
+    #[test]
+    fn map_protocol_error_keeps_auth() {
+        assert!(matches!(
+            map_protocol_error(ProtocolError::Auth("登录被拒".into())),
+            AppError::Auth(_)
+        ));
+    }
+
+    /// 但命令上的 `NO`（`ProtocolError::Imap`）只能是 `AppError::Protocol`，
+    /// 不能是 `Auth`——否则删个文件夹就把账户判死。
+    #[test]
+    fn map_protocol_error_keeps_command_no_as_protocol() {
+        assert!(matches!(
+            map_protocol_error(ProtocolError::Imap("文件夹不存在".into())),
+            AppError::Protocol(_)
+        ));
+    }
+
+    /// 传输层故障与超时都是可重试的网络错。
+    #[test]
+    fn map_protocol_error_maps_transport_to_network() {
+        assert!(matches!(
+            map_protocol_error(ProtocolError::Io("连接被断开".into())),
+            AppError::Network(_)
+        ));
+        assert!(matches!(
+            map_protocol_error(ProtocolError::Timeout("超时".into())),
+            AppError::Network(_)
+        ));
+    }
 
     #[test]
     fn uid_set_merges_consecutive_ranges() {

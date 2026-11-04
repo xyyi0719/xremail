@@ -55,10 +55,16 @@ impl SyncService {
         let mut config = ImapConfig::imaps(&account.server.imap_host);
         config.port = account.server.imap_port;
 
+        // **不要**把这里的错误一律拍平成 `AppError::Protocol`。
+        //
+        // `connect_and_login_with` 已经把错误分好了类：登录被拒是 `ProtocolError::Auth`，
+        // 网络问题则是 `Io` / `Connect` / `Timeout`。拍平之后 `AppError::Auth` 再也不会
+        // 出现，而 actor 正是靠它判定「要人管」并停止重试——于是**一个错授权码会被永久
+        // 重试**，UI 一直显示「正在重连」，把「要人管」伪装成「会自愈」。见 R25。
         let (session, _caps, _tls) =
             connect_and_login_with(&config, &TlsTrust::SystemRoots, &account.username, password)
                 .await
-                .map_err(|e| AppError::Protocol(format!("连接或登录失败: {e}")))?;
+                .map_err(xremail_sync::map_protocol_error)?;
 
         Ok(session)
     }

@@ -59,7 +59,7 @@ pub use intent::{
     FlagDelta, FlagIntent, FlagPlan, MAX_REPLAN_ATTEMPTS, apply_intents, plan_flag_update,
     stale_intents,
 };
-pub use pull::{FolderSyncReport, flags_from_imap, pull_folder};
+pub use pull::{FolderSyncReport, flags_from_imap, map_protocol_error, pull_folder};
 pub use push::{FlagPushReport, push_flags, push_flags_as};
 pub use reconcile::{
     MAX_OPERATION_ATTEMPTS, OperationObservation, ReconcileDecision, ReconcileReport,

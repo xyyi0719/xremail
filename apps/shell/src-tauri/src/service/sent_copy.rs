@@ -141,10 +141,12 @@ impl SentCopyService {
         let mut config = ImapConfig::imaps(&account.server.imap_host);
         config.port = account.server.imap_port;
 
+        // 登录错误不能拍平：登录被拒要变 `AppError::Auth`，否则「授权码错了」
+        // 会被当成可重试的协议错而永久重试。见 R25。
         let (mut session, _caps, _tls) =
             connect_and_login_with(&config, &self.trust, &account.username, password)
                 .await
-                .map_err(|e| AppError::Protocol(format!("连接或登录失败: {e}")))?;
+                .map_err(xremail_sync::map_protocol_error)?;
 
         let folders = list_folders(&mut session)
             .await

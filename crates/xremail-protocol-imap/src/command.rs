@@ -44,13 +44,19 @@ pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 把 async-imap 的错误分类成 [`ProtocolError`]。
 ///
-/// 关键区分：**“密码不对”与“网络断了”不是一回事**
-/// （详见 `connection` 模块里的同名函数）。
+/// **命令收到的 `NO` 不是认证失败。** 能推出「授权码不对」的只有「登录被拒」，
+/// 那件事由 [`crate::connection::classify_login_error`] 负责。命令上的 `NO` 有无
+/// 数种与凭据无关的原因：文件夹在 `LIST` 与 `EXAMINE` 之间被别的客户端删掉/改名、
+/// 文件夹变成 `\Noselect`、没有权限、`NO [INUSE] mailbox locked`、单连接打开的
+/// 邮箱数超限、代理临时拒绝……
+///
+/// 这里曾经把 `No` 判成 [`ProtocolError::Auth`]，后果很硬：`pull` 会把它翻成
+/// `AppError::Auth`，而 `actor` 见到 `AppError::Auth` 就**直接退出**、让账户停在
+/// `ReauthRequired`。也就是说「删掉一个文件夹」＝「把整个账户判死、等用户重新授权」，
+/// 而重新授权多少次都不会好。见 `docs/ISSUES_AND_RISKS.md` 的 R25。
 fn classify_imap_error(error: async_imap::error::Error) -> ProtocolError {
-    match error {
-        async_imap::error::Error::No(detail) => ProtocolError::Auth(detail),
-        other => crate::connection::classify_imap_error(other),
-    }
+    // 交给 `connection` 那一套：`No` / `Bad` → `Imap`，`Io` / `ConnectionLost` → `Io`。
+    crate::connection::classify_imap_error(error)
 }
 
 /// 一条 FETCH 响应（已解析）。
@@ -412,6 +418,31 @@ fn parse_fetch(seq: u32, attributes: &[AttributeValue<'_>]) -> FetchedMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 命令上的 `NO` 一律不是认证失败——只有登录被拒才是。
+    ///
+    /// 回归用例：这里曾把 `No` 判成 `ProtocolError::Auth`，于是「文件夹被别的
+    /// 客户端删掉」会让 `pull` 把它翻成 `AppError::Auth`，actor 见到就退出，
+    /// 账户停在 `ReauthRequired`，而用户重新授权永远不会好。
+    #[test]
+    fn command_no_is_not_an_auth_failure() {
+        let error = classify_imap_error(async_imap::error::Error::No(
+            "[TRYCREATE] 文件夹不存在".into(),
+        ));
+
+        assert!(
+            !matches!(error, ProtocolError::Auth(_)),
+            "命令的 NO 被当成了认证失败，会让删个文件夹就把账户判死：{error:?}"
+        );
+        assert!(matches!(error, ProtocolError::Imap(_)));
+    }
+
+    /// 反过来也要钉住：传输层故障必须是可重试的 `Io`，不能被当成协议错。
+    #[test]
+    fn connection_lost_is_a_retryable_io_failure() {
+        let error = classify_imap_error(async_imap::error::Error::ConnectionLost);
+        assert!(matches!(error, ProtocolError::Io(_)));
+    }
 
     #[test]
     fn parse_fetch_extracts_common_attributes() {
