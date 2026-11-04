@@ -1,0 +1,515 @@
+//! COPY / MOVE / EXPUNGE：把邮件移走、删掉。
+//!
+//! ## 为什么单独一层
+//!
+//! 这两条命令的**成败判定**和 `STORE` 一样容易被骗：async-imap 的
+//! `uid_copy` / `uid_mv` 在服务器回带 tag 的 `NO` / `BAD` 时**不会**报错
+//! （同一个响应解析问题，见 [`crate::command`] 的模块注释）。
+//! 所以这里自己发命令、自己读 tagged 响应、自己判定。
+//!
+//! ## `MOVE` 不是每家都有
+//!
+//! 三家实测（[PROTOCOLS.md](../../../docs/PROTOCOLS.md)）：
+//! **只有 QQ 有 `MOVE`**；163 与沃（Coremail 体系）都**没有**。
+//! 所以调用方必须先看 [`crate::ExtensionSupport::move`]：
+//!
+//! * 有 `MOVE` → 一步 `UID MOVE`
+//! * 没有 → 保守路径：`UID COPY` → `UID STORE +FLAGS (\Deleted)`
+//!   → **有 `UIDPLUS` 才** `UID EXPUNGE`
+//!
+//! ## 删除为什么不能一律 `EXPUNGE`
+//!
+//! 裸 `EXPUNGE` 会把这个文件夹里**所有**带 `\Deleted` 的邮件都删掉，
+//! 包括别的客户端（手机、网页版）标了 `\Deleted` 但还没提交的。
+//! 那也是用户的数据，不能替别人做决定。
+//!
+//! 只有支持 `UIDPLUS`（RFC 4315）时才有 `UID EXPUNGE <set>`——它只删指定的那些；
+//! 163 恰好**没有** `UIDPLUS`。所以没有 `UIDPLUS` 时本模块**只标 `\Deleted`
+//! 不 expunge**，把「真正消失」的时机交还给服务器与用户自己的客户端。
+
+use imap_proto::rfc4315::UidSetMember;
+use imap_proto::{Response, ResponseCode, Status};
+
+use crate::connection::Session;
+use crate::error::ProtocolError;
+
+/// 展开 `COPYUID` / `APPENDUID` 里 UID 区间的**上限**。
+///
+/// 服务器可能回 `1:4294967295` 这种区间。照着展开会瞬间吃掉几个 GB
+/// （R09 有前科：`1:*` 被展开成 1.79 亿个元素，撑爆过假服务器 8 GiB）。
+/// 超过这个上限就截断——真实用途里一次移动几千封已经是极端值了。
+const UID_EXPANSION_LIMIT: usize = 10_000;
+
+/// 一次 COPY / MOVE 的结果。
+///
+/// 字段大多来自 `COPYUID` 响应码（RFC 4315）——**服务器不给就是 `None`**，
+/// 这很正常：163 与沃都不保证给。拿不到时调用方只能靠重新拉取确认。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransferOutcome {
+    /// 源文件夹的 UIDVALIDITY。
+    pub source_uid_validity: Option<u32>,
+    /// 目标文件夹的 UIDVALIDITY。
+    pub destination_uid_validity: Option<u32>,
+    /// 源文件夹里被复制/移动的那些 UID。
+    pub source_uids: Vec<u32>,
+    /// 目标文件夹里对应的新 UID。
+    ///
+    /// 与 [`Self::source_uids`] **按下标一一对应**（RFC 4315 §3）。
+    /// 长度不等时说明服务器回的区间被截断了，别硬套。
+    pub destination_uids: Vec<u32>,
+    /// 服务器的说明文字。
+    pub message: Option<String>,
+}
+
+impl TransferOutcome {
+    /// 服务器有没有告诉我们「新 UID 是什么」。
+    pub fn has_uid_mapping(&self) -> bool {
+        !self.destination_uids.is_empty() && self.destination_uids.len() == self.source_uids.len()
+    }
+
+    /// 按源 UID 查目标 UID（没有对应关系时返回 `None`）。
+    pub fn destination_uid_of(&self, source_uid: u32) -> Option<u32> {
+        if !self.has_uid_mapping() {
+            return None;
+        }
+        self.source_uids
+            .iter()
+            .position(|uid| *uid == source_uid)
+            .map(|index| self.destination_uids[index])
+    }
+}
+
+/// 把 `UID COPY` 搬到 `mailbox` 里的命令（不含 tag，也不含结尾 CRLF）。
+///
+/// `mailbox` 传**线路上的原名**（modified UTF-7），不是解码后的名字——
+/// 理由同 [`crate::append::build_append_command`]。
+pub fn build_copy_command(uids: &[u32], mailbox: &str) -> String {
+    format!("UID COPY {} {}", uid_list(uids), quote_mailbox(mailbox))
+}
+
+/// 把 `UID MOVE` 搬到 `mailbox` 里的命令（RFC 6851）。
+///
+/// 服务器没有 `MOVE` 能力时这条命令会得到 `BAD`——调用方要先用
+/// [`crate::ExtensionSupport::move`] 判断，别指望它自己降级。
+pub fn build_move_command(uids: &[u32], mailbox: &str) -> String {
+    format!("UID MOVE {} {}", uid_list(uids), quote_mailbox(mailbox))
+}
+
+/// 给这些 UID 打上 `\Deleted`（删除的第一步）。
+///
+/// 用 `.SILENT` 是为了省掉每条 untagged `FETCH` 回复；
+/// 需要确认标记是否真的生效时，调用方应当自己再 `UID FETCH` 一次
+/// （ARCHITECTURE §6 的「回读确认」）。
+pub fn build_store_deleted_command(uids: &[u32]) -> String {
+    format!("UID STORE {} +FLAGS.SILENT (\\Deleted)", uid_list(uids))
+}
+
+/// `UID EXPUNGE`（RFC 4315）：只删**指定的**那些 `\Deleted`。
+///
+/// 没有 `UIDPLUS` 的服务器会回 `BAD`，别调。
+pub fn build_uid_expunge_command(uids: &[u32]) -> String {
+    format!("UID EXPUNGE {}", uid_list(uids))
+}
+
+/// 把一批 UID 复制到另一个文件夹。
+pub async fn copy_messages(
+    session: &mut Session,
+    uids: &[u32],
+    mailbox: &str,
+) -> Result<TransferOutcome, ProtocolError> {
+    ensure_usable(uids)?;
+    let command = build_copy_command(uids, mailbox);
+    run_transfer(session, &command, uids).await
+}
+
+/// 把一批 UID 移动到另一个文件夹（需要服务器支持 `MOVE`）。
+pub async fn move_messages(
+    session: &mut Session,
+    uids: &[u32],
+    mailbox: &str,
+) -> Result<TransferOutcome, ProtocolError> {
+    ensure_usable(uids)?;
+    let command = build_move_command(uids, mailbox);
+    run_transfer(session, &command, uids).await
+}
+
+/// 给一批 UID 打 `\Deleted`。
+pub async fn mark_deleted(session: &mut Session, uids: &[u32]) -> Result<(), ProtocolError> {
+    ensure_usable(uids)?;
+    let command = build_store_deleted_command(uids);
+    run_simple(session, &command, "UID STORE \\Deleted").await
+}
+
+/// `UID EXPUNGE` 一批 UID（需要服务器支持 `UIDPLUS`）。
+pub async fn uid_expunge(session: &mut Session, uids: &[u32]) -> Result<(), ProtocolError> {
+    ensure_usable(uids)?;
+    let command = build_uid_expunge_command(uids);
+    run_simple(session, &command, "UID EXPUNGE").await
+}
+
+/// 入参检查：空集合与超长集合都**不能**发出去。
+///
+/// 空的 UID 集合在线上是语法错误（服务器回 `BAD`），
+/// 而且它一定是调用方的 bug——与其发出去换一句看不懂的 `BAD`，不如在这里说清楚。
+fn ensure_usable(uids: &[u32]) -> Result<(), ProtocolError> {
+    if uids.is_empty() {
+        return Err(ProtocolError::Invalid(
+            "要移动/删除的 UID 集合是空的".to_string(),
+        ));
+    }
+    if uids.len() > UID_EXPANSION_LIMIT {
+        return Err(ProtocolError::Invalid(format!(
+            "一次最多处理 {UID_EXPANSION_LIMIT} 封，收到 {} 封",
+            uids.len()
+        )));
+    }
+    Ok(())
+}
+
+/// 拼 UID 集合：排序去重，逗号分隔。
+///
+/// 排序去重不是洁癖：`1,1,2` 这种重复在某些服务器上会让 `STORE`
+/// 重复执行同一封（浪费往返），而乱序会让 `COPYUID` 的
+/// 「源集合 ↔ 目标集合按下标对应」变得难以核对。
+fn uid_list(uids: &[u32]) -> String {
+    let mut sorted = uids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    sorted
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// 给文件夹名加引号（与 [`crate::append`] 同一套规则）。
+fn quote_mailbox(mailbox: &str) -> String {
+    let mut quoted = String::with_capacity(mailbox.len() + 2);
+    quoted.push('"');
+    for ch in mailbox.chars() {
+        if ch == '"' || ch == '\\' {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// 跑一条「只看成败」的命令。
+async fn run_simple(
+    session: &mut Session,
+    command: &str,
+    label: &str,
+) -> Result<(), ProtocolError> {
+    match run_until_tagged(session, command).await? {
+        TaggedOutcome::Ok(_) => Ok(()),
+        TaggedOutcome::Failed(detail) => {
+            Err(ProtocolError::Imap(format!("{label} 失败: {detail}")))
+        }
+    }
+}
+
+/// 跑一条 COPY / MOVE，并从 `COPYUID` 里取 UID 映射。
+async fn run_transfer(
+    session: &mut Session,
+    command: &str,
+    requested: &[u32],
+) -> Result<TransferOutcome, ProtocolError> {
+    match run_until_tagged(session, command).await? {
+        TaggedOutcome::Ok(details) => {
+            let (source_uid_validity, source_uids, destination_uids) = match details.copy_uid {
+                Some(code) => (
+                    Some(code.source_validity),
+                    code.source_uids,
+                    code.destination_uids,
+                ),
+                None => (None, Vec::new(), Vec::new()),
+            };
+
+            // 服务器没给 COPYUID 时，源集合就是我们自己发出去的那些
+            // ——这个信息不需要服务器确认。
+            let source_uids = if source_uids.is_empty() {
+                let mut requested = requested.to_vec();
+                requested.sort_unstable();
+                requested.dedup();
+                requested
+            } else {
+                source_uids
+            };
+
+            Ok(TransferOutcome {
+                source_uid_validity,
+                // RFC 4315 的 COPYUID 只带**源**文件夹的 UIDVALIDITY，
+                // 目标文件夹的一律不告诉客户端。
+                destination_uid_validity: None,
+                source_uids,
+                destination_uids,
+                message: details.information,
+            })
+        }
+        TaggedOutcome::Failed(detail) => Err(ProtocolError::Imap(detail)),
+    }
+}
+
+/// 一条带 tag 命令的结局。
+enum TaggedOutcome {
+    /// 服务器回了 `OK`。
+    Ok(OkDetails),
+    /// 服务器回了 `NO` / `BAD`（已带上下文）。
+    Failed(String),
+}
+
+/// `OK` 里我们真正用得上的东西（已脱离响应缓冲区的生命周期）。
+#[derive(Debug, Default)]
+struct OkDetails {
+    /// `COPYUID` 里的 UID 映射（服务器没给就是 `None`）。
+    copy_uid: Option<CopyUid>,
+    /// 服务器的说明文字。
+    information: Option<String>,
+}
+
+/// `COPYUID` 的已解析形态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopyUid {
+    /// 源文件夹的 UIDVALIDITY。
+    source_validity: u32,
+    /// 源集合（线上顺序）。
+    source_uids: Vec<u32>,
+    /// 目标集合（与 `source_uids` **按下标**对应）。
+    destination_uids: Vec<u32>,
+}
+
+/// 发一条命令并读到**属于它的**那个 tagged 响应为止。
+///
+/// 关键点：别的命令发来的 untagged 响应（`EXISTS` / `EXPUNGE` / `FETCH` …）
+/// 与本命令无关，**忽略并继续读**。移动/删除会让文件夹变空，
+/// 服务器会连着推好几条 untagged 响应，不能遇到一条就收工。
+async fn run_until_tagged(
+    session: &mut Session,
+    command: &str,
+) -> Result<TaggedOutcome, ProtocolError> {
+    let id = session
+        .run_command(command)
+        .await
+        .map_err(|e| ProtocolError::Imap(format!("发送命令失败: {e}")))?;
+
+    loop {
+        let response = session
+            .read_response()
+            .await
+            .map_err(|e| ProtocolError::Io(e.to_string()))?;
+
+        let Some(response) = response else {
+            return Err(ProtocolError::Io("连接被断开".into()));
+        };
+
+        // untagged 响应（`EXISTS` / `EXPUNGE` / `FETCH` …）：与成败无关，忽略。
+        let Response::Done {
+            tag,
+            status,
+            outcome,
+        } = response.parsed()
+        else {
+            continue;
+        };
+
+        // 别的命令的响应：忽略，继续读。
+        if tag != &id {
+            continue;
+        }
+
+        let result = match status {
+            Status::Ok => TaggedOutcome::Ok(OkDetails {
+                copy_uid: copy_uid_of(outcome),
+                information: outcome.information.as_ref().map(|text| text.to_string()),
+            }),
+            Status::No => TaggedOutcome::Failed(format!(
+                "服务器拒绝（NO）: {}",
+                crate::command::outcome_information(outcome)
+            )),
+            Status::Bad => TaggedOutcome::Failed(format!(
+                "服务器拒绝（BAD）: {}",
+                crate::command::outcome_information(outcome)
+            )),
+            other => TaggedOutcome::Failed(format!("意外的响应状态: {other:?}")),
+        };
+
+        return Ok(result);
+    }
+}
+
+/// 从 `OK` 响应里抠出 `COPYUID`（没有就是 `None`）。
+///
+/// RFC 4315 的 `COPYUID` 语法是
+/// `COPYUID <源 UIDVALIDITY> <源 uid-set> <目标 uid-set>`——
+/// **只有一个** UIDVALIDITY，目标文件夹的它不告诉客户端。
+fn copy_uid_of(outcome: &imap_proto::Outcome<'_>) -> Option<CopyUid> {
+    match &outcome.code {
+        Some(ResponseCode::CopyUid(validity, source, destination)) => Some(CopyUid {
+            source_validity: *validity,
+            source_uids: expand_uid_set(source),
+            destination_uids: expand_uid_set(destination),
+        }),
+        _ => None,
+    }
+}
+
+/// 把 `UID SET` 展开成具体 UID 列表（有上限，见 [`UID_EXPANSION_LIMIT`]）。
+fn expand_uid_set(members: &[UidSetMember]) -> Vec<u32> {
+    let mut out: Vec<u32> = Vec::new();
+
+    for member in members {
+        match member {
+            UidSetMember::Uid(uid) => out.push(*uid),
+            UidSetMember::UidRange(range) => {
+                // `range` 是**闭区间**（imap-proto 用 `fst..=snd`），
+                // 所以 `.end()` 就是最后一个 UID，**不要**再减 1。
+                let remaining = UID_EXPANSION_LIMIT.saturating_sub(out.len());
+                out.extend(range.clone().take(remaining));
+            }
+        }
+
+        if out.len() >= UID_EXPANSION_LIMIT {
+            break;
+        }
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_command_quotes_mailbox_and_sorts_uids() {
+        assert_eq!(
+            build_copy_command(&[3, 1, 2], "Trash"),
+            "UID COPY 1,2,3 \"Trash\""
+        );
+    }
+
+    #[test]
+    fn copy_command_dedups_repeated_uids() {
+        assert_eq!(
+            build_copy_command(&[7, 7, 7], "Trash"),
+            "UID COPY 7 \"Trash\""
+        );
+    }
+
+    #[test]
+    fn move_command_uses_the_move_extension() {
+        assert_eq!(
+            build_move_command(&[42], "&XfJT0ZAB-"),
+            "UID MOVE 42 \"&XfJT0ZAB-\""
+        );
+    }
+
+    #[test]
+    fn mailbox_with_quote_or_backslash_is_escaped() {
+        assert_eq!(
+            build_copy_command(&[1], "we\"ird"),
+            "UID COPY 1 \"we\\\"ird\""
+        );
+        assert_eq!(
+            build_copy_command(&[1], "back\\slash"),
+            "UID COPY 1 \"back\\\\slash\""
+        );
+    }
+
+    #[test]
+    fn store_deleted_command_is_silent() {
+        assert_eq!(
+            build_store_deleted_command(&[5, 4]),
+            "UID STORE 4,5 +FLAGS.SILENT (\\Deleted)"
+        );
+    }
+
+    #[test]
+    fn uid_expunge_command_targets_only_the_given_set() {
+        assert_eq!(build_uid_expunge_command(&[9]), "UID EXPUNGE 9");
+    }
+
+    #[test]
+    fn empty_uid_set_is_rejected_before_hitting_the_wire() {
+        let error = ensure_usable(&[]).expect_err("空集合必须被拒绝");
+        assert!(
+            matches!(error, ProtocolError::Invalid(_)),
+            "应当是 Invalid，实际是 {error:?}"
+        );
+    }
+
+    #[test]
+    fn oversized_uid_set_is_rejected() {
+        let uids: Vec<u32> = (1..=(UID_EXPANSION_LIMIT as u32 + 1)).collect();
+        let error = ensure_usable(&uids).expect_err("超长集合必须被拒绝");
+        assert!(matches!(error, ProtocolError::Invalid(_)));
+    }
+
+    #[test]
+    fn uid_range_is_expanded_inclusively() {
+        // 这是 append.rs 里那个 `end() - 1` 反例的正解：
+        // `5:7` 是闭区间，包含 7。
+        let members = vec![UidSetMember::UidRange(5..=7)];
+        assert_eq!(expand_uid_set(&members), vec![5, 6, 7]);
+    }
+
+    #[test]
+    fn uid_range_expansion_is_bounded() {
+        let members = vec![UidSetMember::UidRange(1..=u32::MAX)];
+        let expanded = expand_uid_set(&members);
+        assert_eq!(
+            expanded.len(),
+            UID_EXPANSION_LIMIT,
+            "区间必须被截断，不能照着展开"
+        );
+    }
+
+    #[test]
+    fn mixed_uid_set_expands_in_wire_order() {
+        let members = vec![
+            UidSetMember::Uid(3),
+            UidSetMember::UidRange(10..=11),
+            UidSetMember::Uid(20),
+        ];
+        assert_eq!(expand_uid_set(&members), vec![3, 10, 11, 20]);
+    }
+
+    #[test]
+    fn outcome_without_copy_uid_reports_no_mapping() {
+        let outcome = TransferOutcome {
+            source_uids: vec![1, 2],
+            destination_uids: Vec::new(),
+            ..TransferOutcome::default()
+        };
+        assert!(!outcome.has_uid_mapping());
+        assert_eq!(outcome.destination_uid_of(1), None);
+    }
+
+    #[test]
+    fn mapping_is_positional_not_value_based() {
+        // 服务器给的源集合可能是乱序的：`5,1` → `103,101`。
+        // 对应关系是**按下标**，不是按大小。
+        let outcome = TransferOutcome {
+            source_uids: vec![5, 1],
+            destination_uids: vec![103, 101],
+            ..TransferOutcome::default()
+        };
+        assert!(outcome.has_uid_mapping());
+        assert_eq!(outcome.destination_uid_of(5), Some(103));
+        assert_eq!(outcome.destination_uid_of(1), Some(101));
+        assert_eq!(outcome.destination_uid_of(9), None);
+    }
+
+    #[test]
+    fn mismatched_lengths_are_not_treated_as_a_mapping() {
+        let outcome = TransferOutcome {
+            source_uids: vec![1, 2, 3],
+            destination_uids: vec![100],
+            ..TransferOutcome::default()
+        };
+        assert!(!outcome.has_uid_mapping());
+        assert_eq!(outcome.destination_uid_of(1), None);
+    }
+}

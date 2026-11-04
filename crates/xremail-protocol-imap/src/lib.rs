@@ -19,6 +19,7 @@ pub mod credential;
 pub mod error;
 pub mod folders;
 pub mod probe;
+pub mod transfer;
 pub mod utf7;
 
 pub use append::{AppendOptions, AppendOutcome, append_message, build_append_command};
@@ -36,6 +37,10 @@ pub use folders::{RemoteFolder, list_folders};
 pub use probe::{
     ExtensionSupport, FolderSummary, MailboxSummary, ProbeConfig, ProbeReport, auth_mechanisms,
     capability_names, extension_support, probe,
+};
+pub use transfer::{
+    TransferOutcome, build_copy_command, build_move_command, build_store_deleted_command,
+    build_uid_expunge_command, copy_messages, mark_deleted, move_messages, uid_expunge,
 };
 pub use utf7::{Utf7Error, decode as decode_utf7, encode as encode_utf7};
 

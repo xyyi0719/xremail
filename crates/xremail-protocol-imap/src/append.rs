@@ -250,15 +250,17 @@ async fn read_append_result(
 
 /// 从响应里取出 `APPENDUID` 里的 UID。
 fn appended_uid(outcome: &imap_proto::Outcome<'_>) -> Option<u32> {
-    match &outcome.code {
-        Some(ResponseCode::AppendUid(_, members)) => {
-            members.iter().find_map(|member| match member {
-                UidSetMember::Uid(uid) => Some(*uid),
-                UidSetMember::UidRange(range) => range.end().checked_sub(1),
-            })
-        }
-        _ => None,
-    }
+    let Some(ResponseCode::AppendUid(_, members)) = &outcome.code else {
+        return None;
+    };
+    // `APPENDUID` 只可能给一个 UID；带区间时取**最后一个**：
+    // `UidRange` 是闭区间（imap-proto 用 `fst..=snd` 构造），所以 `.end()` 就是末个 UID。
+    // 曾经写成 `end().checked_sub(1)`：`APPENDUID 123 5:7` 会被错报成 6，
+    // 于是发信副本的 UID 全记错一位。
+    members.first().map(|member| match member {
+        UidSetMember::Uid(uid) => *uid,
+        UidSetMember::UidRange(range) => *range.end(),
+    })
 }
 
 /// 从响应里取出 `APPENDUID` 里的 UIDVALIDITY。

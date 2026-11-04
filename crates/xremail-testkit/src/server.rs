@@ -820,6 +820,36 @@ where
             .await?;
         }
 
+        "COPY" => {
+            handle_copy_or_move(
+                &mut writer,
+                ctx,
+                state,
+                &command.tag,
+                &command.args,
+                false,
+                false,
+            )
+            .await?;
+        }
+
+        "MOVE" => {
+            handle_copy_or_move(
+                &mut writer,
+                ctx,
+                state,
+                &command.tag,
+                &command.args,
+                false,
+                true,
+            )
+            .await?;
+        }
+
+        "EXPUNGE" => {
+            handle_expunge(&mut writer, ctx, state, &command.tag, None, "EXPUNGE").await?;
+        }
+
         "UID" => {
             // `UID FETCH` / `UID SEARCH` / `UID STORE`。
             let Some((sub, rest)) = command.uid_subcommand() else {
@@ -842,6 +872,25 @@ where
                         rest,
                         true,
                         "UID STORE",
+                    )
+                    .await?;
+                }
+                "COPY" => {
+                    handle_copy_or_move(&mut writer, ctx, state, &command.tag, rest, true, false)
+                        .await?;
+                }
+                "MOVE" => {
+                    handle_copy_or_move(&mut writer, ctx, state, &command.tag, rest, true, true)
+                        .await?;
+                }
+                "EXPUNGE" => {
+                    handle_expunge(
+                        &mut writer,
+                        ctx,
+                        state,
+                        &command.tag,
+                        Some(rest),
+                        "UID EXPUNGE",
                     )
                     .await?;
                 }
@@ -872,6 +921,238 @@ where
     }
 
     Ok(Continue::Continue)
+}
+
+/// `COPY` / `MOVE` 的实现（RFC 3501 §6.4.7、RFC 6851）。
+///
+/// `args` 形如 `<set> <mailbox>`。
+async fn handle_copy_or_move<W>(
+    mut writer: &mut W,
+    ctx: &ServerCtx<'_>,
+    state: &mut SessionState,
+    tag: &str,
+    args: &str,
+    by_uid: bool,
+    is_move: bool,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let config = ctx.config;
+    let mailboxes = ctx.mailboxes;
+    let label = if is_move { "MOVE" } else { "COPY" };
+
+    let Some(index) = state.selected else {
+        reply!(writer, "{tag} NO {label} State error");
+        return Ok(());
+    };
+
+    // `MOVE` 要从源文件夹里删东西，只读文件夹不行；`COPY` 不动源文件夹。
+    if is_move && state.read_only {
+        reply!(writer, "{tag} NO [READ-ONLY] Mailbox is read-only");
+        return Ok(());
+    }
+
+    let Some((set_text, rest)) = split_first_token(args) else {
+        reply!(writer, "{tag} BAD Missing sequence set");
+        return Ok(());
+    };
+    let set = match SequenceSet::parse(set_text) {
+        Ok(set) => set,
+        Err(err) => {
+            reply!(writer, "{tag} BAD {err}");
+            return Ok(());
+        }
+    };
+
+    // 文件夹名可能是带引号的（`"INBOX"`），也可能是 modified UTF-7 形态。
+    let target_name = crate::parser::quoted_values(rest)
+        .first()
+        .cloned()
+        .unwrap_or_else(|| rest.trim().to_string());
+    let target_index = {
+        let guard = lock_mailboxes(mailboxes);
+        find_mailbox_index(&guard, &target_name)
+    };
+    let Some(target_index) = target_index else {
+        // `TRYCREATE` 是真实服务器的常见提示：目标文件夹不存在，先建再试。
+        reply!(writer, "{tag} NO [TRYCREATE] Mailbox does not exist");
+        return Ok(());
+    };
+
+    // 锁内只改数据，不 await（锁不能跨 await）。
+    let outcome: Option<(Vec<u32>, Vec<u32>)> = 'calc: {
+        let mut guard = lock_mailboxes(mailboxes);
+
+        // 先把源消息**快照**出来：源和目标可能是同一个文件夹，
+        // 那样没法同时持有不可变借用和可变借用。
+        let snapshot: Vec<(u32, MessageFixture)> = {
+            let Some(source) = guard.get(index) else {
+                break 'calc None;
+            };
+            let targets = resolve_targets(&set, &source.messages, by_uid);
+            let mut pairs: Vec<(u32, MessageFixture)> = targets
+                .iter()
+                .map(|&i| (source.messages[i].uid, source.messages[i].clone()))
+                .collect();
+            // 真实服务器的 `COPYUID` 是升序的。
+            pairs.sort_by_key(|(uid, _)| *uid);
+            pairs
+        };
+
+        if guard.get(target_index).is_none() {
+            break 'calc None;
+        }
+
+        let mut source_uids = Vec::with_capacity(snapshot.len());
+        let mut destination_uids = Vec::with_capacity(snapshot.len());
+        for (uid, mut message) in snapshot {
+            let destination = &mut guard[target_index];
+            let new_uid = destination.max_uid() + 1;
+            message.uid = new_uid;
+            message.modseq = destination
+                .messages
+                .iter()
+                .map(|m| m.modseq)
+                .max()
+                .unwrap_or(0)
+                + 1;
+            destination.messages.push(message);
+            source_uids.push(uid);
+            destination_uids.push(new_uid);
+        }
+
+        // `MOVE`：拷完再把源里那几封真的删掉。
+        // RFC 6851 要求只删**被移动的那些**，不是「所有带 `\Deleted` 的」
+        // ——后者是 `EXPUNGE` 的语义，会把用户手动标删的信也一并干掉。
+        if is_move && !source_uids.is_empty() {
+            let source = &mut guard[index];
+            source
+                .messages
+                .retain(|message| !source_uids.contains(&message.uid));
+        }
+
+        Some((source_uids, destination_uids))
+    };
+
+    let Some((source_uids, destination_uids)) = outcome else {
+        reply!(writer, "{tag} NO Mailbox does not exist");
+        return Ok(());
+    };
+
+    if source_uids.is_empty() {
+        // 集合没命中任何信：空操作也是成功（RFC 3501 不要求报错）。
+        reply!(writer, "{tag} OK {label} completed");
+        return Ok(());
+    }
+
+    reply!(
+        writer,
+        "{tag} OK [COPYUID {} {} {}] {label} completed",
+        config.uid_validity,
+        render_uid_set(&source_uids),
+        render_uid_set(&destination_uids)
+    );
+    Ok(())
+}
+
+/// `EXPUNGE`（RFC 3501 §6.4.3）与 `UID EXPUNGE`（RFC 4315 §2.1）。
+///
+/// `args` 为 `None` 时是普通 `EXPUNGE`（删所有带 `\Deleted` 的）；
+/// 为 `Some(set)` 时只删「集合里 **且** 带 `\Deleted`」的。
+async fn handle_expunge<W>(
+    mut writer: &mut W,
+    ctx: &ServerCtx<'_>,
+    state: &mut SessionState,
+    tag: &str,
+    args: Option<&str>,
+    label: &str,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let Some(index) = state.selected else {
+        reply!(writer, "{tag} NO {label} State error");
+        return Ok(());
+    };
+    if state.read_only {
+        reply!(writer, "{tag} NO [READ-ONLY] Mailbox is read-only");
+        return Ok(());
+    }
+
+    let set = match args {
+        Some(text) => match SequenceSet::parse(text.trim()) {
+            Ok(set) => Some(set),
+            Err(err) => {
+                reply!(writer, "{tag} BAD {err}");
+                return Ok(());
+            }
+        },
+        None => None,
+    };
+
+    // 锁内只改数据，不 await。
+    let removed: Option<Vec<u32>> = {
+        let mut guard = lock_mailboxes(ctx.mailboxes);
+        match guard.get_mut(index) {
+            None => None,
+            Some(mailbox) => {
+                let max_uid = mailbox.messages.iter().map(|m| m.uid).max().unwrap_or(0);
+                let doomed: Vec<usize> = mailbox
+                    .messages
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, message)| message.has_flag("\\Deleted"))
+                    .filter(|(_, message)| match &set {
+                        Some(set) => set.contains(message.uid, max_uid),
+                        None => true,
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+
+                // 从后往前删，免得下标错位。
+                for &index in doomed.iter().rev() {
+                    mailbox.messages.remove(index);
+                }
+
+                Some(doomed.iter().map(|&index| index as u32 + 1).collect())
+            }
+        }
+    };
+
+    let Some(removed) = removed else {
+        reply!(writer, "{tag} NO Mailbox does not exist");
+        return Ok(());
+    };
+
+    // 从大到小报：这样每个序号在**报出时**都还是有效的。
+    for sequence in removed.iter().rev() {
+        reply!(writer, "* {} EXPUNGE", sequence);
+    }
+    reply!(writer, "{tag} OK {label} completed");
+    Ok(())
+}
+
+/// 把升序的 UID 列表渲染成紧凑的 `uid-set`（连续段用 `a:b`）。
+fn render_uid_set(uids: &[u32]) -> String {
+    let mut out = String::new();
+    let mut start = 0;
+    while start < uids.len() {
+        let mut end = start;
+        while end + 1 < uids.len() && uids[end + 1] == uids[end] + 1 {
+            end += 1;
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        if end == start {
+            out.push_str(&uids[start].to_string());
+        } else {
+            out.push_str(&format!("{}:{}", uids[start], uids[end]));
+        }
+        start = end + 1;
+    }
+    out
 }
 
 /// 解析 `APPEND` 参数里的标记列表（`(\Seen)`）。
