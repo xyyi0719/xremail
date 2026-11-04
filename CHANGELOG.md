@@ -56,7 +56,8 @@
   - 新增 `crates/xremail-sync/src/transfer_push.rs`：`push_transfers`
     + 纯函数 `route_for`（能在不连服务器的情况下测路由）
   - **路由由服务器能力决定**：有 `MOVE` 就一条 `UID MOVE`；没有则
-    `UID COPY` → 标删 → **有 `UIDPLUS` 才** `UID EXPUNGE`（163 两者都没有，止步于标删）
+    `UID COPY` → 标删 → **有 `UIDPLUS` 才** `UID EXPUNGE`（163 没有 `MOVE`
+    但有 `UIDPLUS`，所以走的是完整三步，**不是**「止步于标删」）
   - **删除 = 进垃圾箱**：有垃圾箱就挪进去（可撤销），没有才就地标删；
     垃圾箱靠文件夹名推断，推不出来就不乱挪
   - **源文件夹里已经没有这封邮件 → 算成功**：`MOVE` 不是幂等的，
@@ -103,7 +104,7 @@
   - 同时收掉孤儿操作（文件夹已删 → `folder_missing`；移动目标已删 →
     `destination_missing`）与旧 epoch 操作（→ `epoch_changed`）
   - **幂等**：重复执行都不动手（当前触发点只有**应用启动一处**，
-    `apps/shell/src-tauri/src/lib.rs:140`；actor 的 `Startup` 轮尚未调它）
+    `apps/shell/src-tauri/src/lib.rs:196`；actor 的 `Startup` 轮尚未调它）
   - 用例 11 个（`crates/xremail-sync/tests/crash_recovery.rs`）
 
 - **账户调度器（AccountActor）与后台任务 panic 边界**（2026-11-03）
@@ -310,6 +311,34 @@
   用于测非 UTF-8 编码（GBK 正文）
 
 ### Fixed
+- **文档表述与代码不符的六处，以及四处失效的行号**（2026-11-04）
+  - **163 的能力事实被写反**。`CHANGELOG.md` 与 `docs/ARCHITECTURE.md` 的能力路由表把
+    「`MOVE` 与 `UIDPLUS` 都没有」这一行标成「（163）」，于是读起来像「163 只能止步于标删」。
+    实际 163 **有** `UIDPLUS`（`docs/PROTOCOLS.md` 的实测矩阵三处一致），缺的只是 `MOVE`，
+    所以它走的是完整三步 `COPY` → 标删 → `UID EXPUNGE`。错的只在文档，
+    代码按运行时能力路由（`transfer_push.rs` 的 `route_for`）不受影响。
+    同一矛盾还残在 `docs/PROTOCOLS.md:347`「`UID MOVE` 支持情况需实测」，
+    而同一节上文早已记为实测不支持。
+  - **R22 的「残余」说反了**。原文写「附件类型黑名单仅前端提示，后端无 MIME 白名单」，
+    实际后端有**扩展名黑名单**（`crates/xremail-core/src/attachment.rs:71 BLOCKED_ATTACHMENT_EXTENSIONS`，
+    含双扩展名逐段比对），并由 `service/compose.rs:35` 的 `check_attachment_limits_all` **强制**；
+    真正缺的只是 MIME 白名单。这条错的危害是会让后来的人重做一遍已存在的功能。
+    顺带补上漏写的**单封合计 18 MiB** 上限（`attachment.rs:57`）。
+  - **用例数三处不一致**。实测 `cargo test --workspace -- --list` = **803**，
+    其中 1 个是 `#[ignore]` 的真实邮箱往返用例，实际执行 **802**。
+    `docs/ISSUES_AND_RISKS.md` 的总览停在 778（与它自己的台账矛盾），
+    `docs/TESTING_STRATEGY.md` 写 802 但同一文件给的计数命令会得 803。现已统一为
+    「803（含 1 个 `#[ignore]`，实际执行 802）」并说明二者关系。
+    另外 `TESTING_STRATEGY.md` 原写「计数：802 + 544（差 6 条）」，802−544=258 而非 6，
+    已改成「Linux CI 计数自 2026-10-28 起未更新（当时 544），不是同一时点，不要相减」。
+  - **四处行号全部失效**（文件对、行号错）：
+    `lib.rs:140` → **`lib.rs:196`**（`reconcile_account` 调用，三处文档各错一次）；
+    `actor.rs:460` → **`actor.rs:675`**（`pub struct Scheduler`）；
+    `cmd.rs:548`/`:569` → **`cmd.rs:559`/`:580`**（`move_messages`/`delete_messages`）；
+    `cmd.rs:576` + `compose.rs:495` → **`cmd.rs:750`** / **`compose.rs:501`**（`list_drafts`）。
+  - **两处复选框与正文矛盾**：`docs/ROADMAP.md:87` 正文写「**已完成**」却仍为 `[ ]`
+    （同一件事在 `:108` 已勾选）；`docs/ROADMAP.md:347` 把「通知 / 单实例」与托盘一起标为未做，
+    而通知与单实例插件早已接线（`lib.rs:40`、`:47`），真正缺的只有**托盘图标**与**退出/恢复语义**。
 - **认证失败的分类在两个方向上都错，其中一处让「认证终态」从未生效**（R25，2026-11-03）
   - `crates/xremail-protocol-imap/src/command.rs` 的 `classify_imap_error` 把
     **任意命令**的 `NO` 判成 `ProtocolError::Auth`。但 `EXAMINE` / `SELECT` 回 `NO`

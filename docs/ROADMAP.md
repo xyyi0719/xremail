@@ -84,7 +84,7 @@
 - [x] xremail-store：迁移、账户/文件夹 DAO、身份约束（`crates/xremail-store`，2026-10-22）
   - 迁移 `0001_init.sql`（10 张表）；身份不变量 `UNIQUE (account_id, folder_id, uidvalidity, uid)` 落到 schema
   - DAO：账户 upsert/list/get/delete，文件夹 upsert/list/get/delete
-- [ ] xremail-store：跨表事务封装 → **已完成**（`crates/xremail-store/src/dao/sync.rs` 的 `commit_folder_sync`）
+- [x] xremail-store：跨表事务封装 → **已完成**（`crates/xremail-store/src/dao/sync.rs` 的 `commit_folder_sync`）
 - [x] xremail-api：SecretStore、VaultStore、SyncBackend 最小契约与可运行 mock；CAS 冲突测试（`crates/xremail-api`，2026-10-22）
   - `SyncBackend` 只提供原子的 `compare_and_swap`，刻意不提供「先查后写」组合（TOCTOU）
   - 双设备 / 三方 CAS 竞争：恰好一个赢家；另有用例证明 API 形状本身防住 TOCTOU
@@ -189,7 +189,7 @@
   - 同时收掉：孤儿操作（文件夹已删 → `folder_missing`；移动目标已删 →
     `destination_missing`）、旧 epoch 操作（→ `epoch_changed`）
   - 幂等：重复执行都不动手（触发点是**应用启动一处**，
-    `apps/shell/src-tauri/src/lib.rs:140`；actor 的 `Startup` 轮尚未调它）
+    `apps/shell/src-tauri/src/lib.rs:196`；actor 的 `Startup` 轮尚未调它）
   - 用例：`tests/crash_recovery.rs` 11 个
 - [x] **账户调度器**（2026-11-03）：`crates/xremail-sync/src/actor.rs`。
   - 一个账户一个 actor，彼此隔离（一个账户的服务器卡住不拖住另一个）
@@ -344,7 +344,7 @@
 
 ### P4：Windows 与 Android 平台验收
 
-- [ ] Windows 托盘、通知、单实例、退出/恢复。
+- [ ] Windows **托盘图标**、**退出/恢复语义**（通知与单实例插件已接线，见下）
   - [x] **安全存储**（2026-10-26）：Windows 凭据管理器适配已落地（`secrets/windows_store.rs`），
         不静默降级。
   - **2026-11-03 核实进度**：通知（`tauri_plugin_notification`）、单实例

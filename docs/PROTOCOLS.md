@@ -344,7 +344,8 @@ X-CM-EXT-1  XAPPLEPUSHSERVICE  XLIST
 - 首次开启需**手机短信验证**（扫码或手动发短信）。
 - 单账号同时在线客户端数受限（社区反馈 3~5），多端同时 IDLE 会互踢。
 - 大量邮件使用 **GB2312/GBK** 编码，且部分 `Subject` 头未声明 charset。
-- 服务端对 `UID MOVE` 的支持情况需实测；若不支持需走 `COPY` + `\Deleted` + `EXPUNGE` 路径。
+- `UID MOVE` **实测不支持**（见上文能力表与服务商实测记录）；移动只能走
+  `UID COPY` → 标删 → `UID EXPUNGE`（163 **有** `UIDPLUS`，所以最后一步能执行）。
 
 ---
 

@@ -203,7 +203,7 @@ UIDVALIDITY 不得为 0（RFC 3501），收到 0 视为协议错误。
   对账不能凭空造第二套真相。
 * **同时收掉的残骸**：孤儿操作（文件夹已删 → `folder_missing`；移动目标已删 →
   `destination_missing`）、绑定旧 epoch 的操作（→ `epoch_changed`，与 §4.3 一致）。
-* **幂等**。触发点是应用启动（`apps/shell/src-tauri/src/lib.rs:140`）——
+* **幂等**。触发点是应用启动（`apps/shell/src-tauri/src/lib.rs:196`）——
   **必须**在这里做而不是只靠调度器：调度器只对「已交给它调度」的账户跑，
   而崩溃恢复必须对**每个**账户都发生。幂等是为了容忍重复调用，
   **不是**因为现在已经有两处触发点（目前只有启动一处）。
@@ -375,8 +375,8 @@ QQ 要 **30–90 秒**才落盘（第一次实测查得太早，误记成「QQ �
   | 场景 | 发什么 |
   |---|---|
   | 有 `MOVE` | 一条 `UID MOVE` |
-  | 没有 `MOVE` | `UID COPY` → `UID STORE +FLAGS (\Deleted)` → **有 `UIDPLUS` 才** `UID EXPUNGE` |
-  | 两者都没有（163） | 停在「已标删」 |
+  | 没有 `MOVE`（163、沃） | `UID COPY` → `UID STORE +FLAGS (\Deleted)` → **有 `UIDPLUS` 才** `UID EXPUNGE`（两家实测都有 `UIDPLUS`，会走到最后一步） |
+  | `MOVE` 与 `UIDPLUS` 都没有（三家实测都不属于此类） | 停在「已标删」 |
 
 * **裸 `EXPUNGE` 一律不用**：它会把这个文件夹里所有带 `\Deleted` 的信都删掉，
   包括别的客户端标了还没提交的。那也是用户的数据。
