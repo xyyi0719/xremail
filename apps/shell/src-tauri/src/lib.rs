@@ -19,10 +19,13 @@ pub mod secrets;
 pub mod service;
 pub mod state;
 
+use std::sync::Arc;
+
 use tauri::Manager;
 
+use crate::service::scheduler::{AppConnector, TauriSink};
 use crate::service::{AccountService, ComposeService, MessageService, SyncService};
-use crate::state::AppState;
+use crate::state::{AppState, Credentials, Services};
 
 /// 数据库文件名（位于数据目录下）。
 pub const DB_FILE_NAME: &str = "xremail.db";
@@ -56,7 +59,13 @@ pub fn run() {
     builder
         .setup(|app| {
             let state = init_storage(app.handle())?;
+            // 启动后台同步：把「有授权码的账户」交给调度器。
+            //
+            // 必须在 `manage` 之前做不了反——调度器与状态是分开的：
+            // 状态里拿的是调度器的句柄，先 `manage` 再起 actor，
+            // 这样 actor 一上来发的事件就能找到窗口。
             app.manage(state);
+            start_background_sync(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -80,8 +89,55 @@ pub fn run() {
             cmd::withdraw_draft,
             cmd::send_message,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Xremail application");
+        .build(tauri::generate_context!())
+        .expect("error while building Xremail application")
+        .run(|app, event| {
+            // 退出时把 actor 全停掉。
+            //
+            // 不做这件事的后果：进程退出时 actor 还在 `IDLE` 或写库，
+            // 那条连接会被服务器当成「客户端消失」，未提交的写操作
+            // 就会以 `running` 的状态留在库里（下次启动靠对账收拾，
+            // 但那本来是可以避免的一次）。
+            if let tauri::RunEvent::Exit = event {
+                app.state::<AppState>().scheduler.shutdown();
+            }
+        });
+}
+
+/// 把已有账户交给后台调度器。
+///
+/// * 只在**有授权码**时才起 actor：没有口令的账户每轮都只会失败，
+///   白白在日志里刷错误，也浪费退避重试。
+/// * 起失败的账户不影响其他账户（一个连不上的邮箱不该拦住另外两个）。
+fn start_background_sync(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+
+    let accounts = match tauri::async_runtime::block_on(state.accounts.list()) {
+        Ok(accounts) => accounts,
+        Err(error) => {
+            tracing::warn!(%error, "启动后台同步：读账户失败");
+            return;
+        }
+    };
+
+    for account in accounts {
+        // 有会话凭据或有钥匙串引用才值得起。
+        if state.credential(&account.id).is_none() && account.secret_ref.is_none() {
+            tracing::debug!(
+                account = %account.email,
+                "还没有授权码，先不起后台同步（手动同步一次就会起）"
+            );
+            continue;
+        }
+
+        if let Err(error) = state.scheduler.start(account.clone()) {
+            tracing::warn!(
+                account = %account.email,
+                %error,
+                "启动后台同步失败"
+            );
+        }
+    }
 }
 
 /// 解析数据目录、打开数据库、应用迁移。
@@ -163,12 +219,38 @@ fn init_storage(app: &tauri::AppHandle) -> Result<AppState, Box<dyn std::error::
         }
     });
 
+    // 凭据容器要在建调度器之前存在：连接器靠它取授权码。
+    let credentials = Arc::new(Credentials::default());
+
+    let accounts = AccountService::new(pool.clone());
+    let sync = SyncService::new(pool.clone());
+
+    // 调度器：一个账户一个 actor，`poll_interval_secs` 决定节奏。
+    //
+    // 时钟用系统时间：时间戳要跟库里其它表（`created_at` 等）一致，
+    // 不能另起一套「进程启动后的相对时间」。
+    let scheduler = xremail_sync::Scheduler::with_options(
+        pool.clone(),
+        Arc::new(AppConnector::new(
+            Arc::clone(&credentials),
+            accounts.clone(),
+            sync.clone(),
+        )),
+        Arc::new(TauriSink::new(app.clone())),
+        xremail_sync::RetryPolicy::default(),
+        Arc::new(crate::service::current_time_ms),
+    );
+
     Ok(AppState::new(
         data_dir,
-        AccountService::new(pool.clone()),
-        MessageService::new(pool.clone()),
-        SyncService::new(pool.clone()),
-        ComposeService::new(pool.clone(), AccountService::new(pool.clone())),
+        Services {
+            accounts,
+            messages: MessageService::new(pool.clone()),
+            sync,
+            compose: ComposeService::new(pool.clone(), AccountService::new(pool.clone())),
+        },
+        scheduler,
+        credentials,
         pool,
     ))
 }

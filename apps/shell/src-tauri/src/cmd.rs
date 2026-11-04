@@ -94,6 +94,11 @@ pub async fn delete_account<R: Runtime>(
         .map_err(|e| user_error(&e))?;
 
     if deleted {
+        // 先停后台同步：账户行都没了，actor 再跑一轮只会报「账户不存在」。
+        // `stop` 对一个没被调度的账户是幂等的（直接返回），不用先查。
+        let _ = state.scheduler.stop(&id);
+        state.forget_credential(&id);
+
         let event = AppEvent::AccountRemoved { account_id: id };
         app.emit(event.name(), &event).map_err(|e| e.to_string())?;
     }
@@ -147,6 +152,12 @@ pub async fn sync_account<R: Runtime>(
     let Some(credential) = resolve_credential(&state, &account).await? else {
         return Err("这个账户还没保存授权码，请先同步一次".to_string());
     };
+
+    // 拿到授权码之后，把这个账户交给后台调度器（幂等：已在跑就只叫醒一次）。
+    //
+    // 为什么放在这里：这是「用户第一次给出可用凭据」的时点。
+    // 没有授权码的账户在后台只能一直失败，不如等这一刻。
+    ensure_scheduled(&state, &account);
 
     // 先报「连接中」。
     let event = AppEvent::SyncStateChanged {
@@ -657,6 +668,28 @@ async fn flush_transfer_intents(
         uncertain: report.uncertain,
         message: Some(parts.join("，")),
     })
+}
+
+/// 把这个账户交给后台调度器，**幂等**。
+///
+/// 已经在跑就什么也不做：
+/// `start` 在已启动时会顺手叫醒一轮，而调用方（手动同步命令）
+/// **正在自己跑一轮**，再叫醒就是同一个账户并发跑两次。
+///
+/// 失败只记日志：**后台同步起不来不该让「本次手动同步」失败**——
+/// 用户点的是「现在同步一下」，那件事已经做完了。
+fn ensure_scheduled(state: &AppState, account: &Account) {
+    if state.scheduler.is_scheduled(&account.id) {
+        return;
+    }
+
+    if let Err(error) = state.scheduler.start(account.clone()) {
+        tracing::warn!(
+            account = %account.email,
+            %error,
+            "启动后台同步失败（本次手动同步不受影响）"
+        );
+    }
 }
 
 async fn resolve_credential(

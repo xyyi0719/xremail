@@ -58,7 +58,7 @@
   - 三家真实邮箱实测：`UID STORE` 全 OK、**回读确认生效**、重复发同一标记也回 OK（见 `docs/PROTOCOLS.md`）
   - epoch 变了 → 意图作废（`failed` / `epoch_changed`），不会把旧 UID 套到另一封信上
 - [x] 调度器（AccountActor）：什么时候同步、同步哪些文件夹、重连退避
-      （2026-11-03，`crates/xremail-sync/src/actor.rs`；**IDLE 仍未做**，见 P2 小节）。
+      （2026-11-03，`crates/xremail-sync/src/actor.rs`；**IDLE、应用层接线均已补**，见 P1/P2 小节）。
 - [x] 收发链路（P3）：SMTP **提交路径**已写完并跑通真发信（2026-10-29，163 ↔ QQ 双向，见 P3 小节）。
 - [x] **撰写面板**（2026-10-30）：能写一封信并发出去——收件人 / 抄送 / 主题 /
   **富文本**正文（自写 `contenteditable` 编辑器，**不引入新依赖**）、
@@ -199,26 +199,32 @@
   - **R13 的 panic 边界就在这一层**：每轮同步包 `catch_unwind`，
     panic 只停在那一轮；连续 3 次才放弃账户
   - 用例：13 个（5 单测 + 8 端到端，含「一个账户 panic 不影响另一个」）
-  - ⚠️ **但应用层还没接**（2026-11-03 核实）：`apps/shell/src-tauri/src/`
-    里没有任何地方 `use` 这个 `Scheduler`，产品路径仍是用户在界面上��一下 →
-    `cmd::sync_account` 手动跑一轮。也就是说**现在的「后台定时同步」只活在
-    crate 的用例里，编译进应用也没被启用**。接线要动 Tauri 2 的启动与
-    `RunEvent` 退出钩子（还要把退出时停掉轮询写清楚），单独立项。
-- [ ] IDLE 状态切换；其他文件夹调度。
-  - **假服务器已就绪（2026-11-03）**：`crates/xremail-testkit/src/server.rs` 支持 `IDLE`
-    （回 `+ idling` → 等 `DONE` → 用**进入 IDLE 那条命令的原 tag** 回 `OK`），
-    并有服务器级 `PushRegistry` + `push_exists` / `push_expunge` 主动推送。
-    用例 7 个（`crates/xremail-testkit/tests/idle.rs`）。
-    这一步之所以必须先做：没有能主动说话的对端，「服务器推了一条 EXISTS
-    客户端有没有反应」根本无法测，这条路径就永远没有证据。
-  - **仍未做**：**客户端侧** `IDLE` 的保持 / `DONE` 重发 / 断线后重建会话，
-    以及收到 untagged 响应时调 `Scheduler::wake`
+  - **应用层接线已完成（2026-11-03）**：`apps/shell/src-tauri/src/lib.rs` 启动时
+    列出账户，**只给凭据可用的**起 actor（没存授权码的账户起来只能一直失败）；
+    `RunEvent::Exit` 时 `Scheduler::shutdown`。授权码是**后来才保存**的账户
+    由 `cmd::sync_account` 补一次 `start`（`is_scheduled` 先判，已在跑不叫醒）；
+    `cmd::delete_account` 删完先 `stop` 再忘掉凭据。
+  - 前端订阅 `sync://state-changed`，只在 `state === "online"` 时重查——
+    每轮会报 `connecting` 和 `online` 两次，全刷等于白拉一倍数据。
+- [x] **IDLE 状态切换**（2026-11-03）；其他文件夹调度仍未做。
+  - 落点：`crates/xremail-protocol-imap/src/idle.rs`（`idle_once` / `IdleConfig` / `IdleEvent`）
+    + `crates/xremail-sync/src/actor.rs`（`wait_for_change`）；actor 每轮先问
+    `Accounts` 能力（`idle_supported` 缓存在 actor 里），支持就走长连接。
+  - 协议细节：收到 `+ idling` 才开始等推送；**一到推送立刻发 `DONE`**（不只等 30 分钟
+    定时器），否则服务器推的下一条要干等一轮超时；等 tagged `OK` 时**必须匹配
+    进 IDLE 那条命令的原 tag**（`DONE` 本身不带 tag）。
+  - **安全出口**：无论正常返回、超时、断线还是 panic，都先 `is_authenticated()`
+    校验——`DONE` 三次握手没走完的会话**弃用重连**，不还回连接池。
+  - 降级：IDLE 命令被回 `NO`/`BAD` 或能力探测指不支持 → 当轮改走轮询，
+    并把 `idle_supported` 记为 `false`，下轮不再重试。
+  - 用例：`crates/xremail-sync/tests/scheduler.rs`（`push_wakes_the_actor_before_the_poll_interval`、
+    `server_without_idle_still_polls_and_does_not_pay_an_extra_connection`）
+    + `crates/xremail-protocol-imap/tests/idle_client.rs`（`DONE` tag 匹配、
+    同一会话重发、半行拼接、超时夹到 29 分钟以内）+ testkit 侧 7 个。
   - **假服务器的三个局限（写客户端时要知道）**：① `push_*` 只发信号、**不改 fixture**，
     断言邮件数量时不能把推送当成真的增删信；② `EXPUNGE` 的 `seq` **不会**像真服务器
     那样在前一封被删后前移；③ 离开 IDLE（含断线）后登记被摘掉、**不补发**——
-    所以「推送丢 → 轮询兜底」永远不能省
-  - 唤醒通道已留好：接 `IDLE` 之后只需在收到 untagged 响应时调
-    `Scheduler::wake`，调用方不用改
+    所以「推送丢 → 轮询兜底」永远不能省。
   - 已具备条件：三家能力已实测（QQ 有 IDLE，163/沃 无），
     能力判定逻辑在 `xremail-protocol-imap::extension_support`
 - [x] flag bit 级意图、**回读确认**与 `uncertain` 状态。
@@ -273,7 +279,7 @@
 
 **出口**：两客户端并发、崩溃恢复、恶意邮件与检索一致性测试通过；不承诺任意网络下固定收敛秒数。
 *当前状态（2026-11-03）：同步引擎的**拉取**与**回写**（标记 + 移动/删除）两条链路已在 crate 层完成并有端到端测试；
-**HTML 安全门与 FTS 已落地**（2026-10-30），**调度器已落地但应用层尚未接线**（2026-11-03，轮询 + 手动触发 + 退避，IDLE 待补）；
+**HTML 安全门与 FTS 已落地**（2026-10-30），**调度器与后台同步已落地并接进应用**（2026-11-03，IDLE + 轮询 + 退避 + 启动/退出接线）；
 仍缺断线恢复。*
 
 ### P3：发送与草稿
@@ -394,8 +400,11 @@ Gmail 将来有需求再开独立决策：授权流程、scope、个人使用与
    - 一个账户一个 actor；启动即同步 → 按 `poll_interval_secs` 轮询；`wake` 插队
    - 失败退避 `min_backoff` → `max_backoff`，成功即重置
    - R13 的 `catch_unwind` 边界已在这一层落地（每轮同步一个边界）
-   - **残余**：`IDLE` 长连接推送未做（**假服务器侧已就绪（2026-11-03）**，
-     缺的是客户端侧的保持与重发）
+   - **`IDLE` 长连接推送已实现（2026-11-03）**：`crates/xremail-protocol-imap/src/idle.rs`
+     （`idle_once`，由 `crates/xremail-sync/src/actor.rs` 的 `wait_for_change` 调用）；
+     不支持或失败即降级轮询
+   - **应用层接线已完成**：`apps/shell/src-tauri/src/lib.rs` 启动时只给
+     「凭据可用」的账户起 actor，`RunEvent::Exit` 停全部
 4. ~~**同步引擎接进应用的同时跑一次真邮箱验收**~~ **已完成（2026-10-26）**：
    三个测试账号各跑一次完整同步（连接 → 登录 → 列文件夹 → 拉取 → 落库 → 读正文），
    脱敏证据：163 = 6 文件夹 / 4 封 / utf-8；QQ = 6 文件夹 / 71 封 / gb2312；
@@ -413,11 +422,9 @@ Gmail 将来有需求再开独立决策：授权流程、scope、个人使用与
 
 **下一批建议（更新于 2026-11-03）**：调度器、R13 的 panic 边界、
 `COPY` / `MOVE` 协议 + 假服务器支持、**移动/删除的写路径**、
-**断线恢复（崩溃后对账）**均已完工。
-剩下最接近核心可靠度的两件是：
-**`IDLE` 客户端侧**（假服务器已于 2026-11-03 补齐，`crates/xremail-testkit/tests/idle.rs`
-7 个用例）、**断线重连**（`NO` / `BYE` 后重建会话，
-不是重启对账）；它们比 HTML 正文渲染与 SMTP（沃邮箱卡在静态 RSA 套件）
+**断线恢复（崩溃后对账）**、**`IDLE` 客户端侧与调度器接线**均已完工。
+剩下最接近核心可靠度的是**断线重连**（`NO` / `BYE` 后重建会话，
+不是重启对账）——它比 HTML 正文渲染与 SMTP（沃邮箱卡在静态 RSA 套件）
 都更贴近「开着就不掉线」这个目标。
 
 **已完成（2026-10-23）**：三家测试账号已准备并完成只读实测（凭据仅在本机配置）；

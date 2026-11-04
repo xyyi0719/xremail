@@ -9,6 +9,8 @@
 //!
 //! 参考 Tauri 官方的 `tauri::test` 用法。
 
+use std::sync::Arc;
+
 use serde_json::json;
 use tauri::Manager;
 use tauri::WebviewWindowBuilder;
@@ -17,10 +19,24 @@ use tauri::test::{
     INVOKE_KEY, MockRuntime, get_ipc_response, mock_builder, mock_context, noop_assets,
 };
 use tauri::webview::InvokeRequest;
-use xremail_core::model::{Folder, Message, MessageFlags};
+use xremail_core::AppError;
+use xremail_core::model::{Account, Folder, Message, MessageFlags};
 use xremail_shell_lib::cmd;
 use xremail_shell_lib::service::{AccountService, ComposeService, MessageService, SyncService};
-use xremail_shell_lib::state::AppState;
+use xremail_shell_lib::state::{AppState, Credentials, Services};
+use xremail_sync::{AccountConnector, ConnectFuture, NoopSink, RetryPolicy, Scheduler};
+
+/// 从不连服务器的连接器。
+///
+/// IPC 用例测的是「命令 → 服务 → 数据库」这一段，不需要真的同步；
+/// 调度器只是 `AppState` 的一个字段，**从不被启动**。
+struct NeverConnector;
+
+impl AccountConnector for NeverConnector {
+    fn connect<'a>(&'a self, _account: &'a Account) -> ConnectFuture<'a> {
+        Box::pin(async { Err(AppError::Protocol("测试里不连服务器".into())) })
+    }
+}
 
 /// 造一个带内存库的应用与 webview。
 ///
@@ -38,10 +54,20 @@ fn app() -> (tauri::App<MockRuntime>, tauri::WebviewWindow<MockRuntime>) {
 
     let state = AppState::new(
         std::path::PathBuf::from("/tmp/xremail-test"),
-        AccountService::new(pool.clone()),
-        MessageService::new(pool.clone()),
-        SyncService::new(pool.clone()),
-        ComposeService::new(pool.clone(), AccountService::new(pool.clone())),
+        Services {
+            accounts: AccountService::new(pool.clone()),
+            messages: MessageService::new(pool.clone()),
+            sync: SyncService::new(pool.clone()),
+            compose: ComposeService::new(pool.clone(), AccountService::new(pool.clone())),
+        },
+        Scheduler::with_options(
+            pool.clone(),
+            Arc::new(NeverConnector),
+            Arc::new(NoopSink),
+            RetryPolicy::default(),
+            Arc::new(|| 0),
+        ),
+        Arc::new(Credentials::default()),
         pool,
     );
 

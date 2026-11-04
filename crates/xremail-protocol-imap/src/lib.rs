@@ -18,6 +18,7 @@ pub mod connection;
 pub mod credential;
 pub mod error;
 pub mod folders;
+pub mod idle;
 pub mod probe;
 pub mod transfer;
 pub mod utf7;
@@ -34,6 +35,7 @@ pub use credential::{
 };
 pub use error::ProtocolError;
 pub use folders::{RemoteFolder, list_folders};
+pub use idle::{IdleConfig, IdleEvent, IdleOutcome, idle_once};
 pub use probe::{
     ExtensionSupport, FolderSummary, MailboxSummary, ProbeConfig, ProbeReport, auth_mechanisms,
     capability_names, extension_support, probe,

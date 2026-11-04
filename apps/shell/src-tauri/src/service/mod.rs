@@ -17,6 +17,7 @@ pub mod account;
 pub mod compose;
 pub mod credential;
 pub mod message;
+pub mod scheduler;
 pub mod sent_copy;
 pub mod sync;
 

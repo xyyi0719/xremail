@@ -126,16 +126,21 @@ RFC Message-ID 只能作线索，不能作为唯一键或自动跨文件夹去�
 - 第 5 步：正文**按需**拉（`BODY.PEEK[]`，见 `crates/xremail-sync/src/body.rs`）——
   正文可能很大且带附件，一个邮箱几千封全拉一遍既慢又费流量。
 - 第 6 步：服务器已删的 UID 清缓存；**本地草稿的保留策略**由 `UidDiff::retain_local` 落实。
-- 第 7 步（进入 IDLE 或轮询）**轮询已实现（2026-11-03）**：
+- 第 7 步（进入 IDLE 或轮询）**已实现（2026-11-03）**：
   `crates/xremail-sync/src/actor.rs`——一个账户一个 actor，交给调度后立刻同步一轮，
   之后按 `poll_interval_secs` 轮询，`Scheduler::wake` 可插队；
   失败按 `min_backoff`→`max_backoff` 翻倍退避；每一轮都包在
   `catch_unwind` 里（R13），panic 只停在那一轮。
-  **`IDLE` 仍未实现**——需要客户端侧 IDLE 保持与假服务器支持（见 ROADMAP P2）。
-  同时要看清：这个 actor **已经在 crate 里实现并有端到端用例，但应用层还没把它跑起来**——
-  `apps/shell/src-tauri/src/` 里没有任何地方 `use` 它，产品路径仍是手动点刷新触发
-  `cmd::sync_account` 跑一轮。接线（启动时按账户起 actor、退出时停、
-  以及 `Scheduler::wake` 接到刷新按钮上）是单独一步，不要误以为已经自动在后台同步。
+  **服务器支持 IDLE 时走长连接**（`crates/xremail-protocol-imap/src/idle.rs` 的
+  `idle_once`，由 `crates/xremail-sync/src/actor.rs` 的 `wait_for_change` 调用）：
+  等 `+ idling` → 读推送 →
+  发 `DONE` → 等 tagged `OK`；30 分钟或一到推送就发 `DONE` 重进，
+  出口无条件 `is_authenticated()` 校验——**没走完 `DONE` 三次握手的会话一律丢弃重连**，
+  绝不把半 IDLE 流的 `Session` 还回连接池。IDLE 失败 / 服务器不支持 → 自动降级轮询。
+  同时：这个 actor **已经接进应用层**——`apps/shell/src-tauri/src/lib.rs` 启动时
+  从凭据可用性决定拉起哪些账户、`RunEvent::Exit` 时停；
+  `cmd::sync_account` 在「第一次拿到可用凭据」时也补一次 `start`（幂等，已在跑就不叫醒，
+  避免和本次手动同步并发跑两轮）。
 
 **三条实测得来的实现约束（2026-10-23）**：
 

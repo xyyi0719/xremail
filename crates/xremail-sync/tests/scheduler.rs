@@ -162,6 +162,18 @@ struct Fixture {
 
 impl Fixture {
     async fn start(messages: usize) -> Self {
+        // 默认能力集**不含** `IDLE`（照着 163 那类服务器来的）。
+        Self::start_with(messages, FakeConfig::default().capabilities).await
+    }
+
+    /// 服务器**宣告支持 `IDLE`** 的变体：调度器应当用推送代替纯等待。
+    async fn start_with_idle(messages: usize) -> Self {
+        let mut capabilities = FakeConfig::default().capabilities;
+        capabilities.push("IDLE".to_string());
+        Self::start_with(messages, capabilities).await
+    }
+
+    async fn start_with(messages: usize, capabilities: Vec<String>) -> Self {
         let mut inbox = MailboxFixture::new("INBOX");
         for index in 0..messages {
             let uid = 1_792_658_701 + index as u32;
@@ -173,6 +185,7 @@ impl Fixture {
         }
 
         let server = FakeImapServer::start(FakeConfig {
+            capabilities,
             mailboxes: vec![inbox],
             ..Default::default()
         })
@@ -236,6 +249,7 @@ fn fast_policy() -> RetryPolicy {
         min_backoff: Duration::from_millis(20),
         max_backoff: Duration::from_millis(80),
         max_consecutive_panics: 3,
+        command_timeout: Duration::from_secs(2),
     }
 }
 
@@ -667,5 +681,142 @@ async fn waking_an_unscheduled_account_is_an_error() {
     // 静默什么也不做是最坏的选择：调用方会以为同步排上了。
     assert!(scheduler.wake("没这个账户").is_err());
 
+    fixture.server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// IDLE：服务器能推的时候，不要傻等到轮询定时器
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn push_wakes_the_actor_before_the_poll_interval() {
+    let fixture = Fixture::start_with_idle(1).await;
+    // 轮询间隔故意设成 1 小时：第二轮只可能是被推送叫醒的。
+    let account = account("acct-1", 3600);
+    let pool = local_store(std::slice::from_ref(&account)).await;
+
+    let connector = Arc::new(TestConnector::new(
+        fixture.imap.clone(),
+        fixture.trust.clone(),
+    ));
+    let recorder = Arc::new(Recorder::default());
+    let scheduler = Scheduler::with_options(
+        pool,
+        connector,
+        recorder.clone(),
+        fast_policy(),
+        Arc::new(|| 1_792_658_000_000),
+    );
+
+    scheduler.start(account.clone()).expect("应当能启动");
+
+    wait_until(&recorder, "第一轮同步", |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, AccountEvent::Synced { .. }))
+    })
+    .await;
+
+    // `push_exists` 只对**此刻正在 IDLE** 的连接生效，不会攒着。
+    // 所以反复推，直到某一推真的撞上了一个已经进入 IDLE 的 actor。
+    let start = Instant::now();
+    let timeout = Duration::from_secs(20);
+    loop {
+        fixture.server.push_exists("INBOX", 1);
+        let synced = recorder
+            .snapshot()
+            .into_iter()
+            .filter(|event| matches!(event, AccountEvent::Synced { .. }))
+            .count();
+        if synced >= 2 {
+            break;
+        }
+        if start.elapsed() > timeout {
+            panic!(
+                "推送没能叫醒 actor（等了 {:?}）；已有事件：{:#?}",
+                start.elapsed(),
+                recorder.snapshot()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let synced: Vec<_> = recorder
+        .snapshot()
+        .into_iter()
+        .filter(|event| matches!(event, AccountEvent::Synced { .. }))
+        .collect();
+    match &synced[1] {
+        AccountEvent::Synced { reason, .. } => {
+            assert_eq!(*reason, WakeReason::Push, "第二轮应当由推送触发");
+        }
+        other => panic!("应当是 Synced，实际是 {other:?}"),
+    }
+
+    scheduler.shutdown();
+    fixture.server.shutdown().await;
+}
+
+/// 服务器不宣告 `IDLE` 时，仍然按轮询跑，且**不会**多出第二种唤醒原因。
+///
+/// 同时守住一条代价约束：不支持 `IDLE` 就**不能每轮多连一次**去确认
+/// （`attempts` 应当与同步轮数同阶，而不是它的两倍）。
+#[tokio::test]
+async fn server_without_idle_still_polls_and_does_not_pay_an_extra_connection() {
+    let fixture = Fixture::start(1).await;
+    let account = account("acct-1", 1);
+    let pool = local_store(std::slice::from_ref(&account)).await;
+
+    let connector = Arc::new(TestConnector::new(
+        fixture.imap.clone(),
+        fixture.trust.clone(),
+    ));
+    let recorder = Arc::new(Recorder::default());
+    let scheduler = Scheduler::with_options(
+        pool,
+        connector.clone(),
+        recorder.clone(),
+        fast_policy(),
+        Arc::new(|| 1_792_658_000_000),
+    );
+
+    scheduler.start(account.clone()).expect("应当能启动");
+
+    wait_until(&recorder, "三轮同步", |events| {
+        events
+            .iter()
+            .filter(|event| matches!(event, AccountEvent::Synced { .. }))
+            .count()
+            >= 3
+    })
+    .await;
+
+    let snapshot = recorder.snapshot();
+    let synced: Vec<_> = snapshot
+        .iter()
+        .filter(|event| matches!(event, AccountEvent::Synced { .. }))
+        .collect();
+
+    for event in &synced {
+        match event {
+            AccountEvent::Synced { reason, .. } => assert_ne!(
+                *reason,
+                WakeReason::Push,
+                "服务器不支持 IDLE，不该出现推送原因"
+            ),
+            other => panic!("应当是 Synced，实际是 {other:?}"),
+        }
+    }
+
+    // 每轮一次连接；不支持 IDLE 时不允许出现「额外探测连接」。
+    // 留一点余量：读取这两个数字之间可能刚好又跑完一轮。
+    assert!(
+        connector.attempts() as usize <= synced.len() + 1,
+        "不支持 IDLE 时不该多连：attempts={}, 同步轮数={}",
+        connector.attempts(),
+        synced.len()
+    );
+
+    scheduler.shutdown();
     fixture.server.shutdown().await;
 }

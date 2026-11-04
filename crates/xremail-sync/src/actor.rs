@@ -59,7 +59,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use xremail_core::model::Account;
 use xremail_core::{AppError, AppResult};
-use xremail_protocol_imap::Session;
+use xremail_protocol_imap::{IdleConfig, IdleEvent, Session, idle_once};
 
 use crate::sync::{SyncSummary, sync_account};
 
@@ -74,6 +74,11 @@ pub enum WakeReason {
     Manual,
     /// 轮询到点。
     Poll,
+    /// 服务器通过 `IDLE` 主动推了变更。
+    ///
+    /// 与 `Poll` 的区别只在于「谁先叫醒的」：`Poll` 是我们等到了定时器，
+    /// `Push` 是服务器先说话了。两者会触发**完全一样**的同步。
+    Push,
     /// 上一轮失败后的退避重试。
     Retry,
 }
@@ -85,6 +90,7 @@ impl WakeReason {
             WakeReason::Startup => "startup",
             WakeReason::Manual => "manual",
             WakeReason::Poll => "poll",
+            WakeReason::Push => "push",
             WakeReason::Retry => "retry",
         }
     }
@@ -214,6 +220,12 @@ pub struct RetryPolicy {
     /// 没有上限的话，「panic → 立刻重试 → 立刻 panic」会把 CPU 打满，
     /// 而且日志会被同一条 panic 刷爆。
     pub max_consecutive_panics: u32,
+    /// 单条 IMAP 命令的超时（目前只用于 `IDLE` 的 `EXAMINE` / `IDLE` / `DONE`）。
+    ///
+    /// 与 [`Self::poll_interval`] 分开：前者是「等服务器回话」的耐心，
+    /// 后者是「两轮同步之间隔多久」。把两者混用会导致轮询间隔很长时
+    /// 一条卡住的命令要等上几分钟才报错。
+    pub command_timeout: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -224,6 +236,7 @@ impl Default for RetryPolicy {
             min_backoff: Duration::from_secs(5),
             max_backoff: Duration::from_secs(300),
             max_consecutive_panics: 3,
+            command_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -283,6 +296,16 @@ struct AccountActor {
     sink: Arc<dyn EventSink>,
     policy: RetryPolicy,
     clock: Clock,
+    /// 服务器是否支持 `IDLE`。
+    ///
+    /// `None` = 还没问过（下一轮同步收尾时会问）；`Some(true)` = 支持，
+    /// 等待期用 `IDLE` 代替 `sleep`；`Some(false)` = 不支持，永远只用轮询。
+    ///
+    /// **必须确定是真支持才连第二条连接**：不支持还每轮都试一次，等于把
+    /// 「一轮一次连接」变成「一轮两次」，白白多一倍握手。
+    ///
+    /// 一次失败（网络抖、超时）**不会**关掉 `IDLE`——那只是这一轮运气不好。
+    idle_supported: Option<bool>,
 }
 
 impl AccountActor {
@@ -299,19 +322,118 @@ impl AccountActor {
         let pool = self.pool.clone();
         let connector = Arc::clone(&self.connector);
         let now_ms = (self.clock)();
+        let command_timeout = self.policy.command_timeout;
+        // 还不确定支不支持 `IDLE` 时，顺手在收尾时看一眼能力集。
+        // 只问一次：问到了就不再问。
+        let probe_idle = self.idle_supported.is_none();
 
         let body = async move {
             let mut session = connector.connect(&account).await?;
-            sync_account(&pool, &mut session, &account, now_ms).await
+            let summary = sync_account(&pool, &mut session, &account, now_ms).await?;
+
+            // 注意：这里复用**同一条已登录的连接**问 `CAPABILITY`，不是另开一条。
+            // 探测失败不影响本轮同步结果，`None` 表示「没问到，下次再问」。
+            let idle = if probe_idle {
+                tokio::time::timeout(command_timeout, session.capabilities())
+                    .await
+                    .ok()
+                    .and_then(std::result::Result::ok)
+                    .map(|capabilities| capabilities.has_str("IDLE"))
+            } else {
+                None
+            };
+
+            Ok::<(SyncSummary, Option<bool>), AppError>((summary, idle))
         };
 
         // `AssertUnwindSafe`：这里确实跨了 unwind 边界继续用 `pool` / `connector`。
         // 与 `Mutex` 不同，这两者都不持有「被中断的中间状态」——
         // 连接池的 `Connection` 在 drop 时会回滚未提交事务（sqlx 自己保证）。
         match AssertUnwindSafe(body).catch_unwind().await {
-            Ok(Ok(summary)) => Ok(summary),
+            Ok(Ok((summary, idle))) => {
+                if let Some(supported) = idle {
+                    self.idle_supported = Some(supported);
+                }
+                Ok(summary)
+            }
             Ok(Err(error)) => Err(TickFailure::Failed(error.to_string())),
             Err(payload) => Err(TickFailure::Panicked(panic_message(payload.as_ref()))),
+        }
+    }
+
+    /// 等「下一轮该跑了」，**顺便让服务器有机会提前叫醒我们**。
+    ///
+    /// 返回本轮该报的 [`WakeReason`]。
+    ///
+    /// ## 为什么 `IDLE` 取代的是 `sleep`，而不是额外加一条唤醒通道
+    ///
+    /// 轮询定时器本来就在等 `wait` 这么久。把这段等待换成「`IDLE` 等服务器说话」
+    /// 不改变任何语义：
+    /// * 服务器先说话 → `Push`，立刻同步；
+    /// * 没人说话 → `IDLE` 在 `wait` 到点时返回 `Timeout`，按 `on_timeout` 同步。
+    ///
+    /// 两条路最终都以「同步一轮」收尾，所以 **`IDLE` 绝不会让同步变少**，
+    /// 只可能让它变早。这一点比「新加一条唤醒通道」好管得多：
+    /// 推送丢了也仅仅退化成原来的延迟。
+    ///
+    /// ## 失败一律退回纯等待
+    ///
+    /// 连接不上、`IDLE` 被拒、连接半死……全都 `sleep(wait)` 之后按
+    /// `on_timeout` 走。**绝不提前返回**：提前返回会让「连不上服务器」变成
+    /// 「每一轮都多跑一次同步」，反而把错误放大成忙循环。
+    async fn wait_for_change(&mut self, wait: Duration, on_timeout: WakeReason) -> WakeReason {
+        // 只在一个本该等满 `wait` 的情况下才用 `IDLE`。
+        // 不确定 / 已知不支持 → 纯等待，一行代价也没有。
+        if self.idle_supported != Some(true) {
+            tokio::time::sleep(wait).await;
+            return on_timeout;
+        }
+
+        let session = match self.connector.connect(&self.account).await {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::debug!(
+                    account = %self.account.email,
+                    %error,
+                    "IDLE 建连失败，退回纯等待"
+                );
+                tokio::time::sleep(wait).await;
+                return on_timeout;
+            }
+        };
+
+        // `idle_timeout` 就用本轮要等的时间：这样「有人推」和「到点了」
+        // 是同一个时间轴上的两个出口，不需要额外协调。
+        // （`IdleConfig::new` 会把它夹到 RFC 2177 的 29 分钟以内。）
+        let config = IdleConfig::new(self.policy.command_timeout, wait, "INBOX");
+
+        match idle_once(session, &config).await {
+            Ok(outcome) => match outcome.event {
+                IdleEvent::MailboxChanged => WakeReason::Push,
+                IdleEvent::Timeout => on_timeout,
+                IdleEvent::Unsupported => {
+                    // 记下来，以后不再试。
+                    tracing::debug!(
+                        account = %self.account.email,
+                        "服务器未宣告 IDLE，以后只用轮询"
+                    );
+                    self.idle_supported = Some(false);
+                    // 仍然等满 `wait`：本轮本来就该等到这个时刻才同步。
+                    tokio::time::sleep(wait).await;
+                    on_timeout
+                }
+            },
+            Err(error) => {
+                // 连接在 IDLE 期间坏了。**不**提前返回：把它当「没被叫醒」，
+                // 等到点正常同步，否则坏连接会变成忙循环。
+                tracing::debug!(
+                    account = %self.account.email,
+                    %error,
+                    "IDLE 失败，本轮退回轮询"
+                );
+                tokio::time::sleep(wait).await;
+                on_timeout
+            }
         }
     }
 
@@ -339,13 +461,16 @@ impl AccountActor {
                 }
                 Some(wait) => {
                     // `biased`：命令优先于到点，点「刷新」不用等定时器。
+                    //
+                    // 第二路是 `IDLE`：它与 `sleep(wait)` 二选一（见
+                    // `wait_for_change`），所以无论走哪条路，都不会比纯轮询更晚。
                     tokio::select! {
                         biased;
                         command = rx.recv() => match command {
                             None | Some(Command::Stop) => break,
                             Some(Command::Sync(next)) => reason = next,
                         },
-                        () = tokio::time::sleep(wait) => reason = timeout_reason,
+                        next = self.wait_for_change(wait, timeout_reason) => reason = next,
                     }
                 }
             }
@@ -520,11 +645,25 @@ impl Scheduler {
             sink: Arc::clone(&self.sink),
             policy: self.policy.clone(),
             clock: Arc::clone(&self.clock),
+            idle_supported: None,
         };
         let join = tokio::spawn(actor.run(rx));
 
         self.lock()?.insert(account_id, ActorHandle { tx, join });
         Ok(())
+    }
+
+    /// 这个账户是否已在调度中。
+    ///
+    /// 应用层靠它判断「要不要起 actor」而**不去叫醒**——
+    /// 调 [`Self::start`] 在已启动时会顺手叫醒一轮，
+    /// 对「刚手动同步完」的场景就是白跑两次。
+    ///
+    /// 锁中毒时返回 `false`：宁可多起一个（`start` 是幂等的）也不要漏起。
+    pub fn is_scheduled(&self, account_id: &str) -> bool {
+        self.lock()
+            .map(|actors| actors.contains_key(account_id))
+            .unwrap_or(false)
     }
 
     /// 叫醒某个账户，立刻同步一轮（用户点「刷新」）。
@@ -603,6 +742,7 @@ mod tests {
             min_backoff: Duration::from_secs(5),
             max_backoff: Duration::from_secs(40),
             max_consecutive_panics: 3,
+            command_timeout: Duration::from_secs(5),
         }
     }
 

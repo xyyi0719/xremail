@@ -16,8 +16,27 @@
   - 错误路径也覆盖：未 `SELECT` 就 `IDLE` → `NO`；`IDLE` 期间发别的命令 → `BAD`；
     故障注入（`faults`）对 `IDLE` 同样生效
   - 用例 7 个（`crates/xremail-testkit/tests/idle.rs`）
-  - **未做**：客户端侧 `IDLE`（`crates/xremail-sync` 里还没有 IDLE 保持与
-    重连逻辑），所以调度器目前仍只会轮询
+- **`IDLE` 长连接推送与调度器接线**（2026-11-03）
+  - 协议层 `crates/xremail-protocol-imap/src/idle.rs`：`idle_once`——发 `IDLE` →
+    等 `+ idling` → 读推送 → 发 `DONE`（**不带 tag**）→ 等 tagged `OK`，
+    而 tagged 判定**必须匹配进 IDLE 那条命令的原 tag**；半行响应按行拼接，
+    不能把一次 TCP 读就当成一条完整行
+  - 调度层 `crates/xremail-sync/src/actor.rs` 的 `wait_for_change`：拿到推送就立即发 `DONE`
+    （不只等 30 分钟定时器，否则服务器推的下一条要干等一轮超时），然后叫醒同步
+  - **安全出口**：无论正常返回、超时、断线还是 panic，都先 `is_authenticated()`
+    校验；`DONE` 三次握手没走完的会话**弃用重连**，绝不还回连接池
+  - **降级**：服务器不支持 `/` 回 `NO`·`BAD` / 出错 → 记 `idle_supported = false`，
+    当轮改走轮询，下轮不再重试（三家实测：QQ 有 IDLE，163/沃 无）
+  - **调度器接进应用**（`apps/shell/src-tauri/src/`）：启动时列出账户、**只给
+    凭据可用的**起 actor（没存授权码的起来只能一直失败），`RunEvent::Exit` 时
+    `Scheduler::shutdown`；`delete_account` 先 `stop` 再忘凭据；`sync_account` 在
+    「第一次拿到可用凭据」时补 `start`
+  - 新增 `Scheduler::is_scheduled`：`start` 在已启动时会顺手叫醒一轮，
+    而手动同步命令**正在自己跑一轮**——不先判就会同一账户并发跑两次
+  - 前端订阅 `sync://state-changed`，只在 `state === "online"` 时重查
+    （每轮报 `connecting` + `online` 两次，全刷等于白拉一倍数据）
+  - 用例：`crates/xremail-protocol-imap/tests/idle_client.rs` +
+    `crates/xremail-sync/tests/scheduler.rs`（总数 778 → 790）
 - **移动 / 删除的写路径与本地排队**（2026-11-03）
   - 新增 `crates/xremail-sync/src/transfer_push.rs`：`push_transfers`
     + 纯函数 `route_for`（能在不连服务器的情况下测路由）

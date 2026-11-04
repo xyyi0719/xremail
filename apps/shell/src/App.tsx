@@ -33,6 +33,22 @@ const ACCOUNT_EVENTS = [
   "account://removed",
 ] as const;
 
+/**
+ * 后台同步的状态事件。
+ *
+ * 只对“同步完了”这个状态刷一次：调度器每轮会报两次
+ * （`connecting` 开始、`online` 结束），两次都重查等于白拉一倍数据。
+ */
+const SYNC_EVENT = "sync://state-changed";
+
+/** 后台一轮同步落地后报的状态（见 Rust 侧 `SyncState::Online`）。 */
+const SYNC_DONE_STATE = "online";
+
+/** `sync://state-changed` 的载荷形状（对应 Rust 侧 `AppEvent`）。 */
+type SyncStateEvent = {
+  payload?: { state?: string };
+};
+
 function App() {
   const [accounts, setAccounts] = useState<Account[] | null>(null);
   const [info, setInfo] = useState<AppInfo | null>(null);
@@ -97,6 +113,37 @@ function App() {
       for (const unlisten of unlisteners) {
         unlisten();
       }
+    };
+  }, [refresh]);
+
+  // 后台同步（调度器的 actor）跑完一轮 → 重查。
+  //
+  // 这是“邮箱自己跟上服务器”对用户可见的唯一途径：没有这条订阅，
+  // 后台拉到的新邮件要等到下一次手动操作才会出现在列表里。
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: UnlistenFn | null = null;
+
+    void listen<SyncStateEvent>(SYNC_EVENT, (event) => {
+      const state = event.payload?.payload?.state;
+      // 未知形状也刷新：宁可多查一次，不要让后台同步看不见。
+      if (state && state !== SYNC_DONE_STATE) {
+        return;
+      }
+      void refresh();
+    })
+      .then((disposeListener) => {
+        if (disposed) {
+          disposeListener();
+        } else {
+          unlisten = disposeListener;
+        }
+      })
+      .catch((e) => setError(String(e)));
+
+    return () => {
+      disposed = true;
+      unlisten?.();
     };
   }, [refresh]);
 
