@@ -464,6 +464,18 @@ pub enum OperationKind {
     /// 标记变更（bit 级增删）。
     #[serde(rename = "flags")]
     Flags,
+    /// 把邮件摄到另一个文件夹。
+    ///
+    /// 目标文件夹记在 [`MailOperation::destination_folder_id`]。
+    #[serde(rename = "move")]
+    Move,
+    /// 删除邮件。
+    ///
+    /// 这是「用户点了删除」，不是「已经删干净了」：
+    /// 有垃圾箱就往里摄（等于 `Move`），没有才标删。
+    /// 具体走哪条路由同步层按服务器能力定（见 `xremail_sync::push_transfers`）。
+    #[serde(rename = "delete")]
+    Delete,
 }
 
 /// 标记变更的意图载荷。
@@ -515,6 +527,11 @@ pub struct MailOperation {
     pub kind: OperationKind,
     /// 意图载荷。
     pub intent: FlagIntentPayload,
+    /// 目标文件夹（仅 [`OperationKind::Move`] 用）。
+    ///
+    /// 存本地 `folder.id`，不是线路上的邮箱名
+    /// （邮箱名会变，本地映射变一次不该让队列作废）。
+    pub destination_folder_id: Option<String>,
     /// 状态。
     pub state: OperationState,
     /// 本地单调序号——同一封邮件上多个意图的定序依据。

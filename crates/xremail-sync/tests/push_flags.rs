@@ -154,6 +154,7 @@ async fn enqueue_flag_intent(
         uidvalidity,
         kind: OperationKind::Flags,
         intent: FlagIntentPayload::new(add, remove),
+        destination_folder_id: None,
         state: OperationState::Queued,
         seq: 0,
         base_version: None,
@@ -620,6 +621,7 @@ async fn contradictory_intent_is_rejected_at_enqueue() {
             MessageFlags::empty().with(MessageFlags::SEEN),
             MessageFlags::empty().with(MessageFlags::SEEN),
         ),
+        destination_folder_id: None,
         state: OperationState::Queued,
         seq: 0,
         base_version: None,
@@ -638,7 +640,12 @@ async fn contradictory_intent_is_rejected_at_enqueue() {
 }
 
 #[tokio::test]
-async fn debug_noop() {
+async fn move_intents_are_left_to_the_transfer_channel() {
+    // 回归：`push_flags` 曾经把**移动/删除**意图也收进来算「净变化」。
+    //
+    // 它们的 flag 载荷是空的，于是「净变化为零」——被当成「已经在服务器上生效」
+    // 直接标成 `Succeeded`。邮件既没搬走也没删掉，队列却空了：
+    // 一次静默的数据丢失（用户以为搬了，实际上什么都没发生）。
     let fixture = start(config_with_mail()).await;
     let mut session = login(&fixture).await;
     let (pool, folder) = local_store().await;
@@ -652,28 +659,41 @@ async fn debug_noop() {
         .unwrap();
     let epoch = folder.uidvalidity.unwrap();
 
-    // 服务器上第一封的标记
-    let mut s2 = login(&fixture).await;
-    let out = xremail_protocol_imap::run_checked(&mut s2, "UID FETCH 1792658701 (UID FLAGS)")
+    let operation = MailOperation {
+        id: "op-move".to_string(),
+        account_id: folder.account_id.clone(),
+        folder_id: folder.id.clone(),
+        uid: 1_792_658_702,
+        uidvalidity: epoch,
+        kind: OperationKind::Move,
+        intent: FlagIntentPayload::default(),
+        destination_folder_id: Some("folder-archive".to_string()),
+        state: OperationState::Queued,
+        seq: 0,
+        base_version: None,
+        attempts: 0,
+        error_kind: None,
+        error_message: None,
+        created_at: 2_000,
+        updated_at: 2_000,
+    };
+    operation_dao::enqueue_operation(&pool, &operation)
         .await
-        .unwrap();
-    println!("SNAPSHOT = {out:?}");
-
-    enqueue_flag_intent(
-        &pool,
-        &folder,
-        1_792_658_701,
-        epoch,
-        MessageFlags::empty().with(MessageFlags::SEEN),
-        MessageFlags::empty(),
-        2_000,
-    )
-    .await;
+        .expect("入队应当成功");
 
     let report = push_flags(&pool, &mut session, &folder, 3_000)
         .await
-        .unwrap();
-    println!("REPORT = {report:?}");
+        .expect("回写本身不该报错");
+
+    assert_eq!(report.succeeded, 0, "移动意图不该被标记回写当成成功");
+    assert_eq!(report.noop, 0);
+
+    // 它还躺着队列里，等 `push_transfers` 去提交。
+    let stored = operation_dao::get_operation(&pool, "op-move")
+        .await
+        .unwrap()
+        .expect("操作应当还在");
+    assert_eq!(stored.state, OperationState::Queued, "不该被动过");
 
     fixture.server.shutdown().await;
 }

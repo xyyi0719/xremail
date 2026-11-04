@@ -399,6 +399,7 @@ impl MessageService {
             uidvalidity: epoch,
             kind: OperationKind::Flags,
             intent: FlagIntentPayload::new(add, remove),
+            destination_folder_id: None,
             state: OperationState::Queued,
             // `seq` 由存储层分配（同一账户 + 文件夹内严格递增），这里先占位。
             seq: 0,
@@ -417,6 +418,140 @@ impl MessageService {
             .await?
             .ok_or_else(|| xremail_core::AppError::Storage("操作已落库，但读不回来".into()))?;
         Ok(stored)
+    }
+
+    /// 把一批邮件摄进另一个文件夹（**只入队**，提交由同步轮次做）。
+    ///
+    /// 为什么不在命令里直接发 `MOVE`：用户可能离线、可能刚断网，
+    /// 队列的意义就是「意图先被记住」。排空队列的地方在
+    /// [`xremail_sync::sync_account`]（每轮拉取之后）——同步器在后台跑，
+    /// 不需要界面一直开着。
+    pub async fn move_intent(
+        &self,
+        account_id: &str,
+        folder_id: &str,
+        uids: &[i64],
+        destination_folder_id: &str,
+    ) -> AppResult<Vec<MailOperation>> {
+        // `get_folder` 本身就是按账户查的：别的账户的文件夹在这里查不到，
+        // 所以「跨账户移动」根本不可能走到下去（不需要再比 `account_id`，
+        // 比了反而是永远不会被执行的分支）。
+        let destination = self
+            .get_folder(account_id, destination_folder_id)
+            .await?
+            .ok_or_else(|| {
+                xremail_core::AppError::NotFound(format!(
+                    "目标文件夹 {destination_folder_id} 在这个账户里不存在"
+                ))
+            })?;
+
+        if destination.id == folder_id {
+            return Err(xremail_core::AppError::Invalid(
+                "目标文件夹就是源文件夹，没必要移动".into(),
+            ));
+        }
+
+        self.enqueue_transfer(
+            account_id,
+            folder_id,
+            uids,
+            OperationKind::Move,
+            Some(destination.id),
+        )
+        .await
+    }
+
+    /// 删除一批邮件（**只入队**）。
+    ///
+    /// 目标文件夹这里不写：有垃圾箱就往里摄、没有就就地标删，
+    /// 由同步层按服务器能力与本地文件夹名判断
+    /// （见 `xremail_sync::push_transfers`）。
+    pub async fn delete_intent(
+        &self,
+        account_id: &str,
+        folder_id: &str,
+        uids: &[i64],
+    ) -> AppResult<Vec<MailOperation>> {
+        self.enqueue_transfer(account_id, folder_id, uids, OperationKind::Delete, None)
+            .await
+    }
+
+    /// 一批邮件的共性校验 + 入队。
+    ///
+    /// 校验与 [`Self::set_flag_intent`] 一模一样（epoch 必须已知、
+    /// 邮件必须在本地且属于当前 epoch）——原因也一样：
+    /// UID 只在（文件夹, epoch）内有意义，套错 epoch 就是动错了信。
+    async fn enqueue_transfer(
+        &self,
+        account_id: &str,
+        folder_id: &str,
+        uids: &[i64],
+        kind: OperationKind,
+        destination_folder_id: Option<String>,
+    ) -> AppResult<Vec<MailOperation>> {
+        if uids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let folder = self
+            .get_folder(account_id, folder_id)
+            .await?
+            .ok_or_else(|| {
+                xremail_core::AppError::NotFound(format!("文件夹 {folder_id} 不存在"))
+            })?;
+
+        let epoch = folder.uidvalidity.ok_or_else(|| {
+            xremail_core::AppError::Invalid(
+                "该文件夹还没同步过，不知道 epoch，无法安全地移动或删除邮件".into(),
+            )
+        })?;
+
+        let known: Vec<i64> = message_dao::list_messages(&self.pool, account_id, folder_id)
+            .await?
+            .into_iter()
+            .filter(|message| message.uidvalidity == epoch)
+            .map(|message| message.uid)
+            .collect();
+
+        let mut enqueued = Vec::with_capacity(uids.len());
+        for &uid in uids {
+            if !known.contains(&uid) {
+                return Err(xremail_core::AppError::NotFound(format!(
+                    "本地没有 UID {uid} 这封邮件（可能还没同步下来，或 epoch 已变），请重新同步后再试"
+                )));
+            }
+
+            let now = current_time_ms();
+            let operation = MailOperation {
+                id: new_operation_id(),
+                account_id: account_id.to_string(),
+                folder_id: folder_id.to_string(),
+                uid,
+                uidvalidity: epoch,
+                kind,
+                // 移动/删除不看 flag 意图，留空载荷（空集不是矛盾意图）。
+                intent: FlagIntentPayload::default(),
+                destination_folder_id: destination_folder_id.clone(),
+                state: OperationState::Queued,
+                // `seq` 由存储层分配，这里先占位。
+                seq: 0,
+                base_version: None,
+                attempts: 0,
+                error_kind: None,
+                error_message: None,
+                created_at: now,
+                updated_at: now,
+            };
+
+            operation_dao::enqueue_operation(&self.pool, &operation).await?;
+
+            let stored = operation_dao::get_operation(&self.pool, &operation.id)
+                .await?
+                .ok_or_else(|| xremail_core::AppError::Storage("操作已落库，但读不回来".into()))?;
+            enqueued.push(stored);
+        }
+
+        Ok(enqueued)
     }
 }
 
@@ -439,7 +574,9 @@ fn overlay_pending_intents(
 
     let intents: Vec<FlagIntent> = pending
         .iter()
-        .filter(|operation| operation.uidvalidity == epoch)
+        .filter(|operation| {
+            operation.uidvalidity == epoch && operation.kind == OperationKind::Flags
+        })
         .map(|operation| {
             FlagIntent::new(
                 operation.uid,

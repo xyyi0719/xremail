@@ -7,6 +7,64 @@
 ## [Unreleased]
 
 ### Added
+- **移动 / 删除的写路径与本地排队**（2026-11-03）
+  - 新增 `crates/xremail-sync/src/transfer_push.rs`：`push_transfers`
+    + 纯函数 `route_for`（能在不连服务器的情况下测路由）
+  - **路由由服务器能力决定**：有 `MOVE` 就一条 `UID MOVE`；没有则
+    `UID COPY` → 标删 → **有 `UIDPLUS` 才** `UID EXPUNGE`（163 两者都没有，止步于标删）
+  - **删除 = 进垃圾箱**：有垃圾箱就挪进去（可撤销），没有才就地标删；
+    垃圾箱靠文件夹名推断，推不出来就不乱挪
+  - **源文件夹里已经没有这封邮件 → 算成功**：`MOVE` 不是幂等的，
+    重发会让目标文件夹多出一份（上次尝试可能已经生效，只是应答丢了）
+  - **队列在同步轮次自动排空**（`sync::flush_pending`）：离线时点的移动
+    不会丢，也不需要界面开着
+  - 存储：迁移 `0005` 给 `mail_operation` 加 `destination_folder_id`，
+    `OperationKind` 扩为 `flags` / `move` / `delete`
+  - 命令 `move_messages` / `delete_messages`（只入队，能连上就立即提交）
+  - 用例 24 个（`tests/push_transfers.rs` 8 个端到端 +
+    `apps/shell/tests/move_delete_intent.rs` 8 个服务层 + `route_for` 单测 8 个）
+- **`COPY` / `MOVE` / `EXPUNGE` 协议层与假服务器支持**（2026-11-03）
+  - 新增 `crates/xremail-protocol-imap/src/transfer.rs`：`copy_messages` /
+    `move_messages` / `mark_deleted` / `uid_expunge`，加 4 个命令构造函数
+  - **为什么不直接用 async-imap**：它的 `uid_copy` / `uid_mv` 在服务器回带 tag 的
+    `NO` / `BAD` 时**不报错**（与 `command.rs` 里记的是同一个响应解析坑），
+    于是「没拷过去」会被当成「拷好了」——这是丢数据的那一类错
+  - **解析 `COPYUID`**（RFC 4315）：源/目标 UID **按下标对齐**，
+    并暴露 `destination_uid_of(source_uid)` 供上层核对；
+    **不造假**：RFC 4315 只带源文件夹的 UIDVALIDITY，所以
+    `destination_uid_validity` 恒为 `None`而不是猜一个
+  - **删除为什么不能一律 `EXPUNGE`**：裸 `EXPUNGE` 会把这个文件夹里**所有**
+    带 `\Deleted` 的信都删掉，包括别的客户端（手机/网页版）标了还没提交的；
+    所以只在有 `UIDPLUS` 时才发 `UID EXPUNGE <set>`
+  - 假服务器（`crates/xremail-testkit/src/server.rs`）补齐 `COPY` / `MOVE` /
+    `UID COPY` / `UID MOVE` / `EXPUNGE` / `UID EXPUNGE`，并按 RFC 6851
+    让 `MOVE` **只删被移动的那些**（不碰别人标删的）
+  - 用例 9 个（`tests/transfer.rs`）
+
+- **账户调度器（AccountActor）与后台任务 panic 边界**（2026-11-03）
+  - **调度器**（`crates/xremail-sync/src/actor.rs`）：一个账户一个 actor，
+    彼此隔离。账户 A 的服务器卡住（命令超时 30s × N 个文件夹）
+    **不会**让账户 B 的同步排队等它
+  - **节奏**：交给调度后**立刻**同步一轮，之后按账户自己的
+    `poll_interval_secs` 轮询；`Scheduler::wake` 可以把一轮同步插到队首
+    （用户点「刷新」不用等到轮询到点）
+  - **失败退避**：连接失败从 `min_backoff` 起翻倍，封顶 `max_backoff`；
+    成功一次就重置回 `min_backoff`
+  - **R13 的 `catch_unwind` 任务边界**：每一轮同步（含 `connect` 与
+    `sync_account` 内部的全部 await 点）都包在
+    `AssertUnwindSafe(future).catch_unwind()` 里。panic **只停在那一轮**，
+    actor 活着并按退避重试；连续 panic 到 `max_consecutive_panics`（默认 3）
+    才**放弃**这个账户，避免「panic → 立刻重试 → 立刻 panic」热循环
+  - 事件回调（`EventSink`）自己也包一层 `catch_unwind`：UI 层的回调出错
+    不该让同步停摆
+  - **不引入运行时依赖**：`futures-util` 只是显式声明（async-imap 已经依赖它），
+    用它是因为 `std` 没有「对 future 做 `catch_unwind`」的能力，
+    而 `tokio::spawn` + `JoinHandle` 会丢掉取消语义（子任务会脱离父任务继续跑）
+  - 用例 13 个：5 个纯函数单测（退避翻倍与封顶、非正数间隔兜底、panic 载荷解析）
+    + 8 个端到端（启动即同步 / 手动叫醒不等轮询 / 一轮 panic 被拦住后仍能成功 /
+    连续 panic 恰好 3 次就放弃 / 连接失败退避 20→40→80ms /
+    **一个账户 panic 不影响另一个** / stop 后不再连接 / 叫醒未调度的账户报错）
+
 - **撰写面板（能真正写一封信）**（2026-10-30）
   - **前端**（`apps/shell/src/components/ComposePanel.tsx`、
     `RichTextEditor.tsx`、`ComposePanel.css`）：
@@ -216,6 +274,23 @@
     `cmd` 那行的 `|` **没转义**——GFM 会把这一行拆成四列
 
 ### Fixed
+- **`push_flags` 会默默吃掉移动/删除意图**（2026-11-03）：
+  它把所有待提交操作按 UID 分组后算「净变化」，而移动/删除的 flag 载荷是空的，
+  于是「净变化为零」被当成「已经在服务器上生效」直接标成 `succeeded`。
+  结果：**邮件既没搬走也没删掉，队列却空了**——一次静默数据丢失
+  （用户以为搬了，实际什么都没发生）。
+  修法：`push_flags` 只取 `kind = flags` 的操作（旧 epoch 的隔离也同理，
+  否则 `quarantined` 计数会翻倍）。
+  回归用例：`push_flags::move_intents_are_left_to_the_transfer_channel`
+  + `push_transfers::sync_account_drains_queued_moves_without_the_ui_open`。
+- **`APPENDUID` 的 UID 区间被多减了 1**（2026-11-03）：
+  `crates/xremail-protocol-imap/src/append.rs` 把
+  `UidSetMember::UidRange` 当成**半开区间**处理（`end().checked_sub(1)`），
+  而 imap-proto 是用 `fst..=snd` 构造的**闭区间**。
+  于是 `APPENDUID 123 5:7` 会被报成 **6**——发信副本记下的 UID 全错一位，
+  后续按 UID 回查副本会查错信。现实中很少碰到是因为主流服务器
+  一次只 append 一封（回单个 UID 而不是区间），属于「极少触发但错得很难查」的那类。
+  修法：直接取 `range.end()`，并把「闭区间」写进注释。
 - **163 的 IMAP `SEARCH` 只支持 `ALL`**（实测 2026-10-29）：
   `SUBJECT` / `HEADER` / `TEXT` 等条件**静默返回空结果**，连 `NO` 都不回——
   看起来像「没搜到」，实际是「这个服务器不支持这种搜法」（QQ 上正常）。

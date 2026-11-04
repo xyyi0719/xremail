@@ -53,6 +53,9 @@ encoding_rs = "0.8"
 base64 = "0.22"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "fs"] }
 tracing = "0.1"
+# `FutureExt::catch_unwind`：给后台任务加 panic 边界（R13）。
+# 不是新拉包——async-imap 已经依赖它，只是显式声明自己用到。
+futures-util = "0.3"
 
 # Windows 凭据管理器（平台钥匙串适配）。
 # 用的就是 Tauri 已经引入的 windows 同一个版本，不额外拉新包。

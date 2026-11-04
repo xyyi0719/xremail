@@ -21,7 +21,9 @@ use xremail_api::SecretValue;
 use xremail_core::model::{Account, Folder};
 use xremail_core::{AppError, AppResult};
 use xremail_protocol_imap::{ImapConfig, Session, TlsTrust, connect_and_login_with};
-use xremail_sync::{FlagPushReport, SyncSummary, push_flags, sync_account};
+use xremail_sync::{
+    FlagPushReport, SyncSummary, TransferPushReport, push_flags, push_transfers, sync_account,
+};
 
 /// 同步服务。
 #[derive(Debug, Clone)]
@@ -87,5 +89,18 @@ impl SyncService {
         now_ms: i64,
     ) -> AppResult<FlagPushReport> {
         push_flags(&self.pool, session, folder, now_ms).await
+    }
+
+    /// 把某个文件夹里排队的移动/删除意图回写到服务器，并**回读确认**。
+    ///
+    /// 失败分类同 [`Self::push_flags`]；额外一条：源文件夹里已经没那封邮件时
+    /// 算成功（上次尝试可能已生效，`MOVE` 不幂等，重发会多出一份）。
+    pub async fn push_transfers(
+        &self,
+        session: &mut Session,
+        folder: &Folder,
+        now_ms: i64,
+    ) -> AppResult<TransferPushReport> {
+        push_transfers(&self.pool, session, folder, now_ms).await
     }
 }

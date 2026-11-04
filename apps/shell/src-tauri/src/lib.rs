@@ -72,6 +72,8 @@ pub fn run() {
             cmd::save_credential,
             cmd::forget_credential,
             cmd::set_message_flag,
+            cmd::move_messages,
+            cmd::delete_messages,
             cmd::save_draft,
             cmd::list_drafts,
             cmd::get_draft,

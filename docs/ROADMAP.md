@@ -57,7 +57,8 @@
   - 意图先落库（`queued`）→ 提交 → **回读确认** → 六态回报前端（`applied` / `state`）
   - 三家真实邮箱实测：`UID STORE` 全 OK、**回读确认生效**、重复发同一标记也回 OK（见 `docs/PROTOCOLS.md`）
   - epoch 变了 → 意图作废（`failed` / `epoch_changed`），不会把旧 UID 套到另一封信上
-- [ ] 调度器（AccountActor）：什么时候同步、同步哪些文件夹、重连退避。
+- [x] 调度器（AccountActor）：什么时候同步、同步哪些文件夹、重连退避
+      （2026-11-03，`crates/xremail-sync/src/actor.rs`；**IDLE 仍未做**，见 P2 小节）。
 - [x] 收发链路（P3）：SMTP **提交路径**已写完并跑通真发信（2026-10-29，163 ↔ QQ 双向，见 P3 小节）。
 - [x] **撰写面板**（2026-10-30）：能写一封信并发出去——收件人 / 抄送 / 主题 /
   **富文本**正文（自写 `contenteditable` 编辑器，**不引入新依赖**）、
@@ -153,7 +154,15 @@
   - [x] 协议层端到端测试 10 个（假服务器 × 真客户端）
   - [x] 补齐同步链路命令：UID FETCH / UID SEARCH / UID STORE（2026-10-23）
   - [x] 补齐：`APPEND`（发信存副本，2026-10-30 已做）
-  - [ ] 补齐：`COPY` / `MOVE`（垃圾箱移动）——仍是待办
+  - [x] 补齐：`COPY` / `MOVE` / `UID EXPUNGE` / `EXPUNGE`（2026-11-03）
+    - 协议层 `crates/xremail-protocol-imap/src/transfer.rs`：自己发命令、自己读 tagged 响应、
+      自己判定成败（async-imap 的 `uid_copy` / `uid_mv` 在 `NO` / `BAD` 时不报错，同 [`command`] 的坑）
+    - 解析 `COPYUID`（RFC 4315）：源/目标 UID **按下标对齐**；目标文件夹的 UIDVALIDITY
+      服务器**不给**，所以 `destination_uid_validity` 恒为 `None`（宁可空，不造假）
+    - 端到端用例 9 个（`tests/transfer.rs`）：UID 映射、多封乱序对齐、目标不存在报错、
+      空集合不报错、`MOVE` 不碰别人标删的信、`UID EXPUNGE` 只删指定、裸 `EXPUNGE` 删全部
+    - 顺手修了 `append.rs` 的一个真 bug：`APPENDUID 123 5:7` 被错报成 6
+      （`UidRange` 是**闭区间**，原代码多减了 1），发信副本的 UID 会全记错一位
 
 **出口**：三种真实账户各有实测记录；没有账号或配置时保留阻塞，不宣称完成。
 *当前状态（2026-10-26）：**三家均已只读实测**（各自的协议事实记在 [PROTOCOLS.md](PROTOCOLS.md)），
@@ -168,7 +177,25 @@
   - 绑定旧 epoch 的待提交操作**隔离**（标记 `failed`），绝不套用到新 UID 上
   - 用例：`epoch_change_triggers_a_rebuild`、`operations_bound_to_the_old_epoch_are_quarantined`
 - [ ] 断线恢复（崩溃后重启对账）。
-- [ ] IDLE 状态切换与轮询兜底；其他文件夹调度；**调度器本身尚未存在**。
+- [x] **账户调度器**（2026-11-03）：`crates/xremail-sync/src/actor.rs`。
+  - 一个账户一个 actor，彼此隔离（一个账户的服务器卡住不拖住另一个）
+  - 调度后立即先同步一轮 → 按账户自己的 `poll_interval_secs` 轮询；
+    `Scheduler::wake` 插队（用于 UI 的「刷新」按钮）
+  - 失败退避：`min_backoff` 起翻倍、封顶 `max_backoff`，成功即重置
+  - **R13 的 panic 边界就在这一层**：每轮同步包 `catch_unwind`，
+    panic 只停在那一轮；连续 3 次才放弃账户
+  - 用例：13 个（5 单测 + 8 端到端，含「一个账户 panic 不影响另一个」）
+  - ⚠️ **但应用层还没接**（2026-11-03 核实）：`apps/shell/src-tauri/src/`
+    里没有任何地方 `use` 这个 `Scheduler`，产品路径仍是用户在界面上��一下 →
+    `cmd::sync_account` 手动跑一轮。也就是说**现在的「后台定时同步」只活在
+    crate 的用例里，编译进应用也没被启用**。接线要动 Tauri 2 的启动与
+    `RunEvent` 退出钩子（还要把退出时停掉轮询写清楚），单独立项。
+- [ ] IDLE 状态切换；其他文件夹调度。
+  - **仍未做**：`IDLE` 需要客户端侧的保持/重发与唤醒，而假服务器
+    （`xremail-testkit`）**还没有 `IDLE` 支持**——先补假服务器再写客户端，
+    否则这条路径没有证据（与本仓库「每阶段出口要有对应测试」的约束冲突）
+  - 唤醒通道已留好：接 `IDLE` 之后只需在收到 untagged 响应时调
+    `Scheduler::wake`，调用方不用改
   - 已具备条件：三家能力已实测（QQ 有 IDLE，163/沃 无），
     能力判定逻辑在 `xremail-protocol-imap::extension_support`
 - [x] flag bit 级意图、**回读确认**与 `uncertain` 状态。
@@ -177,7 +204,22 @@
     连接断了 → **`uncertain`**（不知道服务器执行了没，**不能盲目重试**）
   - 只发**变化的位**，不整组替换 `FLAGS`
   - 用例：11 个（含「服务器回 OK 却不真改 → 回读发现」）
-- [ ] 移动 / 删除的保守策略（P3 一并做，依赖假服务器的 COPY / MOVE）
+- [x] 移动 / 删除的保守策略（2026-11-03）
+  - 落点：`xremail-sync::transfer_push`（`pub use transfer_push::{TransferPushReport, push_transfers}`）；
+    路由拆成纯函数 `route_for`，不连服务器就能测；
+    服务层 `MessageService::move_intent` / `delete_intent`；命令 `move_messages` / `delete_messages`
+  - **删除 = 进垃圾箱**：有垃圾箱就挪进去（可撤销），没有才就地标删；
+    垃圾箱靠文件夹名推断（本地库还不存 `\Trash` 属性）
+  - 源文件夹里**已经没有这封邮件** → 算成功（`MOVE` 不幂等，重发会多出一份）
+  - 队列在同步轮次里**自动排空**（`flush_pending`），不需要界面开着
+  - 用例：24 个（`crates/xremail-sync/tests/push_transfers.rs` 8 个端到端、
+    `apps/shell/src-tauri/tests/move_delete_intent.rs` 8 个服务层、
+    `transfer_push.rs` 里的 `route_for` 单测 8 个）
+  - 前置已就位（2026-11-03）：协议层 `COPY` / `MOVE` 与假服务器都已支持
+  - 保守路径：有 `MOVE` 就一步 `UID MOVE`；没有则 `UID COPY` → `UID STORE +FLAGS (\Deleted)`
+    → **有 `UIDPLUS` 才** `UID EXPUNGE`（163 没有 `UIDPLUS`，只能止步于标删）
+  - 裸 `EXPUNGE` **不能**用：它会把这个文件夹里所有带 `\Deleted` 的信都删掉，
+    包括别的客户端标了还没提交的（那也是用户的数据）
 - [x] 按需正文（`BODY.PEEK[]` → `message_body` 表）；头随拉取一起落库。
 - [ ] 附件下载、离线缓存状态。
 - [x] **HTML 默认禁网且不可访问宿主**（R06，2026-10-30）。
@@ -195,7 +237,8 @@
     索引由**触发器**维护（epoch 切换、级联删除这些路径也绕不过触发器）
   - 短词（< 3 字符）退化成 `LIKE` **子串**扫描；查询词按字面匹配（`OR` 不是语法）
   - `rebuild_index`（可重复）+ `check_index_consistency`（查漏索引 / 孤儿行 / 正文过期）
-- [ ] **测试用例扩写 T6–T8**（HTML 清洗攻击样本、假 IMAP 同步链路、故障注入）。
+- [ ] **测试用例扩写 T6–T8 的剩余部分**（T6 与 T7 已完成，见 [TESTING_STRATEGY](TESTING_STRATEGY.md)；
+  先进只卡在两项：**完备的 OWASP 样本集**与**乱序响应**）。
   - T7 的**假服务器已就位**（含故障注入）：IMAP 侧覆盖拉取与回写，
     **SMTP 侧覆盖提交与能力协商**（`xremail-testkit`）
   - **T6（HTML 攻击样本）已补上**（2026-10-30）：core 的消毒器单测
@@ -206,8 +249,9 @@
     **乱序响应仍缺**
 
 **出口**：两客户端并发、崩溃恢复、恶意邮件与检索一致性测试通过；不承诺任意网络下固定收敛秒数。
-*当前状态（2026-10-30）：同步引擎的**拉取**与**回写**两条链路已在 crate 层完成并有端到端测试；
-**HTML 安全门与 FTS 已落地**（2026-10-30）；仍缺调度器、断线恢复、移动/删除。*
+*当前状态（2026-11-03）：同步引擎的**拉取**与**回写**（标记 + 移动/删除）两条链路已在 crate 层完成并有端到端测试；
+**HTML 安全门与 FTS 已落地**（2026-10-30），**调度器已落地但应用层尚未接线**（2026-11-03，轮询 + 手动触发 + 退避，IDLE 待补）；
+仍缺断线恢复。*
 
 ### P3：发送与草稿
 
@@ -267,7 +311,12 @@
 
 - [ ] Windows 托盘、通知、单实例、退出/恢复。
   - [x] **安全存储**（2026-10-26）：Windows 凭据管理器适配已落地（`secrets/windows_store.rs`），
-        不静默降级；托盘 / 通知 / 单实例 / 退出恢复仍未做。
+        不静默降级。
+  - **2026-11-03 核实进度**：通知（`tauri_plugin_notification`）、单实例
+        （`tauri_plugin_single_instance`，第二次启动聚焦已有窗口）、开机自启
+        （`tauri_plugin_autostart`）**都已在 `lib.rs:37-53` 接线**；
+        真正还缺的是**托盘图标**（`tauri.conf.json` 无 `trayIcon`）与**退出/恢复语义**
+        （关窗口是否退到托盘、后台同步是否继续）。
 - [ ] **早期可并行** Android PoC：构建、Rust 调用、Keystore 适配路线、前台/后台/息屏/进程恢复。
 - [ ] 根据 PoC 决定移动端前台同步与后台策略；必要时请求用户选择时效/功耗取舍。
 - [ ] Android 阅读/发信/本地缓存验收，背景任务限制如实展示。
@@ -318,11 +367,11 @@ Gmail 将来有需求再开独立决策：授权流程、scope、个人使用与
    - 与 [SECURITY §2.1](SECURITY.md) 一致：数据库里只有不透明的 `secret_ref` ✓
    - 平台不支持时**如实报错**，不静默降级成内存 / 文件
    - 遗留：Android 侧钥匙串适配（Keystore）还没做
-3. **调度器**（AccountActor）：什么时候同步、同步哪些文件夹、重连退避。
-   - 能力判定已有（QQ 有 IDLE，163/沃 无 ⇒ 退化为轮询）
-   - R13 的 `catch_unwind` 边界在这一步落地
-   - **前置已就位**：凭据可从平台钥匙串取用（不用每次问用户要授权码），
-     写操作队列已有六态与回读确认（失败时调度器只管重试 `retryable` 的那些）
+3. ~~**调度器**（AccountActor）~~ **已完成（2026-11-03）**：`crates/xremail-sync/src/actor.rs`。
+   - 一个账户一个 actor；启动即同步 → 按 `poll_interval_secs` 轮询；`wake` 插队
+   - 失败退避 `min_backoff` → `max_backoff`，成功即重置
+   - R13 的 `catch_unwind` 边界已在这一层落地（每轮同步一个边界）
+   - **残余**：`IDLE` 长连接推送未做（假服务器缺 `IDLE` 支持，需先补再写）
 4. ~~**同步引擎接进应用的同时跑一次真邮箱验收**~~ **已完成（2026-10-26）**：
    三个测试账号各跑一次完整同步（连接 → 登录 → 列文件夹 → 拉取 → 落库 → 读正文），
    脱敏证据：163 = 6 文件夹 / 4 封 / utf-8；QQ = 6 文件夹 / 71 封 / gb2312；
@@ -338,10 +387,11 @@ Gmail 将来有需求再开独立决策：授权流程、scope、个人使用与
 **写操作真正回写服务器**（标记已读 / 星标 → `UID STORE` → 回读确认 → 六态回报），
 三家真实邮箱的 `UID STORE` 实测记录在 [PROTOCOLS.md](PROTOCOLS.md)。
 
-**下一批建议（2026-10-26，未获授权不动手）**：**调度器（AccountActor）**——
-凭据不再需要人工输入，且写操作有了可靠的失败分类，调度器才有东西可调；
-其次是 **HTML 正文渲染（R06）**（P2 的阅读体验缺口）。
-**SMTP（R18）**排在后面：它要先实测三家的 SMTP 参数，风险与不可逆性都更高。
+**下一批建议（更新于 2026-11-03）**：调度器、R13 的 panic 边界、
+`COPY` / `MOVE` 协议 + 假服务器支持、**移动/删除的写路径**均已完工。
+接下来依次是：**断线恢复（崩溃后对账）**、
+**`IDLE`**（先给假服务器补 `IDLE`）；
+它们比 HTML 正文渲染与 SMTP 都更接近核心可靠度。
 
 **已完成（2026-10-23）**：三家测试账号已准备并完成只读实测（凭据仅在本机配置）；
 只读 probe、假服务器、同步纯函数、同步引擎（拉取 + 回写 + 按需正文）、

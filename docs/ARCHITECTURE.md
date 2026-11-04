@@ -126,7 +126,16 @@ RFC Message-ID 只能作线索，不能作为唯一键或自动跨文件夹去�
 - 第 5 步：正文**按需**拉（`BODY.PEEK[]`，见 `crates/xremail-sync/src/body.rs`）——
   正文可能很大且带附件，一个邮箱几千封全拉一遍既慢又费流量。
 - 第 6 步：服务器已删的 UID 清缓存；**本地草稿的保留策略**由 `UidDiff::retain_local` 落实。
-- 第 7 步（进入 IDLE 或轮询）**尚未实现**——调度器还不存在。
+- 第 7 步（进入 IDLE 或轮询）**轮询已实现（2026-11-03）**：
+  `crates/xremail-sync/src/actor.rs`——一个账户一个 actor，交给调度后立刻同步一轮，
+  之后按 `poll_interval_secs` 轮询，`Scheduler::wake` 可插队；
+  失败按 `min_backoff`→`max_backoff` 翻倍退避；每一轮都包在
+  `catch_unwind` 里（R13），panic 只停在那一轮。
+  **`IDLE` 仍未实现**——需要客户端侧 IDLE 保持与假服务器支持（见 ROADMAP P2）。
+  同时要看清：这个 actor **已经在 crate 里实现并有端到端用例，但应用层还没把它跑起来**——
+  `apps/shell/src-tauri/src/` 里没有任何地方 `use` 它，产品路径仍是手动点刷新触发
+  `cmd::sync_account` 跑一轮。接线（启动时按账户起 actor、退出时停、
+  以及 `Scheduler::wake` 接到刷新按钮上）是单独一步，不要误以为已经自动在后台同步。
 
 **三条实测得来的实现约束（2026-10-23）**：
 
@@ -172,10 +181,13 @@ UIDVALIDITY 不得为 0（RFC 3501），收到 0 视为协议错误。
 
 Message-ID、稳定操作 ID 有助于排查，但不能保证 SMTP 去重。明确不承诺网络故障下 exactly-once。
 
-**实现落点（2026-10-23）**：状态枚举已定在 `xremail-core::model::OperationState`
+**实现落点（2026-10-23，后经 2026-11-03 核实修正）**：状态枚举已定在 `xremail-core::model::OperationState`
 （六态，取值与 `mail_operation.state` 列一致）；`xremail-store::dao::operation` 提供入队、
-列未完结操作、更新状态。**目前只实现了 flag 类操作**——
-move / delete / append / SMTP 尚未定义（等假服务器补齐 COPY / MOVE / APPEND）。
+列未完结操作、更新状态。**已实现的类别**：flag（2026-10-26）、append（2026-10-30，发信存副本）、
+SMTP（2026-10-28，`send_queue` 独立队列）。**协议层已就绪、队列尚未定义**：move / delete
+——`crates/xremail-protocol-imap/src/transfer.rs` 已提供 `copy_messages` / `move_messages` /
+`mark_deleted` / `uid_expunge` 与假服务器支持（2026-11-03），
+但 `OperationKind` 仍只有 `flags` 一种，加 move 需要先给 `mail_operation` 加目标文件夹。
 
 **实现落点（2026-10-26）**：flag 类操作**已真正回写服务器**。
 链路：`MessageService::set_flag_intent` 先落一条 `mail_operation`（`queued`）→
@@ -281,6 +293,35 @@ QQ 要 **30–90 秒**才落盘（第一次实测查得太早，误记成「QQ �
   连接断了 / 超时 → **`uncertain`**。
 * 绑定旧 epoch 的操作**隔离**为 `failed`，绝不套用到新 UID 上。
 
+**实现落点（2026-11-03，`crates/xremail-sync/src/transfer_push.rs`）——移动 / 删除：**
+
+* 与标记回写**分两条通道**：标记的意图是「这封信该带哪些 flag」（可按 bit 算净变化），
+  移动/删除的意图是「这封信不该在这个文件夹里了」——没有净变化可算，
+  只能做一次然后**核对它真的走了**。
+* 路由由**服务器能力**决定，抽成纯函数 `route_for` 以便不连服务器就能测：
+
+  | 场景 | 发什么 |
+  |---|---|
+  | 有 `MOVE` | 一条 `UID MOVE` |
+  | 没有 `MOVE` | `UID COPY` → `UID STORE +FLAGS (\Deleted)` → **有 `UIDPLUS` 才** `UID EXPUNGE` |
+  | 两者都没有（163） | 停在「已标删」 |
+
+* **裸 `EXPUNGE` 一律不用**：它会把这个文件夹里所有带 `\Deleted` 的信都删掉，
+  包括别的客户端标了还没提交的。那也是用户的数据。
+* **删除 = 进垃圾箱**（保守优先）：有垃圾箱就挪进去（可撤销），没有才就地标删。
+  垃圾箱靠**文件夹名**推断（本地库还不存 `\Trash` 属性）；推不出来就不乱挪。
+* **移动专属的保守处理**：源文件夹里已经没有这封邮件 → 算成功。
+  可能是上次尝试生效了（应答丢了），也可能别人挪走了——两种情况下
+  「再挪一次」都是错的（RFC 6851 的 `MOVE` 不是幂等的，`COPY` 重发会多一份）。
+* 失败分类与标记回写**完全一致**（复用 `SubmitError`）：`NO` → `retryable`；
+  断线/超时 → `uncertain`；认证失败不重试。
+* **队列由同步轮次自动排空**（`sync::flush_pending`，每轮拉取之后）：
+  用户离线时点的移动不会丢，也不需要界面开着。
+* 一个必须钉住的细节：`push_flags` **只处理 `kind = flags` 的操作**。
+  若让它把移动意图也收进来算净变化，空载荷会被当成「净变化为零」直接标成
+  `succeeded`——邮件既没搬走也没删掉，队列却空了（静默丢数据）。
+  回归用例：`push_flags::move_intents_are_left_to_the_transfer_channel`。
+
 ## 7. 检索模型
 
 推荐先做显式 `search_document` 投影，聚合摘要与已解码正文；使用普通存内容 FTS5 表并在 DAO 事务内维护索引。
@@ -345,7 +386,9 @@ Linux/macOS/iOS 不属于当前验收平台，不因 Tauri 支持就视为产品
 
 错误附加上下文时必须保留错误变体，否则 `is_retryable()` / `requires_user_action()` 判定失效。
 `AppError::with_context` 按变体逐个包裹，`Context::ctx` 基于它实现，已有单测锁定该行为。
-`panic = "abort"` 意味着后台任务无法用 `catch_unwind` 兜底，单个同步 task 的 panic 会终止整个应用；取舍见 [ISSUES_AND_RISKS R13](ISSUES_AND_RISKS.md)。
+`panic = "abort"` 会让后台任务无法用 `catch_unwind` 兜底，单个同步 task 的 panic 就会终止整个应用。
+因此 release profile 选用 `unwind`（仓库根 `Cargo.toml:96`），并在同步任务边界加 `catch_unwind`
+（`crates/xremail-sync/src/actor.rs`，每轮同步一个边界）；取舍与残余见 [ISSUES_AND_RISKS R13](ISSUES_AND_RISKS.md)。
 
 ### 9.1 HTML 正文的安全边界（R06）
 

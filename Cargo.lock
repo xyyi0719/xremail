@@ -6369,6 +6369,7 @@ dependencies = [
 name = "xremail-sync"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "sqlx",
  "tempfile",
  "tokio",

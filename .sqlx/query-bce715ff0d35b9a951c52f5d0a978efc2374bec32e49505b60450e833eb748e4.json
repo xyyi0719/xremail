@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT INTO mail_operation (\n            id, account_id, folder_id, uid, uidvalidity,\n            kind, intent, destination_folder_id, state, seq, base_version,\n            attempts, error_kind, error_message, created_at, updated_at\n        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 16
+    },
+    "nullable": []
+  },
+  "hash": "bce715ff0d35b9a951c52f5d0a978efc2374bec32e49505b60450e833eb748e4"
+}

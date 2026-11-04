@@ -6,7 +6,9 @@
 //! 它们无网络依赖、无 IO，可直接在 CI 跑（见
 //! [TESTING_STRATEGY §5.1](../../../docs/TESTING_STRATEGY.md)）。
 //!
-//! 账户调度、IMAP 会话、操作队列持久化属于 P2，尚未实现。
+//! 账户调度、IMAP 会话、操作队列持久化属于 P2。
+//! **调度器已落地（2026-11-03）**：见 [`actor`]——一个账户一个 actor，
+//! 轮询 + 手动触发 + 退避重试，每一轮同步都包在 `catch_unwind` 里（R13）。
 //!
 //! ## 为什么这些逻辑必须是纯函数
 //!
@@ -32,6 +34,7 @@
 //!
 //! `xremail-sync` → `xremail-core`。不认识 Tauri，也不认识 UI。
 
+pub mod actor;
 pub mod body;
 pub mod diff;
 pub mod epoch;
@@ -40,7 +43,12 @@ pub mod net;
 pub mod pull;
 pub mod push;
 pub mod sync;
+pub mod transfer_push;
 
+pub use actor::{
+    AccountConnector, AccountEvent, Clock, ConnectFuture, EventSink, NoopSink, RetryPolicy,
+    Scheduler, WakeReason, system_clock,
+};
 pub use body::{fetch_body, read_body};
 pub use diff::{UidDiff, UidSet, diff_uids};
 pub use epoch::{EpochTransition, PendingOperationBinding, StoredEpoch, plan_epoch_transition};
@@ -51,3 +59,4 @@ pub use intent::{
 pub use pull::{FolderSyncReport, flags_from_imap, pull_folder};
 pub use push::{FlagPushReport, push_flags};
 pub use sync::{SyncSummary, sync_account};
+pub use transfer_push::{TransferPushReport, push_transfers};

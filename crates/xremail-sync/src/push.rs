@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 use sqlx::SqlitePool;
 use xremail_core::AppError;
 use xremail_core::AppResult;
-use xremail_core::model::{Folder, MailOperation, MessageFlags, OperationState};
+use xremail_core::model::{Folder, MailOperation, MessageFlags, OperationKind, OperationState};
 use xremail_protocol_imap::{CommandOutcome, ProtocolError, Session};
 use xremail_store::dao::message as message_dao;
 use xremail_store::dao::operation;
@@ -97,6 +97,13 @@ pub async fn push_flags(
         pending.into_iter().partition(|op| op.uidvalidity != epoch);
 
     for op in &stale {
+        // 移动/删除的隔离归 `push_transfers` 管（那边要先按 kind 过滤，
+        // 因为它还要区分「目标文件夹还在不在」）。两边都隔离一遍是幂等的，
+        // 但会让 `quarantined` 计数翻倍，所以这里只处理标记操作。
+        if op.kind != OperationKind::Flags {
+            continue;
+        }
+
         operation::update_operation_state(
             pool,
             &op.id,
@@ -113,8 +120,13 @@ pub async fn push_flags(
     }
 
     // 3. 按 UID 分组。
+    //
+    // **只取标记操作**：移动/删除的意图载荷是空的（它们不看 flag），
+    // 若让它们进 `plan_flag_update`，净变化为零会被当成「已经在服务器上生效」
+    // 直接标成成功——结果是邮件既没搬走也没删掉，队列却空了。
+    // 那条通道在 [`crate::transfer_push`]。
     let mut by_uid: BTreeMap<i64, Vec<&MailOperation>> = BTreeMap::new();
-    for op in &live {
+    for op in live.iter().filter(|op| op.kind == OperationKind::Flags) {
         by_uid.entry(op.uid).or_default().push(op);
     }
 
@@ -264,7 +276,10 @@ enum Outcome {
 }
 
 /// 提交失败的三种分类。
-enum SubmitError {
+///
+/// 与 [`push_transfers`](crate::transfer_push) 共用：
+/// 移动/删除与标记的失败语义完全一样（明确拒绝可重试、断线不确定、认证失败不重试）。
+pub(crate) enum SubmitError {
     /// 服务器明确拒绝：可重试。
     Retryable { message: String },
     /// 不知道服务器执行了没：不能盲目重试。
@@ -370,7 +385,7 @@ async fn read_snapshot(session: &mut Session, uid: i64) -> Result<Snapshot, Subm
 }
 
 /// 把协议错误分类成提交失败的三种。
-fn classify_submit_error(error: ProtocolError) -> SubmitError {
+pub(crate) fn classify_submit_error(error: ProtocolError) -> SubmitError {
     match error {
         // 服务器明确拒绝 → 它**没执行** → 可重试。
         ProtocolError::Imap(detail) | ProtocolError::ConditionFailed(detail) => {

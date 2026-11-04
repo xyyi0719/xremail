@@ -108,6 +108,15 @@ pub async fn sync_account(
                 summary.added += report.added;
                 summary.removed += report.removed;
                 summary.reports.push(report);
+
+                // 3.5 排空这个文件夹的待提交操作。
+                //
+                // 放在**拉取之后**：UID 与 epoch 刚刷新过，
+                // 队列里的意图应该按最新的现实去提交。
+                //
+                // 这一步让 `retryable` 的操作有了自动重试的机会——
+                // 在此之前只有用户手动点一下才会回写，失败一次就永远躺着。
+                flush_pending(pool, session, &folder, now_ms).await;
             }
             Err(error) => {
                 tracing::warn!(
@@ -121,6 +130,58 @@ pub async fn sync_account(
     }
 
     Ok(summary)
+}
+
+/// 把一个文件夹里待提交的操作回写到服务器。
+///
+/// 失败**不影响**拉取结果：发不出去就留在队列里，下一轮再试。
+/// 这里刻意不向上抛错：一个文件夹提交不了不该让整轮同步失败，
+/// 更不该把已拉回来的数据丢掉。
+async fn flush_pending(pool: &SqlitePool, session: &mut Session, folder: &Folder, now_ms: i64) {
+    // 重新读一遍：`pull_folder` 可能刚换过 epoch。
+    let fresh = match folder_dao::get_folder(pool, &folder.id).await {
+        Ok(Some(fresh)) => fresh,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::warn!(%error, folder = %folder.remote_name, "读文件夹失败，跳过回写");
+            return;
+        }
+    };
+
+    match crate::push::push_flags(pool, session, &fresh, now_ms).await {
+        Ok(report) if !report.is_noop() => tracing::debug!(
+            folder = %fresh.remote_name,
+            succeeded = report.succeeded,
+            retryable = report.retryable,
+            failed = report.failed,
+            uncertain = report.uncertain,
+            "标记意图已回写"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            folder = %fresh.remote_name,
+            "标记回写失败，意图留在队列里"
+        ),
+    }
+
+    match crate::transfer_push::push_transfers(pool, session, &fresh, now_ms).await {
+        Ok(report) if !report.is_noop() => tracing::debug!(
+            folder = %fresh.remote_name,
+            moved = report.moved,
+            deleted = report.deleted,
+            retryable = report.retryable,
+            failed = report.failed,
+            uncertain = report.uncertain,
+            "移动/删除意图已回写"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            folder = %fresh.remote_name,
+            "移动/删除回写失败，意图留在队列里"
+        ),
+    }
 }
 
 /// 从账户配置构造 IMAP 连接参数。

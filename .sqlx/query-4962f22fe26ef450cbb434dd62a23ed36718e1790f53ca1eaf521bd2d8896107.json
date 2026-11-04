@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n        SELECT id, account_id, folder_id, uid, uidvalidity,\n               kind, intent, state, seq, base_version,\n               attempts, error_kind, error_message, created_at, updated_at\n        FROM mail_operation\n        WHERE account_id = ? AND folder_id = ?\n          AND state IN ('queued', 'running', 'retryable', 'uncertain')\n        ORDER BY seq ASC\n        ",
+  "query": "\n        SELECT id, account_id, folder_id, uid, uidvalidity,\n               kind, intent, destination_folder_id, state, seq, base_version,\n               attempts, error_kind, error_message, created_at, updated_at\n        FROM mail_operation\n        WHERE account_id = ?\n          AND state IN ('queued', 'running', 'retryable', 'uncertain')\n        ORDER BY seq ASC\n        ",
   "describe": {
     "columns": [
       {
@@ -81,8 +81,19 @@
         }
       },
       {
-        "name": "state",
+        "name": "destination_folder_id",
         "ordinal": 7,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mail_operation",
+            "name": "destination_folder_id"
+          }
+        }
+      },
+      {
+        "name": "state",
+        "ordinal": 8,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -93,7 +104,7 @@
       },
       {
         "name": "seq",
-        "ordinal": 8,
+        "ordinal": 9,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -104,7 +115,7 @@
       },
       {
         "name": "base_version",
-        "ordinal": 9,
+        "ordinal": 10,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -115,7 +126,7 @@
       },
       {
         "name": "attempts",
-        "ordinal": 10,
+        "ordinal": 11,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -126,7 +137,7 @@
       },
       {
         "name": "error_kind",
-        "ordinal": 11,
+        "ordinal": 12,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -137,7 +148,7 @@
       },
       {
         "name": "error_message",
-        "ordinal": 12,
+        "ordinal": 13,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -148,7 +159,7 @@
       },
       {
         "name": "created_at",
-        "ordinal": 13,
+        "ordinal": 14,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -159,7 +170,7 @@
       },
       {
         "name": "updated_at",
-        "ordinal": 14,
+        "ordinal": 15,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -170,7 +181,7 @@
       }
     ],
     "parameters": {
-      "Right": 2
+      "Right": 1
     },
     "nullable": [
       false,
@@ -180,6 +191,7 @@
       false,
       false,
       false,
+      true,
       false,
       false,
       true,
@@ -190,5 +202,5 @@
       false
     ]
   },
-  "hash": "f59127a26b99270edbdb1c0fa4944d5a0b7e8dd3dd05b20b9606f73f7c808901"
+  "hash": "4962f22fe26ef450cbb434dd62a23ed36718e1790f53ca1eaf521bd2d8896107"
 }

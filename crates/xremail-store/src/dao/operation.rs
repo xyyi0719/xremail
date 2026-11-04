@@ -38,6 +38,7 @@ struct OperationRow {
     uidvalidity: i64,
     kind: String,
     intent: String,
+    destination_folder_id: Option<String>,
     state: String,
     seq: i64,
     base_version: Option<i64>,
@@ -89,9 +90,9 @@ pub async fn enqueue_operation(pool: &SqlitePool, operation: &MailOperation) -> 
         r#"
         INSERT INTO mail_operation (
             id, account_id, folder_id, uid, uidvalidity,
-            kind, intent, state, seq, base_version,
+            kind, intent, destination_folder_id, state, seq, base_version,
             attempts, error_kind, error_message, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
         operation.id,
         operation.account_id,
@@ -100,6 +101,7 @@ pub async fn enqueue_operation(pool: &SqlitePool, operation: &MailOperation) -> 
         operation.uidvalidity,
         kind,
         intent,
+        operation.destination_folder_id,
         state,
         next_seq,
         operation.base_version,
@@ -147,7 +149,7 @@ pub async fn list_pending_operations(
         OperationRow,
         r#"
         SELECT id, account_id, folder_id, uid, uidvalidity,
-               kind, intent, state, seq, base_version,
+               kind, intent, destination_folder_id, state, seq, base_version,
                attempts, error_kind, error_message, created_at, updated_at
         FROM mail_operation
         WHERE account_id = ? AND folder_id = ?
@@ -175,7 +177,7 @@ pub async fn get_operation(pool: &SqlitePool, id: &str) -> AppResult<Option<Mail
         OperationRow,
         r#"
         SELECT id, account_id, folder_id, uid, uidvalidity,
-               kind, intent, state, seq, base_version,
+               kind, intent, destination_folder_id, state, seq, base_version,
                attempts, error_kind, error_message, created_at, updated_at
         FROM mail_operation
         WHERE id = ?
@@ -203,7 +205,7 @@ pub async fn list_all_pending_operations(
         OperationRow,
         r#"
         SELECT id, account_id, folder_id, uid, uidvalidity,
-               kind, intent, state, seq, base_version,
+               kind, intent, destination_folder_id, state, seq, base_version,
                attempts, error_kind, error_message, created_at, updated_at
         FROM mail_operation
         WHERE account_id = ?
@@ -313,6 +315,7 @@ fn row_to_operation(row: &OperationRow) -> AppResult<MailOperation> {
         uidvalidity: row.uidvalidity,
         kind,
         intent,
+        destination_folder_id: row.destination_folder_id.clone(),
         state,
         seq: row.seq,
         base_version: row.base_version,

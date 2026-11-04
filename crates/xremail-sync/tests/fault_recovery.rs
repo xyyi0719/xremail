@@ -165,6 +165,7 @@ async fn enqueue_read_intent(
             MessageFlags::empty().with(MessageFlags::SEEN),
             MessageFlags::empty(),
         ),
+        destination_folder_id: None,
         state: OperationState::Queued,
         seq: 0,
         base_version: None,

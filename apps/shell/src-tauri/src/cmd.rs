@@ -518,6 +518,147 @@ pub async fn set_message_flag(
 /// 找一个账户的授权码：先看内存，再看平台钥匙串。
 ///
 /// 两处都没有 → `None`（"这个账户还没保存授权码"是**状态**，不是错误）。
+/// 移动/删除意图的回写结果。
+#[derive(Debug, Clone, Serialize)]
+pub struct TransferIntentResult {
+    /// 意图已落库进本地操作队列。
+    pub queued: bool,
+    /// 服务器已回读确认生效的封数（移动 + 删除）。
+    pub applied: usize,
+    /// 失败但可重试几封。
+    pub retryable: usize,
+    /// 失败且不该重试几封。
+    pub failed: usize,
+    /// 不知道服务器执行了没几封。
+    pub uncertain: usize,
+    /// 给用户看的中文说明。
+    pub message: Option<String>,
+}
+
+/// 把一批邮件移进另一个文件夹。
+///
+/// ## 链路
+///
+/// 1. 意图落库（`mail_operation`，`kind = move`，带目标文件夹）；
+/// 2. 能连上就立刻回写并**回读确认**；连不上就留在队列里，
+///    由同步轮次（[`xremail_sync::sync_account`]）自动排空。
+///
+/// 目标文件夹传**本地 `folder_id`**，不是邮箱名：邮箱名会被服务器改写。
+#[tauri::command]
+pub async fn move_messages(
+    state: State<'_, AppState>,
+    account_id: String,
+    folder_id: String,
+    uids: Vec<i64>,
+    destination_folder_id: String,
+) -> Result<TransferIntentResult, String> {
+    state
+        .messages
+        .move_intent(&account_id, &folder_id, &uids, &destination_folder_id)
+        .await
+        .map_err(|e| user_error(&e))?;
+
+    flush_transfer_intents(&state, &account_id, &folder_id).await
+}
+
+/// 删除一批邮件。
+///
+/// 有垃圾箱就挪进去（等于移动，能撤销），没有就就地标删——
+/// 具体走哪条路由由同步层按服务器能力决定（见 `xremail_sync::push_transfers`）。
+#[tauri::command]
+pub async fn delete_messages(
+    state: State<'_, AppState>,
+    account_id: String,
+    folder_id: String,
+    uids: Vec<i64>,
+) -> Result<TransferIntentResult, String> {
+    state
+        .messages
+        .delete_intent(&account_id, &folder_id, &uids)
+        .await
+        .map_err(|e| user_error(&e))?;
+
+    flush_transfer_intents(&state, &account_id, &folder_id).await
+}
+
+/// 立刻排空一个文件夹的移动/删除队列，并把结果翻成人话。
+///
+/// 连不上不算错：意图已经在队列里，同步轮次会接着试。
+async fn flush_transfer_intents(
+    app: &AppState,
+    account_id: &str,
+    folder_id: &str,
+) -> Result<TransferIntentResult, String> {
+    let queued = |message: &str| TransferIntentResult {
+        queued: true,
+        applied: 0,
+        retryable: 0,
+        failed: 0,
+        uncertain: 0,
+        message: Some(message.to_string()),
+    };
+
+    let account = app
+        .accounts
+        .get(account_id)
+        .await
+        .map_err(|e| user_error(&e))?
+        .ok_or_else(|| format!("账户 {account_id} 不存在"))?;
+
+    // 没凭据就静静排队——不是错误，用户可能还没填授权码。
+    let Some(credential) = resolve_credential(app, &account).await? else {
+        return Ok(queued("已排队：保存授权码后会自动提交给服务器"));
+    };
+
+    let folder = app
+        .messages
+        .get_folder(account_id, folder_id)
+        .await
+        .map_err(|e| user_error(&e))?
+        .ok_or_else(|| format!("文件夹 {folder_id} 不存在"))?;
+
+    let mut session = match app.sync.connect(&account, &credential).await {
+        Ok(session) => session,
+        Err(error) => {
+            return Ok(queued(&format!(
+                "连不上服务器，已排队稍后重试：{}",
+                user_error(&error)
+            )));
+        }
+    };
+
+    let now = current_time_ms();
+    let report = app
+        .sync
+        .push_transfers(&mut session, &folder, now)
+        .await
+        .map_err(|e| user_error(&e))?;
+
+    let applied = report.moved + report.deleted;
+    let mut parts = vec![format!("{applied} 封已提交")];
+    if report.noop > 0 {
+        parts.push(format!("其中 {} 封服务器上本来就不在了", report.noop));
+    }
+    if report.retryable > 0 {
+        parts.push(format!("{} 封可重试", report.retryable));
+    }
+    if report.uncertain > 0 {
+        parts.push(format!("{} 封结果未确认", report.uncertain));
+    }
+    if report.failed > 0 {
+        parts.push(format!("{} 封失败", report.failed));
+    }
+
+    Ok(TransferIntentResult {
+        queued: false,
+        applied,
+        retryable: report.retryable,
+        failed: report.failed,
+        uncertain: report.uncertain,
+        message: Some(parts.join("，")),
+    })
+}
+
 async fn resolve_credential(
     state: &AppState,
     account: &Account,
