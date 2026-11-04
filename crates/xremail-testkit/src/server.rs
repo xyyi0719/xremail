@@ -19,8 +19,11 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 
 use crate::certificate::{CertError, ServerCertificate};
@@ -74,6 +77,8 @@ pub struct FakeImapServer {
     mailboxes: Arc<Mutex<Vec<MailboxFixture>>>,
     /// 这个服务器的 UIDVALIDITY。
     uid_validity: u32,
+    /// 正在 `IDLE` 的连接登记表（推送用）。
+    pushes: Arc<Mutex<PushRegistry>>,
 }
 
 impl FakeImapServer {
@@ -108,14 +113,17 @@ impl FakeImapServer {
         // 命令日志与一次性故障的状态：**整个服务器共享**（不是每个连接一份）。
         let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let faults: Arc<Mutex<FaultState>> = Arc::new(Mutex::new(FaultState::default()));
+        // `IDLE` 推送的登记表：**整个服务器共享**（推送方只知道文件夹名）。
+        let pushes: Arc<Mutex<PushRegistry>> = Arc::new(Mutex::new(PushRegistry::default()));
 
         let handle = tokio::spawn({
             let log = log.clone();
             let mailboxes = mailboxes.clone();
+            let pushes = pushes.clone();
             async move {
                 tokio::select! {
                     _ = shutdown_rx => {}
-                    _ = accept_loop(listener, acceptor, config, mailboxes, log, faults) => {}
+                    _ = accept_loop(listener, acceptor, config, mailboxes, log, faults, pushes) => {}
                 }
             }
         });
@@ -128,6 +136,7 @@ impl FakeImapServer {
             log,
             mailboxes,
             uid_validity,
+            pushes,
         })
     }
 
@@ -199,6 +208,94 @@ impl FakeImapServer {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.clone()
     }
+
+    /// 让**正在 `IDLE` 且选中了 `mailbox` 的连接**收到一条 `* {count} EXISTS`。
+    ///
+    /// 只是「信号」：**不改** [`FakeImapServer::mailboxes`] 里的内容，
+    /// 所以 `count` 写多少都行——想让它跟 fixture 对得上，是测试自己的事
+    /// （先 `APPEND` 再推一个对得上的数字）。
+    ///
+    /// 没有连接正在这个文件夹上 `IDLE` 时，这个方法**什么也不做**：
+    /// 那条通知不会攒下来等下一次 `IDLE` 再发。
+    pub fn push_exists(&self, mailbox: &str, count: u32) {
+        broadcast_push(&self.pushes, mailbox, PushNotice::Exists(count));
+    }
+
+    /// 让**正在 `IDLE` 且选中了 `mailbox` 的连接**收到一条 `* {seq} EXPUNGE`。
+    ///
+    /// ## `seq` 是「序号」不是 UID
+    ///
+    /// RFC 3501 §7.4.1：`EXPUNGE` 报的是**序号**（这个文件夹里的第几封）。
+    /// 而且真实服务器每删一封，后面那些信的序号会**向前移动**——
+    /// 一个正在 `IDLE` 的客户端要连收两条 `* 3 EXPUNGE`，才代表
+    /// 「原来的第 3、4 封都没了」。
+    ///
+    /// 本方法**不模拟**这件事，它只是把给定 `seq` 原样发出去：
+    /// * **不改** fixture 的内容（推送是信号，不是真的删信）；
+    /// * 不重排序号，也不做 `EXPUNGE` 的记账。
+    ///
+    /// 因此推送的序号可以和 fixture 里实际还剩几封**互相矛盾**。
+    /// 需要内容与序号保持一致时，用真的 `EXPUNGE` 命令
+    /// （它改 fixture，并按真实规则报序号），别用这个推送。
+    pub fn push_expunge(&self, mailbox: &str, seq: u32) {
+        broadcast_push(&self.pushes, mailbox, PushNotice::Expunge(seq));
+    }
+}
+
+/// 一条推给 `IDLE` 中客户端的通知（RFC 2177 期间服务器主动发的 untagged 响应）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushNotice {
+    /// `* n EXISTS`。
+    Exists(u32),
+    /// `* n EXPUNGE`。
+    Expunge(u32),
+}
+
+/// 一个正在 `IDLE` 的连接在登记表里的条目。
+struct PushRegistration {
+    /// 条目编号。
+    ///
+    /// 注销要**按编号精确摘**而不能按文件夹名：同一个文件夹上
+    /// 完全可能有多个连接同时 `IDLE`。
+    id: u64,
+    /// 该连接当前选中的文件夹名（推送方只知道名字）。
+    mailbox: String,
+    /// 推送给这个连接的通道。
+    tx: mpsc::UnboundedSender<PushNotice>,
+}
+
+/// 正在 `IDLE` 的连接登记表。
+///
+/// 连接进入 `IDLE` 时登记，离开时（`DONE`、断线、IO 错误）注销——
+/// 注销走 [`IdlePushChannel`] 的 `Drop`，保证所有退出路径都盖到。
+#[derive(Default)]
+struct PushRegistry {
+    /// 下一个条目编号。
+    next_id: u64,
+    /// 当前登记着的连接。
+    entries: Vec<PushRegistration>,
+}
+
+/// 把一条推送发给所有**正在 `IDLE` 且选中了 `mailbox`** 的连接。
+fn broadcast_push(pushes: &Mutex<PushRegistry>, mailbox: &str, notice: PushNotice) {
+    let mut guard = lock_pushes(pushes);
+    guard.entries.retain(|entry| {
+        if !entry.mailbox.eq_ignore_ascii_case(mailbox) {
+            // 不是这个文件夹：留着。
+            return true;
+        }
+        // 发不出去说明那条连接已经没了：顺手清掉，否则登记表会越积越多。
+        entry.tx.send(notice).is_ok()
+    });
+}
+
+/// 锁住推送登记表。
+///
+/// 与邮箱锁一样：**绝不能**把 guard 跨 `.await` 持有。
+fn lock_pushes(pushes: &Mutex<PushRegistry>) -> MutexGuard<'_, PushRegistry> {
+    pushes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// 故障状态：记录「一次性」故障触发过没有。
@@ -227,6 +324,7 @@ async fn accept_loop(
     mailboxes: Arc<Mutex<Vec<MailboxFixture>>>,
     log: Arc<Mutex<Vec<String>>>,
     faults: Arc<Mutex<FaultState>>,
+    pushes: Arc<Mutex<PushRegistry>>,
 ) {
     loop {
         let Ok((stream, _peer)) = listener.accept().await else {
@@ -237,8 +335,10 @@ async fn accept_loop(
         let mailboxes = mailboxes.clone();
         let log = log.clone();
         let faults = faults.clone();
+        let pushes = pushes.clone();
         tokio::spawn(async move {
-            let _ = handle_connection(stream, acceptor, config, mailboxes, log, faults).await;
+            let _ =
+                handle_connection(stream, acceptor, config, mailboxes, log, faults, pushes).await;
         });
     }
 }
@@ -251,6 +351,7 @@ async fn handle_connection(
     mailboxes: Arc<Mutex<Vec<MailboxFixture>>>,
     log: Arc<Mutex<Vec<String>>>,
     faults: Arc<Mutex<FaultState>>,
+    pushes: Arc<Mutex<PushRegistry>>,
 ) -> std::io::Result<()> {
     let _ = stream.set_nodelay(true);
     let tls_stream = match acceptor.accept(stream).await {
@@ -318,6 +419,7 @@ async fn handle_connection(
                     config: &config,
                     mailboxes: &mailboxes,
                     faults: &faults,
+                    pushes: &pushes,
                 };
                 let _ = handle_command(
                     &mut discard,
@@ -340,6 +442,7 @@ async fn handle_connection(
             config: &config,
             mailboxes: &mailboxes,
             faults: &faults,
+            pushes: &pushes,
         };
         match handle_command(&mut write_half, &mut reader, &ctx, &mut state, &command).await {
             Ok(Continue::Continue) => {}
@@ -362,6 +465,11 @@ struct SessionState {
     selected: Option<usize>,
     /// 选中的是不是只读（`EXAMINE` 打开的）。
     read_only: bool,
+    /// 是否正在 `IDLE`（RFC 2177）。
+    ///
+    /// 只在 `IDLE` 的内层循环里为 `true`：进循环前置上，退出（`DONE`、断线、
+    /// IO 错误）时清掉。外层的命令处理永远不会看到它为 `true`。
+    idling: bool,
 }
 
 /// 命令处理需要的上下文。
@@ -374,9 +482,54 @@ struct ServerCtx<'a> {
     mailboxes: &'a Mutex<Vec<MailboxFixture>>,
     /// 共享的故障状态（一次性故障记账）。
     faults: &'a Mutex<FaultState>,
+    /// 共享的 `IDLE` 推送登记表。
+    pushes: &'a Mutex<PushRegistry>,
+}
+
+/// 一个连接在 `IDLE` 期间的推送登记。
+///
+/// 注销写在 `Drop` 里：`DONE`、客户端断线、IO 错误——所有离开 `IDLE` 的路径
+/// 都会 drop 它，不会漏。忘了注销的后果是向已经离开 `IDLE`（甚至已经断开）
+/// 的连接写响应，而且登记表会无界增长。
+struct IdlePushChannel<'a> {
+    /// 登记表（注销时要用）。
+    registry: &'a Mutex<PushRegistry>,
+    /// 自己在登记表里的条目编号。
+    id: u64,
+    /// 服务器推给这个连接的通知。
+    rx: mpsc::UnboundedReceiver<PushNotice>,
+}
+
+impl Drop for IdlePushChannel<'_> {
+    fn drop(&mut self) {
+        let mut guard = lock_pushes(self.registry);
+        guard.entries.retain(|entry| entry.id != self.id);
+    }
 }
 
 impl ServerCtx<'_> {
+    /// 为一个刚开始 `IDLE` 的连接登记推送通道。
+    fn register_push(&self, mailbox: &str) -> IdlePushChannel<'_> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let id = {
+            // 锁内只改数据，不 await。
+            let mut guard = lock_pushes(self.pushes);
+            let id = guard.next_id;
+            guard.next_id += 1;
+            guard.entries.push(PushRegistration {
+                id,
+                mailbox: mailbox.to_string(),
+                tx,
+            });
+            id
+        };
+        IdlePushChannel {
+            registry: self.pushes,
+            id,
+            rx,
+        }
+    }
+
     /// 当前生效的「整封正文截断」故障（截到多少字节）。
     ///
     /// 一次性故障的记账必须发生在这里——**只在真的要截断整封正文时**才算数。
@@ -544,7 +697,9 @@ async fn handle_command<W, R>(
 ) -> std::io::Result<Continue>
 where
     W: AsyncWrite + Unpin,
-    R: AsyncRead + Unpin,
+    // `IDLE` 要在等推送的同时读客户端的一行，所以这里要的是
+    // `AsyncBufRead` 而不只是 `AsyncRead`（`APPEND` 的 `read_exact` 依旧能用）。
+    R: AsyncBufRead + Unpin,
 {
     let config = ctx.config;
     let mailboxes = ctx.mailboxes;
@@ -909,6 +1064,10 @@ where
             reply!(writer, "{} OK NOOP completed", command.tag);
         }
 
+        "IDLE" => {
+            return handle_idle(&mut writer, reader, ctx, state, command).await;
+        }
+
         "LOGOUT" => {
             reply!(writer, "* BYE Fake IMAP signing off");
             reply!(writer, "{} OK LOGOUT completed", command.tag);
@@ -921,6 +1080,160 @@ where
     }
 
     Ok(Continue::Continue)
+}
+
+/// `IDLE`（RFC 2177）。
+///
+/// 流程：
+/// 1. 未选中文件夹 → `NO IDLE not in selected state`（RFC 2177 要求先
+///    `SELECT` / `EXAMINE`）；
+/// 2. 登记推送通道 → 回裸的续行 `+ idling`；
+/// 3. 内层循环：推送就写一条 untagged 响应**并继续待着**；
+///    `DONE` 就回 `{tag} OK IDLE terminated` 并退出；其他命令回
+///    `{tag} BAD IDLE in progress`（同一 socket 只允许一个拥有者）。
+///
+/// 退出时靠 [`IdlePushChannel`] 的 `Drop` 摘掉登记——所以「离开 `IDLE`」
+/// 的每一条路径（`DONE`、断线、IO 错误）都不会把登记漏在表里。
+async fn handle_idle<W, R>(
+    mut writer: &mut W,
+    reader: &mut R,
+    ctx: &ServerCtx<'_>,
+    state: &mut SessionState,
+    command: &Command,
+) -> std::io::Result<Continue>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncBufRead + Unpin,
+{
+    // 同一连接不允许嵌套 `IDLE`。内层循环会把 `IDLE 期间的另一条 IDLE`
+    // 当「非 DONE」拒掉，所以这里正常不会命中；留着是防御性的：
+    // 将来若改成「回 BAD 就退出 IDLE」，状态也不会错乱。
+    if state.idling {
+        reply!(writer, "{} BAD IDLE in progress", command.tag);
+        return Ok(Continue::Continue);
+    }
+
+    let Some(index) = state.selected else {
+        reply!(writer, "{} NO IDLE not in selected state", command.tag);
+        return Ok(Continue::Continue);
+    };
+
+    // 推送是按**文件夹名**匹配的（推送方只知道名字，不知道下标）。
+    let mailbox_name = {
+        let guard = lock_mailboxes(ctx.mailboxes);
+        guard.get(index).map(|mailbox| mailbox.name.clone())
+    };
+    let Some(mailbox_name) = mailbox_name else {
+        reply!(writer, "{} NO Mailbox does not exist", command.tag);
+        return Ok(Continue::Continue);
+    };
+
+    // 先登记再回续行：客户端一读到 `+ idling`，推送就应该能到达。
+    let mut channel = ctx.register_push(&mailbox_name);
+    state.idling = true;
+    reply!(writer, "+ idling");
+
+    // `read_line` 不是 cancel-safe（见 [`idle_wait`]），半行会留在 `pending`。
+    let mut pending = String::new();
+    let ended = loop {
+        match idle_wait(reader, &mut channel.rx, &mut pending).await? {
+            IdleEvent::Closed => {
+                // 客户端不发 `DONE` 就断线：`IDLE` 自然结束。
+                break IdleEnd::Closed;
+            }
+            IdleEvent::Notice(PushNotice::Exists(count)) => {
+                reply!(writer, "* {count} EXISTS");
+            }
+            IdleEvent::Notice(PushNotice::Expunge(sequence)) => {
+                reply!(writer, "* {sequence} EXPUNGE");
+            }
+            IdleEvent::Line(line) => {
+                if line.trim().eq_ignore_ascii_case("DONE") {
+                    break IdleEnd::Done;
+                }
+                // `IDLE` 期间客户端不该发别的命令。用**那条命令自己的 tag**
+                // 回 `BAD`（客户端才知道是它哪一条被拒了），然后**继续**待在
+                // `IDLE` 里——客户端还得发 `DONE` 才能收场。
+                let tag = Command::parse(&line)
+                    .map(|other| other.tag)
+                    .unwrap_or_else(|| "*".to_string());
+                reply!(writer, "{tag} BAD IDLE in progress");
+            }
+        }
+    };
+
+    // **先摘登记再回 `OK`**：客户端读到 `OK IDLE terminated` 时，
+    // 新推送绝对不会再落到这个连接上了。
+    drop(channel);
+    state.idling = false;
+
+    match ended {
+        IdleEnd::Done => {
+            // `DONE` 本身不带 tag，回的是**进入 IDLE 时那条命令**的 tag。
+            reply!(writer, "{} OK IDLE terminated", command.tag);
+            Ok(Continue::Continue)
+        }
+        IdleEnd::Closed => Ok(Continue::Close),
+    }
+}
+
+/// `IDLE` 内层循环怎么结束的。
+enum IdleEnd {
+    /// 收到 `DONE`。
+    Done,
+    /// 客户端断线了。
+    Closed,
+}
+
+/// `IDLE` 内层循环里等到的事件。
+enum IdleEvent {
+    /// 客户端发来的一整行（含 `DONE`；末尾带 CRLF）。
+    Line(String),
+    /// 服务器推来的一条通知。
+    Notice(PushNotice),
+    /// 再也读不到东西（客户端断线，或者推送通道已经没了）。
+    Closed,
+}
+
+/// 在 `IDLE` 里等「客户端的一行」或「一条推送」。
+///
+/// `read_line` **不是** cancel-safe：它被 `tokio::select!` 打断时，
+/// 已经读到的字节会留在 `pending` 里，但「读到哪儿了」的内部状态会丢。
+/// 所以每轮先把 `pending` 里已凑成整行的那些取完，再继续读——
+/// 这样既不会丢字节，也不会把半行当成命令。
+async fn idle_wait<R>(
+    reader: &mut R,
+    rx: &mut mpsc::UnboundedReceiver<PushNotice>,
+    pending: &mut String,
+) -> std::io::Result<IdleEvent>
+where
+    R: AsyncBufRead + Unpin,
+{
+    loop {
+        if let Some(index) = pending.find('\n') {
+            let line: String = pending.drain(..=index).collect();
+            return Ok(IdleEvent::Line(line));
+        }
+
+        tokio::select! {
+            // `biased`：推送优先。否则客户端一直发垃圾命令时，
+            // 推送可能被饿住——而「推送能不能到」正是这条链路要测的东西。
+            biased;
+            notice = rx.recv() => {
+                // 通道另一端消失只会在登记被摘掉时发生；对客户端来说
+                // 等价于「服务器不推了」，按断线处理。
+                return Ok(match notice {
+                    Some(notice) => IdleEvent::Notice(notice),
+                    None => IdleEvent::Closed,
+                });
+            }
+            read = reader.read_line(pending) => {
+                if read? == 0 {
+                    return Ok(IdleEvent::Closed);
+                }
+            }
+        }
+    }
 }
 
 /// `COPY` / `MOVE` 的实现（RFC 3501 §6.4.7、RFC 6851）。
