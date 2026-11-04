@@ -208,6 +208,29 @@ UIDVALIDITY 不得为 0（RFC 3501），收到 0 视为协议错误。
 * 用例：`crates/xremail-sync/tests/crash_recovery.rs` 11 个（含「活着的进程的行不动」
   「次数到顶的 `running` 先回收再判死」「幂等」三条关键的）。
 
+### 4.5 重发前的幂等探测与次数闸门
+
+§4.4 只解决「`running` 的残骸」；还有一类更隐蔽的重复：操作**自己**被重发。
+
+* **`uncertain` 必须计次**。`uncertain` 表示「命令可能已经到服务器了」，它和
+  `retryable` 一样会被 `claim_for_push` 重新认领（`state IN ('queued','retryable','uncertain')`），
+  而那道闸门靠 `AND attempts < ?` 卡住。原先 `uncertain` 出口只用 `update_operation_state`
+  改状态、**不自增 `attempts`**，于是 `attempts < ?` 永远成立——一条发不出去的
+  `copy+delete` 会**每轮重发一次** `COPY`。现在两条出口都自增：
+  `operation::mark_operation_retryable`（→ `retryable`）与
+  `operation::mark_operation_uncertain`（→ `uncertain`）。自增点仍然**只有这两处**，
+  认领（`claim_for_push`）不自增，否则一次失败会烧掉两个配额。
+* **非幂等路由重发前先探测**。`MOVE` 幂等、`COPY` 不幂等；163 没有 `MOVE`，
+  只能 `COPY` + 删除。所以重发前必须确认目标文件夹里是不是已经有这封：
+  `message_dao::find_message_id_by_uid` 取本地 `Message-ID` → `EXAMINE <目标>` +
+  `UID SEARCH HEADER Message-ID "<id>"`。探到就**跳过 `COPY`**、只补删除那一半
+  （`transfer_push.rs` 的 `submit(..., copy_already_done)`）。
+* **取不到 `Message-ID` 就不重发**。宁可停在 `uncertain` 等对账 / 用户确认，也不赌。
+  这是本条与「反正重试」的分界线：**能证明已生效才重发，不能证明就停下来**。
+* 探测只在 `attempts > 0` 时做——首次尝试不可能产生副本，而探测要切文件夹、多打两条命令。
+* 用例：`crates/xremail-sync/tests/push_transfers.rs` 3 条（重发不多出副本 /
+  无 `Message-ID` 拒绝重发 / 次数到顶一条命令都不发）。
+
 将队列分为 **mail_operation**（flag/move/delete/append）与 **send_queue**（SMTP）。名称可在迁移时定稿，避免一个模糊 outbox 混淆语义。
 
 - 一次本地命令在同事务内写操作意图与本地投影；提交后返回/发事件。
@@ -421,6 +444,14 @@ Linux/macOS/iOS 不属于当前验收平台，不因 Tauri 支持就视为产品
 **不**降级成「存内存」或「存文件」——那样用户会以为已经保存了。
 `CredentialService`（`service/credential.rs`）只认 `account.secret_ref`：
 没有引用就**不去打扰钥匙串**；`forget_credential` 会同时删钥匙串条目并把 `secret_ref` 清成 `None`。
+
+**panic 边界要盖住全部 await 点，不是只盖「主流程」**：`catch_unwind` 是手写的，
+漏一处就等于没盖。`crates/xremail-sync/src/actor.rs` 里有**两条**会 `connect` 的路径——
+`tick`（跑一轮同步）与 `wait_for_change`（等待期用 `IDLE` 维持连接）。两条都要包；
+`wait_for_change` 曾漏掉，后果是任务**静悄悄死掉**而不是崩，比崩更难发现。
+判断标准：凡是跑在 tokio 任务里、会 `await` 且可能 panic 的函数，要么自己就是边界，
+要么**只**被已经包了边界的函数调用。**残余**：Tauri 命令处理线程与前端 Wry IPC
+回调不在这套边界内（见 [ISSUES R13](ISSUES_AND_RISKS.md)）。
 
 错误按可恢复原因分类：传输临时失败退避；认证需用户动作；磁盘满/迁移失败不能当普通 Storage 错误无限重试；协议错误不原样输出可能含凭据/正文的响应。
 事件枚举以 `xremail-core/src/event.rs` 为准，flag 更新使用 MessageUpserted，当前没有 FlagsChanged。

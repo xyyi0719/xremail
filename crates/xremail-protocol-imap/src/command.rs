@@ -27,8 +27,20 @@
 
 use imap_proto::{AttributeValue, MessageSection, Response, SectionPath, Status};
 
+use std::time::Duration;
+
 use crate::connection::Session;
 use crate::error::ProtocolError;
+
+/// 单条 IMAP 命令的默认超时。
+///
+/// async-imap **没有**命令超时（见 [`crate::command`] 与 ARCHITECTURE §5），
+/// 所以每一条命令都必须由调用方套一层超时；这里是「没指定时」的兜底值，
+/// 与 [`crate::connection::ImapConfig::imaps`] 的默认值一致。
+///
+/// 真正生效的超时应当来自调用方（例如同步引擎的
+/// `SyncPolicy::command_timeout`），本常量只做默认值。
+pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 把 async-imap 的错误分类成 [`ProtocolError`]。
 ///
@@ -153,10 +165,36 @@ pub struct MailboxInfo {
 /// 为什么单独写一个：async-imap 的 `examine` 走的是 `parse_status`，
 /// 它**会**把 `NO` / `BAD` 变成错误（不像 `uid_fetch` 那样吞掉），
 /// 但错误类型是 `async_imap::Error`——分类工作交给本层做。
+///
+/// 超时用默认值（[`DEFAULT_COMMAND_TIMEOUT`]）；能拿到具体超时的调用方
+/// 用 [`examine_checked_with_timeout`]。
 pub async fn examine_checked(
     session: &mut Session,
     mailbox: &str,
 ) -> Result<MailboxInfo, ProtocolError> {
+    examine_checked_with_timeout(session, mailbox, DEFAULT_COMMAND_TIMEOUT).await
+}
+
+/// 同 [`examine_checked`]，但用**调用方给的**超时。
+///
+/// async-imap 的命令**没有**超时：服务器接受了连接却不回话时，
+/// `EXAMINE` 会一直挂着。同步引擎必须传自己的
+/// `command_timeout` 进来，否则超时配置形同虚设。
+pub async fn examine_checked_with_timeout(
+    session: &mut Session,
+    mailbox: &str,
+    timeout: Duration,
+) -> Result<MailboxInfo, ProtocolError> {
+    match tokio::time::timeout(timeout, examine_inner(session, mailbox)).await {
+        Ok(result) => result,
+        Err(_) => Err(ProtocolError::Timeout(format!(
+            "命令超时（{timeout:?}）: EXAMINE {mailbox}"
+        ))),
+    }
+}
+
+/// [`examine_checked`] 的实际调用（不带超时）。
+async fn examine_inner(session: &mut Session, mailbox: &str) -> Result<MailboxInfo, ProtocolError> {
     let result = session.examine(mailbox).await;
 
     match result {
@@ -419,5 +457,56 @@ mod tests {
         let outcome = CommandOutcome::Search(vec![1, 2, 3]);
         assert_eq!(outcome.search(), &[1, 2, 3]);
         assert!(outcome.fetches().is_empty());
+    }
+
+    /// 服务器收了 `EXAMINE` 却**不回话**时，`examine_checked_with_timeout`
+    /// 必须按超时返回，而不是永久挂住。
+    #[tokio::test]
+    async fn examine_times_out_when_server_never_answers() {
+        use std::time::{Duration, Instant};
+
+        use xremail_testkit::{FakeImapServer, Fault, ServerConfig};
+
+        use crate::connection::{ImapConfig, TlsTrust, connect_and_login_with};
+
+        let server = FakeImapServer::start(ServerConfig {
+            faults: vec![Fault::HangOn("EXAMINE".to_string())],
+            ..ServerConfig::default()
+        })
+        .await
+        .expect("启动假服务器失败");
+
+        let mut config = ImapConfig::imaps(server.host());
+        config.port = server.port();
+        config.connect_timeout = Duration::from_secs(5);
+        let trust = TlsTrust::Roots(server.root_store());
+        let (mut session, _, _) =
+            connect_and_login_with(&config, &trust, "tester@example.com", "test-password")
+                .await
+                .expect("登录应当成功");
+
+        let timeout = Duration::from_millis(200);
+        let started = Instant::now();
+        let result = examine_checked_with_timeout(&mut session, "INBOX", timeout).await;
+        let elapsed = started.elapsed();
+
+        match result {
+            Ok(_) => panic!("服务器不回话时必须超时，而不是返回邮箱信息"),
+            Err(ProtocolError::Timeout(detail)) => {
+                assert!(
+                    detail.contains("EXAMINE") && detail.contains("INBOX"),
+                    "超时文案里应带上命令与邮箱名，实际: {detail}"
+                );
+            }
+            Err(other) => panic!("应当是 Timeout，实际: {other:?}"),
+        }
+        assert!(
+            elapsed >= timeout,
+            "超时不应早于 {timeout:?}，实际 {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "超时必须在 {timeout:?} 量级返回（而不是挂到默认的 30 秒），实际 {elapsed:?}"
+        );
     }
 }

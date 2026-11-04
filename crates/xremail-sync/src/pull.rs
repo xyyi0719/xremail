@@ -25,15 +25,16 @@
 //! 标记回写另走 `SELECT`（见 ARCHITECTURE §6）。
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use sqlx::SqlitePool;
 use xremail_core::model::{Folder, Message, MessageFlags};
 use xremail_core::{AppError, AppResult};
-use xremail_protocol_imap::{CommandOutcome, ProtocolError, Session, examine_checked};
+use xremail_protocol_imap::{CommandOutcome, ProtocolError, Session, examine_checked_with_timeout};
 
 use crate::diff::{UidSet, diff_uids};
 use crate::epoch::{EpochTransition, StoredEpoch, plan_epoch_transition};
-use crate::net::run_checked_with_timeout;
+use crate::net::{SyncOptions, run_checked_with_timeout_for};
 use xremail_store::dao::message as message_dao;
 use xremail_store::dao::sync::{FolderSyncWrite, commit_folder_sync};
 
@@ -106,10 +107,25 @@ pub async fn pull_folder(
     folder: &Folder,
     now_ms: i64,
 ) -> AppResult<FolderSyncReport> {
+    pull_folder_with_options(pool, session, folder, now_ms, SyncOptions::default()).await
+}
+
+/// 同 [`pull_folder`]，但用**调用方给的**选项（主要是命令超时）。
+pub async fn pull_folder_with_options(
+    pool: &SqlitePool,
+    session: &mut Session,
+    folder: &Folder,
+    now_ms: i64,
+    options: SyncOptions,
+) -> AppResult<FolderSyncReport> {
     // 1. 打开文件夹（只读）。
-    let mailbox = examine_checked(session, &folder.remote_name)
-        .await
-        .map_err(map_protocol_error)?;
+    //
+    // 必须带超时：async-imap 的 `examine` 不会自己超时，
+    // 服务器不回话时整个同步就停在这一行。
+    let mailbox =
+        examine_checked_with_timeout(session, &folder.remote_name, options.command_timeout)
+            .await
+            .map_err(map_protocol_error)?;
 
     // 2. epoch：服务器必须给出 UIDVALIDITY，否则无法定位邮件。
     let observed = mailbox
@@ -137,7 +153,7 @@ pub async fn pull_folder(
     //
     // 用 `UID FETCH 1:* (UID)` 而不是 `UID SEARCH ALL`：
     // FETCH 是 IMAP 的**必备**命令，SEARCH 是可选扩展。
-    let remote = fetch_remote_uids(session).await?;
+    let remote = fetch_remote_uids(session, options.command_timeout).await?;
 
     // 5. 差分。
     let local =
@@ -162,7 +178,7 @@ pub async fn pull_folder(
     let fetched = if added_uids.is_empty() {
         Vec::new()
     } else {
-        fetch_metadata(session, &added_uids).await?
+        fetch_metadata(session, &added_uids, options.command_timeout).await?
     };
 
     let mut to_write = Vec::with_capacity(fetched.len());
@@ -202,8 +218,8 @@ pub async fn pull_folder(
 }
 
 /// 取远端的全部 UID。
-async fn fetch_remote_uids(session: &mut Session) -> AppResult<UidSet> {
-    let outcome = run_checked_with_timeout(session, "UID FETCH 1:* (UID)")
+async fn fetch_remote_uids(session: &mut Session, timeout: Duration) -> AppResult<UidSet> {
+    let outcome = run_checked_with_timeout_for(session, "UID FETCH 1:* (UID)", timeout)
         .await
         .map_err(map_protocol_error)?;
 
@@ -227,6 +243,7 @@ async fn fetch_remote_uids(session: &mut Session) -> AppResult<UidSet> {
 async fn fetch_metadata(
     session: &mut Session,
     uids: &[i64],
+    timeout: Duration,
 ) -> AppResult<Vec<xremail_protocol_imap::FetchedMessage>> {
     // 分批：一次 `UID FETCH` 太多 UID 会让服务器超载。
     const BATCH: usize = 200;
@@ -235,7 +252,7 @@ async fn fetch_metadata(
     for batch in uids.chunks(BATCH) {
         let set = build_uid_set(batch);
         let command = format!("UID FETCH {set} (UID FLAGS RFC822.SIZE BODY.PEEK[HEADER])");
-        let outcome = run_checked_with_timeout(session, &command)
+        let outcome = run_checked_with_timeout_for(session, &command, timeout)
             .await
             .map_err(map_protocol_error)?;
         if let CommandOutcome::Fetches(messages) = outcome {

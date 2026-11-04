@@ -23,9 +23,13 @@
 //! 包括别的客户端（手机、网页版）标了 `\Deleted` 但还没提交的。
 //! 那也是用户的数据，不能替别人做决定。
 //!
-//! 只有支持 `UIDPLUS`（RFC 4315）时才有 `UID EXPUNGE <set>`——它只删指定的那些；
-//! 163 恰好**没有** `UIDPLUS`。所以没有 `UIDPLUS` 时本模块**只标 `\Deleted`
-//! 不 expunge**，把「真正消失」的时机交还给服务器与用户自己的客户端。
+//! 只有支持 `UIDPLUS`（RFC 4315）时才有 `UID EXPUNGE <set>`——它只删指定的那些。
+//! 没有 `UIDPLUS` 时本模块**只标 `\Deleted` 不 expunge**，把「真正消失」的时机
+//! 交还给服务器与用户自己的客户端。
+//!
+//! 注意别把这条读成「163 没有 `UIDPLUS`」：本仓实测 163 / QQ / 沃三家**都有**
+//! `UIDPLUS`（见 `docs/PROTOCOLS.md` 的认证后能力集），163 缺的是 `MOVE`。
+//! 判断一律走能力集，不要凭服务商名字猜。
 
 use imap_proto::rfc4315::UidSetMember;
 use imap_proto::{Response, ResponseCode, Status};

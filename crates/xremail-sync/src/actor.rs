@@ -61,7 +61,8 @@ use xremail_core::model::Account;
 use xremail_core::{AppError, AppResult};
 use xremail_protocol_imap::{IdleConfig, IdleEvent, Session, idle_once};
 
-use crate::sync::{SyncSummary, sync_account};
+use crate::net::SyncOptions;
+use crate::sync::{SyncSummary, sync_account_as_with};
 
 /// 一轮同步被触发的原因。
 ///
@@ -352,7 +353,19 @@ impl AccountActor {
 
         let body = async move {
             let mut session = connector.connect(&account).await?;
-            let summary = sync_account(&pool, &mut session, &account, now_ms).await?;
+            let summary = sync_account_as_with(
+                &pool,
+                &mut session,
+                &account,
+                now_ms,
+                crate::boot::boot_id(),
+                SyncOptions {
+                    // 与上面 `command_timeout` 同源：都是 `self.policy` 的字段，
+                    // 这里用局部变量是为了不把 `self` 移进 future。
+                    command_timeout,
+                },
+            )
+            .await?;
 
             // 注意：这里复用**同一条已登录的连接**问 `CAPABILITY`，不是另开一条。
             // 探测失败不影响本轮同步结果，`None` 表示「没问到，下次再问」。
@@ -405,6 +418,37 @@ impl AccountActor {
     /// `on_timeout` 走。**绝不提前返回**：提前返回会让「连不上服务器」变成
     /// 「每一轮都多跑一次同步」，反而把错误放大成忙循环。
     async fn wait_for_change(&mut self, wait: Duration, on_timeout: WakeReason) -> WakeReason {
+        // 与 [`Self::tick`] 同一条理由：等待期会 `connect` 并 `idle_once`，同样
+        // 全是 await 点。这条分支原先**没有**包边界——它 panic 会直接撞到 tokio
+        // 任务边界，任务静悄悄死掉，`reap_finished` 把尸体清掉，该账户从此不再
+        // 同步，直到用户重启应用。R13 说「所有 panic 停在这里」，那就得真的
+        // 盖住这条分支，而不只是 `tick`。
+        let result = AssertUnwindSafe(self.wait_for_change_inner(wait, on_timeout))
+            .catch_unwind()
+            .await;
+
+        match result {
+            Ok(reason) => reason,
+            Err(payload) => {
+                tracing::error!(
+                    account = %self.account.email,
+                    panic = %panic_message(payload.as_ref()),
+                    "等待期 panic，按到点处理"
+                );
+                // 不提前返回：panic 若出在 `connect` 里会每轮重现，立即返回就成了
+                // 忙循环。等满 `wait` 再同步，与其它失败路径的处理保持一致。
+                tokio::time::sleep(wait).await;
+                on_timeout
+            }
+        }
+    }
+
+    /// [`Self::wait_for_change`] 的本体，只被那个包了 panic 边界的版本调用。
+    async fn wait_for_change_inner(
+        &mut self,
+        wait: Duration,
+        on_timeout: WakeReason,
+    ) -> WakeReason {
         // 只在一个本该等满 `wait` 的情况下才用 `IDLE`。
         // 不确定 / 已知不支持 → 纯等待，一行代价也没有。
         if self.idle_supported != Some(true) {

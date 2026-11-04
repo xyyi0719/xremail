@@ -13,8 +13,9 @@
 | Android SDK + NDK + JDK 17 | 仅 Android | Android Studio |
 | Windows: WebView2 + MSVC Build Tools | 仅 Windows 桌面 | [Tauri 前置依赖](https://v2.tauri.app/start/prerequisites/) |
 
-> 2026-10-20 本机实测：Rust 1.99.1、Node 22.21.0 可用；**仅装有 JDK 8 且无 Android SDK**，
-> 因此本机暂时无法构建 Android 产物，P4 前需先补 JDK 17 + SDK/NDK。
+> 2026-10-21 本机已就绪：**JDK 17.0.20.1 + Android SDK + NDK 27.2** 均已装好（见
+> [ENVIRONMENT §1.8](ENVIRONMENT.md)），Android 产物可构建；剩余卡点是符号链接
+> 权限（需重新登录一次），不再是「没装工具链」。
 >
 > MSRV 由 1.88 上提至 1.94：sqlx 0.9.0 声明的 MSRV 是 1.94.0。
 

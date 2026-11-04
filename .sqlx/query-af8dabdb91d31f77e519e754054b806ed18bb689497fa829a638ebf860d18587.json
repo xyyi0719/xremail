@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT message_id\n        FROM message\n        WHERE account_id = ? AND folder_id = ? AND uidvalidity = ? AND uid = ?\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "message_id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "message",
+            "name": "message_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "af8dabdb91d31f77e519e754054b806ed18bb689497fa829a638ebf860d18587"
+}

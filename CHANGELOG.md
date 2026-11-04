@@ -45,8 +45,9 @@
     凭据可用的**起 actor（没存授权码的起来只能一直失败），`RunEvent::Exit` 时
     `Scheduler::shutdown`；`delete_account` 先 `stop` 再忘凭据；`sync_account` 在
     「第一次拿到可用凭据」时补 `start`
-  - 新增 `Scheduler::is_scheduled`：`start` 在已启动时会顺手叫醒一轮，
-    而手动同步命令**正在自己跑一轮**——不先判就会同一账户并发跑两次
+  - 新增 `cmd::ensure_scheduled`（`apps/shell/src-tauri/src/cmd.rs`）：先问
+    `Scheduler::is_running`，已在跑就**不**叫醒——`Scheduler::wake` 会立刻让
+    actor 跑一轮，而手动同步命令**正在自己跑一轮**，不先判就会同一账户并发跑两次
   - 前端订阅 `sync://state-changed`，只在 `state === "online"` 时重查
     （每轮报 `connecting` + `online` 两次，全刷等于白拉一倍数据）
   - 用例：`crates/xremail-protocol-imap/tests/idle_client.rs` +
@@ -307,6 +308,41 @@
   - 存储层新增 `message_body` DAO 与 `update_has_attachment_by_uid`
 - **`xremail-testkit` 的邮件夹具支持原始字节**（`with_raw`）：
   用于测非 UTF-8 编码（GBK 正文）
+
+### Fixed
+- **`COPY` 重发会在目标文件夹多出副本**（2026-11-03，审计发现）
+  - `crates/xremail-sync/src/transfer_push.rs` 的 `SubmitError::Uncertain` 分支用
+    `update_operation_state` 收尾，**不自增 `attempts`**；而 `claim_for_push` 靠
+    `AND attempts < ?` 卡重发、且 `state IN ('queued','retryable','uncertain')`
+    ——于是 `uncertain` 的行可以被**无限重认领**，每轮重发一次 `COPY`。
+    163 没有 `MOVE`，只能走 `copy+delete`，所以这条在主力账户上是可达路径
+  - 新增 `operation::mark_operation_uncertain`（与 `mark_operation_retryable` 同样自增，
+    只是落在 `uncertain`），`uncertain` 出口改走它
+  - `copy+delete` **重发前先探测**：`message_dao::find_message_id_by_uid` 取本地
+    `Message-ID` → `EXAMINE <目标>` + `UID SEARCH HEADER Message-ID "<id>"`，
+    探到就跳过 `COPY`、只补删除那一半（`submit(..., copy_already_done)`）
+  - **取不到 `Message-ID` 就不重发**，停在 `uncertain` 等对账 / 用户确认
+- **`LIST` / `EXAMINE` / `SELECT` 没有命令超时**（2026-11-03，审计发现）
+  - `crates/xremail-sync/src/net.rs` 自己写着「async-imap 没有命令超时，必须有」，
+    但只有部分命令走了 `run_checked_with_timeout`；连接能建、服务器不回话时
+    该账户的同步会**永久卡住**（`catch_unwind` 救不了 hang）
+  - 现补上 `list_folders_with_timeout` / `examine_checked_with_timeout`，
+    `SELECT` 也包上超时；单一数值来源改为 `SyncPolicy::command_timeout`
+- **`wait_for_change` 不在 panic 边界内**（2026-11-03，审计发现）
+  - 边界原先只包了 `tick`；`wait_for_change`（含 `connect` + `idle_once`）是
+    `select!` 的另一条分支、**裸的**——它 panic 会撞到 tokio 任务边界，任务
+    静悄悄死掉，`reap_finished` 清掉句柄后该账户再不同步，直到重启应用。
+    R13 说「所有 panic 停在这里」，那就得真的盖住这条分支
+  - 现改为「包边界的壳 + `wait_for_change_inner` 本体」：panic 记 `error` 日志、
+    等满 `wait` 后按到点处理（不提前返回，否则 `connect` 里反复 panic 会成为忙循环）
+- **文档里 5 处与代码不符的表述**（2026-11-03）：
+  `Scheduler::is_scheduled` 这个函数**不存在**（真正做这件事的是
+  `cmd::ensure_scheduled`）；「163 没有 `UIDPLUS`」与 `docs/PROTOCOLS.md` 的实测
+  矛盾（163 **有** `UIDPLUS`，缺的是 `MOVE`）；用例数停在旧快照；
+  `docs/CONTRIBUTING.md` 还写着「仅装有 JDK 8 且无 Android SDK」（ 2026-10-21 已装好）
+- 用例 792 → **797**（`crates/xremail-sync/tests/push_transfers.rs` 新增 3 条：
+  重发不多出副本 / 无 `Message-ID` 拒绝重发 / 次数到顶一条命令不发；
+  另 2 条为命令超时用例）
 
 ### Changed
 - **文档与代码对齐**（2026-11-02）：一次全量审计，把文档里**与实际代码不符**的表述改掉。

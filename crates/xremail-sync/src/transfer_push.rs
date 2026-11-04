@@ -11,8 +11,8 @@
 //! | 场景 | 发什么 |
 //! |---|---|
 //! | 有 `MOVE` | 一条 `UID MOVE` |
-//! | 没有 `MOVE` | `UID COPY` → `UID STORE +FLAGS (\Deleted)` → **有 `UIDPLUS` 才** `UID EXPUNGE` |
-//! | 没有 `MOVE` 也没有 `UIDPLUS` | 停在「已标删」：163 就是这一类 |
+//! | 没有 `MOVE` | `UID COPY` → `UID STORE +FLAGS (\Deleted)` → **有 `UIDPLUS` 才** `UID EXPUNGE`（163 是这一类） |
+//! | 没有 `MOVE` 也没有 `UIDPLUS` | 停在「已标删」（三家实测都支持 `UIDPLUS`，这档只为兜底） |
 //!
 //! **裸 `EXPUNGE` 一律不用**：它会把这个文件夹里所有带 `\Deleted` 的信都删掉，
 //! 包括别的客户端（手机、网页版）标了还没提交的。那也是用户的数据。
@@ -280,7 +280,70 @@ pub async fn push_transfers_as(
             }
         };
 
-        match submit(session, op.uid, &route).await {
+        // 6. 重发前的**幂等探测**。
+        //
+        // `COPY` 不幂等：上一轮可能已经把信复制到目标文件夹了，只是确认没读到。
+        // 无条件重发就会一份变两份、两份变三份——163 没有 `MOVE`，`copy+delete`
+        // 是它唯一的路子，所以这不是理论问题。
+        //
+        // 只在 `attempts > 0` 时问：首次尝试不可能有副本，而探测要切文件夹、
+        // 多打两条命令，不值得给每条新操作都付这个代价。
+        let mut copy_already_done = false;
+        if matches!(route, Route::CopyDelete { .. }) && op.attempts > 0 {
+            let Route::CopyDelete { destination, .. } = &route else {
+                unreachable!("上面刚判断过只有 CopyDelete 才进这段");
+            };
+
+            let message_id = message_dao::find_message_id_by_uid(
+                pool,
+                &folder.account_id,
+                &folder.id,
+                epoch,
+                op.uid,
+            )
+            .await?;
+
+            // 探测结果先收起来，**切回源文件夹之后再处理**。
+            //
+            // `destination_has_message_id` 会 `EXAMINE` 目标文件夹，无论成功还是失败
+            // 会话都停在目标文件夹上。若带着这个状态 `continue`，下一条操作会对着
+            // **错的文件夹**搜 UID，被误判成 `AlreadyGone` 后静默丢掉——那正是本条
+            // 要修的那类「邮件没搬、队列却空了」。
+            let probe = match &message_id {
+                // 没有 `Message-ID` 就无法确认目标文件夹里有没有副本。
+                // 宁可停住等对账 / 用户确认，也不能赌着重发一遍。
+                None => Err(
+                    "命令可能已经发出，但这封信没有 Message-ID，无法确认目标文件夹里是否已有副本，因此不重发"
+                        .to_owned(),
+                ),
+                Some(id) => match destination_has_message_id(session, destination, id).await {
+                    Ok(found) => Ok(found),
+                    Err(error) => Err(format!(
+                        "重发前探测目标文件夹失败，因此不重发：{}",
+                        submit_error_message(&error)
+                    )),
+                },
+            };
+
+            // 探测换了选中的文件夹，提交之前必须切回**可写**的源文件夹。
+            session
+                .select(&folder.remote_name)
+                .await
+                .map_err(|error| AppError::Protocol(format!("切回源文件夹失败: {error}")))?;
+
+            match probe {
+                // 已经在目标文件夹里了：`COPY` 那一半不必再发。
+                Ok(found) => copy_already_done = found,
+                Err(message) => {
+                    operation::mark_operation_uncertain(pool, &op.id, "unknown", &message, now_ms)
+                        .await?;
+                    report.uncertain += 1;
+                    continue;
+                }
+            }
+        }
+
+        match submit(session, op.uid, &route, copy_already_done).await {
             Ok(result) => {
                 // 本地视图跟着服务器走：源文件夹里这封邮件已经不该显示了。
                 message_dao::delete_messages_by_uids(
@@ -322,15 +385,11 @@ pub async fn push_transfers_as(
                 report.retryable += 1;
             }
             Err(SubmitError::Uncertain { message }) => {
-                operation::update_operation_state(
-                    pool,
-                    &op.id,
-                    OperationState::Uncertain,
-                    Some("unknown"),
-                    Some(&message),
-                    now_ms,
-                )
-                .await?;
+                // 必须走 `mark_operation_uncertain`（而不是 `update_operation_state`）：
+                // 只有它会自增 `attempts`，而 `claim_for_push` 靠 `attempts < ?` 卡住重发。
+                // 不自增 = 这条永远可以被重认领 = 每轮重发一次 `COPY`。
+                operation::mark_operation_uncertain(pool, &op.id, "unknown", &message, now_ms)
+                    .await?;
                 report.uncertain += 1;
             }
             Err(SubmitError::Failed { message }) => {
@@ -361,10 +420,23 @@ enum SubmitResult {
 }
 
 /// 按路由发命令，并**回读确认**。
+///
+/// `copy_already_done` 为真时跳过 `COPY` 那一半（调用方已经用 `Message-ID`
+/// 在目标文件夹里探到副本了），只补完源文件夹的删除。
+/// 取出 [`SubmitError`] 里的人话部分（三个分支都只有一个 `message`）。
+fn submit_error_message(error: &SubmitError) -> &str {
+    match error {
+        SubmitError::Retryable { message }
+        | SubmitError::Uncertain { message }
+        | SubmitError::Failed { message } => message,
+    }
+}
+
 async fn submit(
     session: &mut Session,
     uid: i64,
     route: &Route,
+    copy_already_done: bool,
 ) -> Result<SubmitResult, SubmitError> {
     let uid32 = u32::try_from(uid).map_err(|_| SubmitError::Failed {
         message: format!("UID {uid} 超出 32 位范围，不能用 IMAP 命令表达"),
@@ -389,9 +461,12 @@ async fn submit(
             destination,
             expunge,
         } => {
-            copy_messages(session, &[uid32], destination)
-                .await
-                .map_err(classify_submit_error)?;
+            // 探测已经确认目标文件夹里有这封，再发一次 `COPY` 就多一份。
+            if !copy_already_done {
+                copy_messages(session, &[uid32], destination)
+                    .await
+                    .map_err(classify_submit_error)?;
+            }
             mark_deleted(session, &[uid32])
                 .await
                 .map_err(classify_submit_error)?;
@@ -420,6 +495,42 @@ async fn submit(
     }
 
     Ok(SubmitResult::Submitted)
+}
+
+/// 目标文件夹里是否已经有这封（按 `Message-ID` 认）。
+///
+/// 会**切换选中的文件夹**（它是 `EXAMINE` 的），调用方必须自己切回去——
+/// `submit` 需要的是可写的源文件夹。
+async fn destination_has_message_id(
+    session: &mut Session,
+    destination: &str,
+    message_id: &str,
+) -> Result<bool, SubmitError> {
+    session
+        .examine(destination)
+        .await
+        .map_err(|error| SubmitError::Uncertain {
+            message: format!("打开目标文件夹 {destination} 失败: {error}"),
+        })?;
+
+    // `Message-ID` 理论上不含引号，但服务器给的东西不能信：
+    // 去掉引号、空白与控制字符，避免拼出一条坏命令。
+    let sanitized: String = message_id
+        .chars()
+        .filter(|c| *c != '"' && !c.is_whitespace() && !c.is_control())
+        .collect();
+
+    let command = format!("UID SEARCH HEADER Message-ID \"{sanitized}\"");
+    let outcome = run_checked_with_timeout(session, &command)
+        .await
+        .map_err(classify_submit_error)?;
+
+    match outcome {
+        CommandOutcome::Search(uids) => Ok(!uids.is_empty()),
+        other => Err(SubmitError::Uncertain {
+            message: format!("期望 UID SEARCH 返回命中列表，实际是 {other:?}"),
+        }),
+    }
 }
 
 /// 回读时要看到什么才算成功。
@@ -551,7 +662,7 @@ mod tests {
 
     #[test]
     fn without_uidplus_copy_stops_at_deleted_flag() {
-        // 163 就是这一档：没有 UIDPLUS，所以**绝不能** expunge。
+        // 兜底那一档：没有 UIDPLUS，所以**绝不能** expunge。
         let route = route_for(OperationKind::Move, false, false, Some(DST), None).unwrap();
         assert_eq!(
             route,

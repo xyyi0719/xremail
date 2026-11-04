@@ -58,9 +58,33 @@ impl RemoteFolder {
 pub async fn list_folders(
     session: &mut crate::connection::Session,
 ) -> Result<Vec<RemoteFolder>, ProtocolError> {
-    let outcome = crate::command::run_checked(session, "LIST \"\" \"*\"").await?;
+    list_folders_with_timeout(session, crate::command::DEFAULT_COMMAND_TIMEOUT).await
+}
 
-    Ok(outcome
+/// 同 [`list_folders`]，但用**调用方给的**超时。
+///
+/// `LIST` 也得有超时：async-imap **没有**命令超时，
+/// 服务器收了命令不回话时，同步会在「列文件夹」这一步永久挂住。
+pub async fn list_folders_with_timeout(
+    session: &mut crate::connection::Session,
+    timeout: std::time::Duration,
+) -> Result<Vec<RemoteFolder>, ProtocolError> {
+    match tokio::time::timeout(
+        timeout,
+        crate::command::run_checked(session, "LIST \"\" \"*\""),
+    )
+    .await
+    {
+        Ok(outcome) => Ok(to_remote_folders(outcome?)),
+        Err(_) => Err(ProtocolError::Timeout(format!(
+            "命令超时（{timeout:?}）: LIST \"\" \"*\""
+        ))),
+    }
+}
+
+/// 把 `LIST` 的结果转成 [`RemoteFolder`]。
+fn to_remote_folders(outcome: crate::command::CommandOutcome) -> Vec<RemoteFolder> {
+    outcome
         .list()
         .iter()
         .map(|mailbox| {
@@ -74,7 +98,7 @@ pub async fn list_folders(
                 attributes: mailbox.attributes.clone(),
             }
         })
-        .collect())
+        .collect()
 }
 
 /// 按 RFC 6154 的特殊用途**属性**识别角色。
@@ -209,5 +233,63 @@ mod tests {
         assert_eq!(role_by_name("Virus Items"), None);
         assert_eq!(role_by_name("其他文件夹"), None);
         assert_eq!(role_by_name(""), None);
+    }
+
+    /// 服务器收了 `LIST` 却**不回话**时，`list_folders_with_timeout`
+    /// 必须按超时返回，而不是永久挂住。
+    ///
+    /// async-imap 自己**没有**命令超时（见 `net.rs` 的说明），
+    /// 所以这层超时是唯一的兵：没有它，整个账户的同步就停在这里。
+    #[tokio::test]
+    async fn list_folders_times_out_when_server_never_answers() {
+        use std::time::{Duration, Instant};
+
+        use xremail_testkit::{FakeImapServer, Fault, ServerConfig};
+
+        use crate::connection::{ImapConfig, TlsTrust, connect_and_login_with};
+
+        // 假服务器收到 `LIST` 后不响应（内部的 `Hang` 分支睡 3600 秒）。
+        let server = FakeImapServer::start(ServerConfig {
+            faults: vec![Fault::HangOn("LIST".to_string())],
+            ..ServerConfig::default()
+        })
+        .await
+        .expect("启动假服务器失败");
+
+        let mut config = ImapConfig::imaps(server.host());
+        config.port = server.port();
+        config.connect_timeout = Duration::from_secs(5);
+        let trust = TlsTrust::Roots(server.root_store());
+        let (mut session, _, _) =
+            connect_and_login_with(&config, &trust, "tester@example.com", "test-password")
+                .await
+                .expect("登录应当成功");
+
+        let timeout = Duration::from_millis(200);
+        let started = Instant::now();
+        let result = list_folders_with_timeout(&mut session, timeout).await;
+        let elapsed = started.elapsed();
+
+        match result {
+            Ok(folders) => panic!(
+                "服务器不回话时必须超时，而不是返回文件夹列表（拿到 {} 个）",
+                folders.len()
+            ),
+            Err(ProtocolError::Timeout(detail)) => {
+                assert!(
+                    detail.contains("LIST"),
+                    "超时文案里应带上命令名，实际: {detail}"
+                );
+            }
+            Err(other) => panic!("应当是 Timeout，实际: {other:?}"),
+        }
+        assert!(
+            elapsed >= timeout,
+            "超时不应早于 {timeout:?}，实际 {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "超时必须在 {timeout:?} 量级返回（而不是挂到默认的 30 秒），实际 {elapsed:?}"
+        );
     }
 }

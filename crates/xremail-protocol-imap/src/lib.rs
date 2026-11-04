@@ -25,7 +25,8 @@ pub mod utf7;
 
 pub use append::{AppendOptions, AppendOutcome, append_message, build_append_command};
 pub use command::{
-    CommandOutcome, FetchedMessage, ListedMailbox, MailboxInfo, examine_checked, run_checked,
+    CommandOutcome, FetchedMessage, ListedMailbox, MailboxInfo, examine_checked,
+    examine_checked_with_timeout, run_checked,
 };
 pub use connection::{
     ImapConfig, ImapStream, Session, TlsInfo, TlsTrust, connect_and_login, connect_and_login_with,
@@ -34,7 +35,7 @@ pub use credential::{
     AccountCredential, CredentialError, CredentialStore, default_accounts_path, mask_user,
 };
 pub use error::ProtocolError;
-pub use folders::{RemoteFolder, list_folders};
+pub use folders::{RemoteFolder, list_folders, list_folders_with_timeout};
 pub use idle::{IdleConfig, IdleEvent, IdleOutcome, idle_once};
 pub use probe::{
     ExtensionSupport, FolderSummary, MailboxSummary, ProbeConfig, ProbeReport, auth_mechanisms,

@@ -26,6 +26,7 @@
 //! 绝不能套用到新 UID 上（见 [ARCHITECTURE §4.3](../../../docs/ARCHITECTURE.md)）。
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use sqlx::SqlitePool;
 use xremail_core::AppError;
@@ -36,7 +37,7 @@ use xremail_store::dao::message as message_dao;
 use xremail_store::dao::operation;
 
 use crate::intent::{FlagIntent, MAX_REPLAN_ATTEMPTS, apply_intents, plan_flag_update};
-use crate::net::run_checked_with_timeout;
+use crate::net::{SyncOptions, run_checked_with_timeout_for};
 
 /// 一轮标记回写的结果。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -108,6 +109,27 @@ pub async fn push_flags_as(
     now_ms: i64,
     boot_id: &str,
 ) -> AppResult<FlagPushReport> {
+    push_flags_as_with_options(
+        pool,
+        session,
+        folder,
+        now_ms,
+        boot_id,
+        SyncOptions::default(),
+    )
+    .await
+}
+
+/// 同 [`push_flags_as`]，但用**调用方给的**选项（主要是命令超时）。
+pub async fn push_flags_as_with_options(
+    pool: &SqlitePool,
+    session: &mut Session,
+    folder: &Folder,
+    now_ms: i64,
+    boot_id: &str,
+    options: SyncOptions,
+) -> AppResult<FlagPushReport> {
+    let timeout = options.command_timeout;
     let mut report = FlagPushReport::default();
 
     let Some(epoch) = folder.uidvalidity else {
@@ -164,10 +186,25 @@ pub async fn push_flags_as(
     //
     // 拉取那一轮用的是 `EXAMINE`（只读），而只读邮箱拒绝 `STORE`。
     // 同一个 session 上必须重新以 `SELECT` 打开才能写。
-    session
-        .select(&folder.remote_name)
-        .await
-        .map_err(|error| AppError::Protocol(format!("以可写方式打开文件夹失败: {error}")))?;
+    //
+    // 必须带超时：async-imap 的 `select` 不会自己超时，
+    // 服务器收了命令不回话时，回写就永久停在这一行。
+    // 超时按**传输层故障**处理：服务器可能已经切了，但我们不知道，
+    // 与 [`classify_submit_error`] 对 `ProtocolError::Timeout` 的归类一致。
+    match tokio::time::timeout(timeout, session.select(&folder.remote_name)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            return Err(AppError::Protocol(format!(
+                "以可写方式打开文件夹失败: {error}"
+            )));
+        }
+        Err(_) => {
+            return Err(AppError::Network(format!(
+                "以可写方式打开文件夹超时（{timeout:?}）: {}",
+                folder.remote_name
+            )));
+        }
+    }
 
     for (uid, ops) in by_uid {
         // 认领这一组：只对认领到的操作发命令。
@@ -208,7 +245,7 @@ pub async fn push_flags_as(
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        match push_one(session, epoch, uid, &intents).await {
+        match push_one(session, epoch, uid, &intents, timeout).await {
             Ok(Outcome::NoChange { flags }) => {
                 // 净变化为零 → 意图已经在服务器上生效了，不必发命令。
                 // 算成功：读到的快照本身就是服务器的确认。
@@ -347,10 +384,11 @@ async fn push_one(
     epoch: i64,
     uid: i64,
     intents: &[FlagIntent],
+    timeout: Duration,
 ) -> Result<Outcome, SubmitError> {
     for _attempt in 0..MAX_REPLAN_ATTEMPTS {
         // 读快照。
-        let snapshot = read_snapshot(session, uid).await?;
+        let snapshot = read_snapshot(session, uid, timeout).await?;
         let plan = plan_flag_update(uid, snapshot.flags, epoch, snapshot.modseq, intents);
 
         let Some(delta) = plan.delta else {
@@ -362,10 +400,10 @@ async fn push_one(
         };
 
         // 发命令。
-        match send_delta(session, &delta).await {
+        match send_delta(session, &delta, timeout).await {
             Ok(sent) => {
                 // **回读确认**。
-                let after = read_snapshot(session, uid).await?;
+                let after = read_snapshot(session, uid, timeout).await?;
 
                 // 只核对「我们动过的那些位」——服务器上别的位（比如 \Recent）
                 // 不归我们管。
@@ -410,9 +448,13 @@ struct Snapshot {
 }
 
 /// 读一封邮件的标记。
-async fn read_snapshot(session: &mut Session, uid: i64) -> Result<Snapshot, SubmitError> {
+async fn read_snapshot(
+    session: &mut Session,
+    uid: i64,
+    timeout: Duration,
+) -> Result<Snapshot, SubmitError> {
     let command = format!("UID FETCH {uid} (UID FLAGS)");
-    let outcome = run_checked_with_timeout(session, &command)
+    let outcome = run_checked_with_timeout_for(session, &command, timeout)
         .await
         .map_err(classify_submit_error)?;
 
@@ -460,6 +502,7 @@ pub(crate) fn classify_submit_error(error: ProtocolError) -> SubmitError {
 async fn send_delta(
     session: &mut Session,
     delta: &crate::intent::FlagDelta,
+    timeout: Duration,
 ) -> Result<usize, SubmitError> {
     let mut sent = 0usize;
     let condition = match delta.unchangedsince {
@@ -470,7 +513,7 @@ async fn send_delta(
     if !delta.add.is_empty() {
         let names = delta.add.to_imap_names().join(" ");
         let command = format!("UID STORE {} +FLAGS ({names}){condition}", delta.uid);
-        run_checked_with_timeout(session, &command)
+        run_checked_with_timeout_for(session, &command, timeout)
             .await
             .map_err(classify_submit_error)?;
         sent += 1;
@@ -479,7 +522,7 @@ async fn send_delta(
     if !delta.remove.is_empty() {
         let names = delta.remove.to_imap_names().join(" ");
         let command = format!("UID STORE {} -FLAGS ({names}){condition}", delta.uid);
-        run_checked_with_timeout(session, &command)
+        run_checked_with_timeout_for(session, &command, timeout)
             .await
             .map_err(classify_submit_error)?;
         sent += 1;

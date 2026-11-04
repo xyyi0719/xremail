@@ -238,7 +238,8 @@ pub async fn list_all_pending_operations(
 /// 尝试次数要表达的是「失败了几次」。若认领也自增，那么一次失败会烧掉两个配额，
 /// `attempts` 就不再是失败次数而是「失败次数 + 认领次数」，
 /// 正常抖动就会被提前判成 `retry_exhausted`。
-/// 所以自增点**只有** [`mark_operation_retryable`] 一处。
+/// 所以自增点只有 [`mark_operation_retryable`] 和 [`mark_operation_uncertain`]
+/// 两处，都是「确实尝试过一次且结果不明/失败」的收尾。
 ///
 /// 配额由 `AND attempts < ?` 卡住：到顶的行认领失败，由对账统一收成
 /// `failed / retry_exhausted`（见 `xremail_sync::reconcile`）。
@@ -388,8 +389,8 @@ pub async fn update_operation_state(
 
 /// 增加一条操作的尝试次数，并置为可重试。
 ///
-/// **这是 `attempts` 唯一的自增点**。若认领（[`claim_for_push`]）也自增，
-/// 一次失败会烧掉两个配额，正常抖动就会被提前判成 `retry_exhausted`。
+/// 自增点只有本函数和 [`mark_operation_uncertain`]。若认领（[`claim_for_push`]）
+/// 也自增，一次失败会烧掉两个配额，正常抖动就会被提前判成 `retry_exhausted`。
 ///
 /// 同样只允许从未完结状态迁过来：终态不能被一次后到的失败覆盖成 `retryable`。
 pub async fn mark_operation_retryable(
@@ -415,6 +416,48 @@ pub async fn mark_operation_retryable(
     .execute(pool)
     .await
     .map_err(|e| map_sqlx(e, "mark_operation_retryable"))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// 把一条操作收成「结果不明」，**并增加尝试次数**。
+///
+/// ## 为什么要自增
+///
+/// `uncertain` 与 `retryable` 一样，都表示「这一轮真的发了命令，但没拿到可信
+/// 的结果」，下一轮会被 `claim_for_push` 重新认领（它的 `state IN (...)` 含
+/// `uncertain`）。原先这条路径用 [`update_operation_state`] 收尾，虽然把状态写成
+/// 了 `uncertain`，但 **`attempts` 不动**——于是 `claim_for_push` 的
+/// `AND attempts < ?` 对它永远成立，一条老发不出去的 `copy+delete` 会**每轮
+/// 重发一次**，而 `COPY` 不幂等（163 没有 `MOVE`）：目标文件夹里就会不断多出
+/// 副本。次数不涨就没有任何东西能让这个循环停下来。
+///
+/// 与 [`mark_operation_retryable`] 的唯一区别是落到 `uncertain` 而不是
+/// `retryable`：前者是「确认失败」，后者是「不知道成没成」，下游对二者的处理
+/// 不同（`uncertain` 要先回读核对）。
+pub async fn mark_operation_uncertain(
+    pool: &SqlitePool,
+    id: &str,
+    error_kind: &str,
+    error_message: &str,
+    now_ms: i64,
+) -> AppResult<bool> {
+    let result = sqlx::query!(
+        r#"
+        UPDATE mail_operation
+        SET state = 'uncertain', attempts = attempts + 1,
+            error_kind = ?, error_message = ?, updated_at = ?
+        WHERE id = ?
+          AND state IN ('queued', 'running', 'retryable', 'uncertain')
+        "#,
+        error_kind,
+        error_message,
+        now_ms,
+        id
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| map_sqlx(e, "mark_operation_uncertain"))?;
 
     Ok(result.rows_affected() > 0)
 }

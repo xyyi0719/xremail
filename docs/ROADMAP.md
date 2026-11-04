@@ -202,7 +202,8 @@
   - **应用层接线已完成（2026-11-03）**：`apps/shell/src-tauri/src/lib.rs` 启动时
     列出账户，**只给凭据可用的**起 actor（没存授权码的账户起来只能一直失败）；
     `RunEvent::Exit` 时 `Scheduler::shutdown`。授权码是**后来才保存**的账户
-    由 `cmd::sync_account` 补一次 `start`（`is_scheduled` 先判，已在跑不叫醒）；
+    由 `cmd::sync_account` 补一次 `start`（`cmd::ensure_scheduled` 先问
+    `Scheduler::is_running`，已在跑不叫醒）；
     `cmd::delete_account` 删完先 `stop` 再忘掉凭据。
   - 前端订阅 `sync://state-changed`，只在 `state === "online"` 时重查——
     每轮会报 `connecting` 和 `online` 两次，全刷等于白拉一倍数据。
@@ -246,9 +247,14 @@
     `transfer_push.rs` 里的 `route_for` 单测 8 个）
   - 前置已就位（2026-11-03）：协议层 `COPY` / `MOVE` 与假服务器都已支持
   - 保守路径：有 `MOVE` 就一步 `UID MOVE`；没有则 `UID COPY` → `UID STORE +FLAGS (\Deleted)`
-    → **有 `UIDPLUS` 才** `UID EXPUNGE`（163 没有 `UIDPLUS`，只能止步于标删）
+    → **有 `UIDPLUS` 才** `UID EXPUNGE`（163 有 `UIDPLUS` 但没有 `MOVE`，走的是这一行）
   - 裸 `EXPUNGE` **不能**用：它会把这个文件夹里所有带 `\Deleted` 的信都删掉，
     包括别的客户端标了还没提交的（那也是用户的数据）
+  - **重发不会多出副本（2026-11-03 修）**：`COPY` 不幂等，而 `uncertain` 原先
+    **不自增 `attempts`**，`claim_for_push` 的 `AND attempts < ?` 对它永远成立
+    → 一条发不出去的 `copy+delete` 每轮重发一次。现已：`uncertain` 也计次
+    （`mark_operation_uncertain`）；重发前先用 `Message-ID` 探目标文件夹，探到就
+    跳过 `COPY`；探不了就**不重发**。见 [ARCHITECTURE §4.5](ARCHITECTURE.md)
 - [x] 按需正文（`BODY.PEEK[]` → `message_body` 表）；头随拉取一起落库。
 - [ ] 附件下载、离线缓存状态。
 - [x] **HTML 默认禁网且不可访问宿主**（R06，2026-10-30）。

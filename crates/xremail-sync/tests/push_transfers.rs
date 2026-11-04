@@ -30,13 +30,19 @@ use xremail_store::dao::{
     operation as operation_dao,
 };
 use xremail_store::{PoolConfig, migrate, open_pool_in_memory};
-use xremail_sync::{pull_folder, push_transfers, sync_account};
+use xremail_sync::{
+    MAX_OPERATION_ATTEMPTS, TransferPushReport, pull_folder, push_transfers, sync_account,
+};
 use xremail_testkit::{
     FakeImapServer, Fault, MailboxFixture, MessageFixture, ServerConfig as FakeServerConfig,
 };
 
 const INBOX_UID: i64 = 1_792_658_702;
 const OTHER_UID: i64 = 1_792_658_701;
+/// 目标文件夹里那封「上一轮已经复制进去的副本」的 UID。
+///
+/// 与 `INBOX_UID` 不同：不同文件夹的 UID 空间是**各自独立**的。
+const ARCHIVE_COPY_UID: i64 = 1_792_658_800;
 
 /// 假服务器 + 客户端配置。
 struct Fixture {
@@ -79,6 +85,56 @@ fn config_with_mail() -> FakeServerConfig {
         ],
         ..FakeServerConfig::default()
     }
+}
+
+/// 同上，但 `Archive` 里**预先已经有一份副本**：`Message-ID` 与 INBOX 那封相同。
+///
+/// 这正是「上一轮 `COPY` 已经生效、但确认没读到」之后服务器上的样子。
+/// 重发前必须先认出它，否则一份变两份。
+fn config_with_copy_already_in_archive() -> FakeServerConfig {
+    let mut config = config_with_mail();
+    let archive = config
+        .mailboxes
+        .iter_mut()
+        .find(|mailbox| mailbox.name == "Archive")
+        .expect("config_with_mail 里应当有 Archive");
+
+    // `Message-ID` 的拼法与 testkit 的默认邮件头一致（`<fixture-{uid}@example.com>`），
+    // 但这里**故意让 UID 与 INBOX 那封不同**、`Message-ID` 与它相同——
+    // 「同一个 `Message-ID` 出现在两个文件夹里」就是副本的样子。
+    archive.messages.push(
+        MessageFixture::new(ARCHIVE_COPY_UID as u32).with_content(&format!(
+            "From: sender@example.com\r\n\
+             To: tester@example.com\r\n\
+             Subject: 上一轮已经复制进来的副本\r\n\
+             Message-ID: <fixture-{INBOX_UID}@example.com>\r\n\
+             \r\n\
+             "
+        )),
+    );
+    config
+}
+
+/// 同上，但被搬的那封**没有 `Message-ID`**。
+///
+/// RFC 5322 里 `Message-ID` 不是必填字段，现实里的信确实有缺的；
+/// 缺了它就没法在目标文件夹里认出「这封是不是已经复制过去了」。
+fn config_with_mail_without_message_id() -> FakeServerConfig {
+    let mut config = config_with_mail();
+    for mailbox in &mut config.mailboxes {
+        for message in &mut mailbox.messages {
+            if message.uid == INBOX_UID as u32 {
+                // 换掉整封内容：默认头里那个 `Message-ID` 必须消失。
+                message.content = "From: sender@example.com\r\n\
+                     To: tester@example.com\r\n\
+                     Subject: 没有 Message-ID 的一封\r\n\
+                     \r\n\
+                     正文"
+                    .to_string();
+            }
+        }
+    }
+    config
 }
 
 /// 同上，但多一个垃圾箱（名字靠 `\Trash` 属性，路由靠名字推断）。
@@ -203,6 +259,65 @@ async fn enqueue_transfer(
         .expect("入队应当成功");
 
     operation
+}
+
+/// 入队一条**已经试过 `attempts` 次**的移动意图（目标是 `folder-archive`）。
+///
+/// 重发路径靠 `attempts` 判断两件事：`> 0` 才去探测目标文件夹里有没有副本；
+/// `< MAX_OPERATION_ATTEMPTS` 才能被 `claim_for_push` 认领。
+/// 所以测试要能直接把这两个字段摆成想要的值（这是"上一轮已经发过命令"的入口）。
+async fn enqueue_retried_move(
+    pool: &SqlitePool,
+    folder: &Folder,
+    uid: i64,
+    state: OperationState,
+    attempts: i64,
+    now_ms: i64,
+) -> MailOperation {
+    let operation = MailOperation {
+        id: format!("op-{uid}-{now_ms}"),
+        account_id: folder.account_id.clone(),
+        folder_id: folder.id.clone(),
+        uid,
+        uidvalidity: folder.uidvalidity.expect("测试里应当已经同步过"),
+        kind: OperationKind::Move,
+        intent: FlagIntentPayload::default(),
+        destination_folder_id: Some("folder-archive".to_string()),
+        state,
+        seq: 0,
+        base_version: None,
+        attempts,
+        error_kind: None,
+        error_message: None,
+        created_at: now_ms,
+        updated_at: now_ms,
+    };
+    operation_dao::enqueue_operation(pool, &operation)
+        .await
+        .expect("入队应当成功");
+
+    operation
+}
+
+/// 读回一条操作的当前状态（`push_transfers` 只返回汇总报告）。
+async fn reload_operation(pool: &SqlitePool, id: &str) -> MailOperation {
+    operation_dao::get_operation(pool, id)
+        .await
+        .expect("读回操作失败")
+        .expect("操作应当还在")
+}
+
+/// 服务器收到的 `UID COPY` 条目。
+///
+/// **直接证据**：这里是空的，就不可能有"多出一份"；
+/// 日志里多一条，目标文件夹里就真会多一封（`COPY` 不幂等）。
+fn copy_commands(fixture: &Fixture) -> Vec<String> {
+    fixture
+        .server
+        .command_log()
+        .into_iter()
+        .filter(|line| line.starts_with("UID COPY"))
+        .collect()
 }
 
 /// 服务器上某个文件夹里有没有这个 UID（用真客户端，绕开同步层）。
@@ -443,7 +558,7 @@ async fn delete_goes_into_trash_when_there_is_one() {
 
 #[tokio::test]
 async fn delete_without_trash_or_uidplus_only_marks_deleted() {
-    // 163 那一档：没有垃圾箱，也没有 UIDPLUS。
+    // 兜底那一档：没有垃圾箱，也没有 UIDPLUS（三家实测都有 UIDPLUS，这里人为关掉）。
     // 裸 `EXPUNGE` 会连带删掉别的客户端标了 `\Deleted` 的邮件，所以停在这一步。
     let mut config = config_with_mail();
     config.capabilities.retain(|cap| cap != "UIDPLUS");
@@ -559,6 +674,210 @@ async fn operations_bound_to_the_old_epoch_are_quarantined() {
         .await
         .unwrap();
     assert_eq!(count, 1);
+
+    fixture.server.shutdown().await;
+}
+
+// ------------------------------------------------ 重发幂等（163 没有 `MOVE`）
+//
+// 没有 `MOVE` 时移动 = `COPY` + 标删，而 `COPY` **不幂等**：
+// 命令已经发出、确认没读到，下一轮重发就会在目标文件夹里多出一份。
+// 下面三个用例锁的就是「重发前先认一下副本」和「次数到顶就不再认领」。
+
+#[tokio::test]
+async fn resending_copy_does_not_duplicate_when_target_already_has_the_message() {
+    // 上一轮 `COPY` 已经生效，只是确认丢在路上。
+    // 目标文件夹里预先放一封同 `Message-ID` 的信，就是那一刻的服务器状态。
+    let fixture = start(config_with_copy_already_in_archive()).await;
+    let mut session = login_inbox(&fixture).await;
+    let (pool, folder) = local_store(true).await;
+    let folder = pull_and_reload(&pool, &mut session, &folder, 1_000).await;
+
+    let archive_before = server_count(&fixture, "Archive").await;
+
+    let operation = enqueue_retried_move(
+        &pool,
+        &folder,
+        INBOX_UID,
+        OperationState::Retryable,
+        1,
+        2_000,
+    )
+    .await;
+
+    let report = push_transfers(&pool, &mut session, &folder, 3_000)
+        .await
+        .expect("回写本身不该报错");
+
+    assert_eq!(report.moved, 1, "探测到副本 → 补完删除那一半就算搬走");
+
+    // 先证明探针真的跑了：日志里应当有那条按 `Message-ID` 的 SEARCH。
+    // 这同时证明日志是按「命令名 + 参数」记的，所以下面「没有 COPY」看的确实是 COPY 本身。
+    let log = fixture.server.command_log();
+    assert!(
+        log.iter()
+            .any(|line| line.contains("SEARCH") && line.contains("Message-ID")),
+        "重发前应当先按 Message-ID 探测目标文件夹，实际命令：{log:?}"
+    );
+    // **直接证据**：日志里一条 `UID COPY` 都没有，所以目标文件夹不可能多出副本。
+    assert!(
+        copy_commands(&fixture).is_empty(),
+        "目标文件夹里已经有这封了，不该再发 COPY，实际命令：{log:?}"
+    );
+    // 代理指标：邮件条数没增加。它是用户能看见的东西，但它只是代理——
+    // 真正的因果在上面那条（`COPY` 出现几次，副本就有几份）。
+    assert_eq!(
+        server_count(&fixture, "Archive").await,
+        archive_before,
+        "重发不该让目标文件夹里的信变多"
+    );
+
+    let operation = reload_operation(&pool, &operation.id).await;
+    assert_eq!(
+        operation.state,
+        OperationState::Succeeded,
+        "副本已经在，删除那一半补完就该收成成功"
+    );
+
+    let messages = message_dao::list_messages(&pool, "acct-1", "folder-1")
+        .await
+        .unwrap();
+    assert!(
+        messages.iter().all(|message| message.uid != INBOX_UID),
+        "源文件夹里那封信也得从本地视图里消失"
+    );
+
+    fixture.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn resending_is_refused_when_message_id_is_missing() {
+    // 没有 `Message-ID` 就无法确认目标文件夹里有没有副本。
+    // 赌一把直接重发 = 可能多出一份（`COPY` 不幂等）；
+    // 所以宁可停住等对账 / 用户确认，也不拿用户的数据去赌。
+    let fixture = start(config_with_mail_without_message_id()).await;
+    let mut session = login_inbox(&fixture).await;
+    let (pool, folder) = local_store(true).await;
+    let folder = pull_and_reload(&pool, &mut session, &folder, 1_000).await;
+
+    let archive_before = server_count(&fixture, "Archive").await;
+
+    let operation = enqueue_retried_move(
+        &pool,
+        &folder,
+        INBOX_UID,
+        OperationState::Retryable,
+        1,
+        2_000,
+    )
+    .await;
+
+    let report = push_transfers(&pool, &mut session, &folder, 3_000)
+        .await
+        .expect("回写本身不该报错");
+
+    assert_eq!(report.uncertain, 1, "认不出副本 → 结果不明，等对账");
+    assert_eq!(report.moved, 0, "没搬就算不上成功");
+
+    // 同上：先证明日志在录，否则「没有 COPY」证明不了任何东西。
+    let log = fixture.server.command_log();
+    assert!(!log.is_empty(), "命令日志不该是空的");
+    // **直接证据**：拒绝重发就是一条 `COPY` 都不能发。
+    assert!(
+        copy_commands(&fixture).is_empty(),
+        "没有 Message-ID 时不能赌着重发 COPY，实际命令：{log:?}"
+    );
+    // 代理指标：目标文件夹条数不变。
+    assert_eq!(
+        server_count(&fixture, "Archive").await,
+        archive_before,
+        "不该有任何东西被复制进目标文件夹"
+    );
+
+    let operation = reload_operation(&pool, &operation.id).await;
+    assert_eq!(
+        operation.state,
+        OperationState::Uncertain,
+        "结果不明就得落成 uncertain，不能当成功也不能当失败"
+    );
+    // 这一条是"停止循环"的全部依据：`claim_for_push` 靠 `attempts < ?` 卡重发，
+    // 收尾时不自增 `attempts`，这一轮拒绝重发就等于白拒绝——下一轮照样再发一次 `COPY`。
+    assert_eq!(
+        operation.attempts, 2,
+        "uncertain 必须计次（原本 1 次，这一轮 +1）"
+    );
+
+    fixture.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn exhausted_operation_is_not_reclaimed_again() {
+    // 次数到顶 → `claim_for_push` 的 `AND attempts < ?` 不再放行。
+    // 这一轮一条会改服务器的命令都不该发；收成 `failed / retry_exhausted`
+    // 是对账（`reconcile`）的事，不归这里管，所以状态也**不动**。
+    //
+    // 防的是什么：把闸门放宽（或让 `uncertain` 不再计次）之后，
+    // 一条老发不出去的 `copy+delete` 会每轮再 `COPY` 一次，永远停不下来。
+    let fixture = start(config_with_copy_already_in_archive()).await;
+    let mut session = login_inbox(&fixture).await;
+    let (pool, folder) = local_store(true).await;
+    let folder = pull_and_reload(&pool, &mut session, &folder, 1_000).await;
+
+    let archive_before = server_count(&fixture, "Archive").await;
+
+    let operation = enqueue_retried_move(
+        &pool,
+        &folder,
+        INBOX_UID,
+        OperationState::Uncertain,
+        MAX_OPERATION_ATTEMPTS,
+        2_000,
+    )
+    .await;
+
+    let report = push_transfers(&pool, &mut session, &folder, 3_000)
+        .await
+        .expect("回写本身不该报错");
+
+    assert_eq!(
+        report,
+        TransferPushReport::default(),
+        "没认领到就什么也不算：既不算 moved，也不算 failed"
+    );
+
+    // 同上：先证明日志在录（拉取阶段发过命令），否则「没发命令」是空话。
+    let log = fixture.server.command_log();
+    assert!(!log.is_empty(), "命令日志不该是空的");
+    // **直接证据**：日志里没有任何一条会改服务器的命令。
+    let mutating: Vec<String> = log
+        .into_iter()
+        .filter(|line| {
+            ["UID COPY", "UID MOVE", "UID STORE", "UID EXPUNGE"]
+                .iter()
+                .any(|prefix| line.starts_with(prefix))
+        })
+        .collect();
+    assert!(
+        mutating.is_empty(),
+        "次数到顶就不该再向服务器发命令，实际命令：{mutating:?}"
+    );
+    // 代理指标：目标文件夹条数不变。
+    assert_eq!(
+        server_count(&fixture, "Archive").await,
+        archive_before,
+        "不该有任何东西被复制进目标文件夹"
+    );
+
+    let operation = reload_operation(&pool, &operation.id).await;
+    assert_eq!(
+        operation.state,
+        OperationState::Uncertain,
+        "没被认领 → 状态不该被改成 succeeded / failed"
+    );
+    assert_eq!(
+        operation.attempts, MAX_OPERATION_ATTEMPTS,
+        "一条命令都没发，就不该再记一次尝试"
+    );
 
     fixture.server.shutdown().await;
 }

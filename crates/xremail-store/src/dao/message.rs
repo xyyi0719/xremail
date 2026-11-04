@@ -292,6 +292,41 @@ pub async fn delete_messages_by_uids(
     Ok(deleted as usize)
 }
 
+/// 取某封信的 `Message-ID`，供**幂等探测**用。
+///
+/// **为什么需要它**：`COPY` 不幂等。一条 `copy+delete` 操作若在「命令已经发出、
+/// 确认还没读到」之间断网或崩溃，重发就会在目标文件夹里多出一份副本（163 就没有
+/// `MOVE`，只能走这条路）。重发之前先用 `Message-ID` 去目标文件夹问一句「这封在
+/// 不在」，在就直接收工。取不到 `Message-ID` 就**不许**重发。
+///
+/// 回 `None` 有两种含义：邮件不在本地（已被别的路径删了），或者服务器没给
+/// `Message-ID`。调用方对这两种情况一律按「不能确认」处理。
+pub async fn find_message_id_by_uid(
+    pool: &SqlitePool,
+    account_id: &str,
+    folder_id: &str,
+    uidvalidity: i64,
+    uid: i64,
+) -> AppResult<Option<String>> {
+    let message_id = sqlx::query_scalar!(
+        r#"
+        SELECT message_id
+        FROM message
+        WHERE account_id = ? AND folder_id = ? AND uidvalidity = ? AND uid = ?
+        "#,
+        account_id,
+        folder_id,
+        uidvalidity,
+        uid
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| map_sqlx(e, "find_message_id_by_uid"))?;
+
+    // 外层的 `None` = 没有这行；内层的 `None` = 这行没 `Message-ID`。
+    Ok(message_id.flatten())
+}
+
 /// 删掉某个文件夹里的**全部**邮件，返回删掉几封。
 ///
 /// 用于 **epoch 切换**：旧世代的 UID 映射全部作废（见 ARCHITECTURE §4.3）。

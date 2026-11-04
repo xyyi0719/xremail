@@ -22,11 +22,12 @@
 use sqlx::SqlitePool;
 use xremail_core::model::{Account, Folder, TlsMode};
 use xremail_core::{AppError, AppResult};
-use xremail_protocol_imap::folders::list_folders;
+use xremail_protocol_imap::folders::list_folders_with_timeout;
 use xremail_protocol_imap::{ImapConfig, Session};
 use xremail_store::dao::folder as folder_dao;
 
-use crate::pull::{FolderSyncReport, pull_folder};
+use crate::net::SyncOptions;
+use crate::pull::{FolderSyncReport, pull_folder_with_options};
 
 /// 一轮账户同步的结果。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -65,6 +66,30 @@ pub async fn sync_account_as(
     now_ms: i64,
     boot_id: &str,
 ) -> AppResult<SyncSummary> {
+    sync_account_as_with(
+        pool,
+        session,
+        account,
+        now_ms,
+        boot_id,
+        SyncOptions::default(),
+    )
+    .await
+}
+
+/// 同 [`sync_account_as`]，但**显式指定超时等选项**。
+///
+/// [`crate::actor::AccountActor`] 走这一条：它的
+/// [`crate::actor::SyncPolicy::command_timeout`] 必须真的落到每一条命令上，
+/// 否则「policy 里配了超时」只是一句空话。
+pub async fn sync_account_as_with(
+    pool: &SqlitePool,
+    session: &mut Session,
+    account: &Account,
+    now_ms: i64,
+    boot_id: &str,
+    options: SyncOptions,
+) -> AppResult<SyncSummary> {
     // 只支持隐式 TLS：不静默降级。
     if account.server.imap_tls != TlsMode::Implicit {
         return Err(AppError::Unsupported(format!(
@@ -74,7 +99,7 @@ pub async fn sync_account_as(
     }
 
     // 1. 服务器上的文件夹。
-    let remote = list_folders(session)
+    let remote = list_folders_with_timeout(session, options.command_timeout)
         .await
         .map_err(|e| AppError::Protocol(format!("列文件夹失败: {e}")))?;
 
@@ -117,7 +142,7 @@ pub async fn sync_account_as(
         //
         // 单个文件夹失败**不该**让整轮同步失败：邮箱里常有一个文件夹
         // 是坏的（权限不足之类）。逐个记录，继续下一个。
-        match pull_folder(pool, session, &folder, now_ms).await {
+        match pull_folder_with_options(pool, session, &folder, now_ms, options).await {
             Ok(report) => {
                 summary.folders += 1;
                 summary.added += report.added;
@@ -131,7 +156,7 @@ pub async fn sync_account_as(
                 //
                 // 这一步让 `retryable` 的操作有了自动重试的机会——
                 // 在此之前只有用户手动点一下才会回写，失败一次就永远躺着。
-                flush_pending(pool, session, &folder, now_ms, boot_id).await;
+                flush_pending(pool, session, &folder, now_ms, boot_id, options).await;
             }
             Err(error) => {
                 tracing::warn!(
@@ -158,6 +183,7 @@ async fn flush_pending(
     folder: &Folder,
     now_ms: i64,
     boot_id: &str,
+    options: SyncOptions,
 ) {
     // 重新读一遍：`pull_folder` 可能刚换过 epoch。
     let fresh = match folder_dao::get_folder(pool, &folder.id).await {
@@ -169,7 +195,9 @@ async fn flush_pending(
         }
     };
 
-    match crate::push::push_flags_as(pool, session, &fresh, now_ms, boot_id).await {
+    match crate::push::push_flags_as_with_options(pool, session, &fresh, now_ms, boot_id, options)
+        .await
+    {
         Ok(report) if !report.is_noop() => tracing::debug!(
             folder = %fresh.remote_name,
             succeeded = report.succeeded,

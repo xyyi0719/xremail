@@ -26,7 +26,7 @@ use xremail_core::model::MessageBody;
 use xremail_protocol_imap::{CommandOutcome, Session};
 use xremail_store::dao::message as message_dao;
 
-use crate::net::run_checked_with_timeout;
+use crate::net::{SyncOptions, run_checked_with_timeout_for};
 use crate::pull::map_protocol_error;
 
 /// 拉取一封邮件的正文并落库。
@@ -51,6 +51,34 @@ pub async fn fetch_body(
     uid: i64,
     uidvalidity: i64,
 ) -> AppResult<bool> {
+    fetch_body_with_options(
+        pool,
+        session,
+        account_id,
+        folder_id,
+        remote_name,
+        uid,
+        uidvalidity,
+        SyncOptions::default(),
+    )
+    .await
+}
+
+/// 同 [`fetch_body`]，但用**调用方给的**选项（主要是命令超时）。
+///
+/// 参数比 [`fetch_body`] 多一个：`fetch_body` 的签名不能改（现有 ~10 个调用点），
+/// 选项只能作为额外参数跟着，所以这里放行 `too_many_arguments`。
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_body_with_options(
+    pool: &SqlitePool,
+    session: &mut Session,
+    account_id: &str,
+    folder_id: &str,
+    remote_name: &str,
+    uid: i64,
+    uidvalidity: i64,
+    options: SyncOptions,
+) -> AppResult<bool> {
     // 1. 先在本地找到这封邮件（要它的本地 ID）。
     let messages = message_dao::list_messages(pool, account_id, folder_id).await?;
     let Some(message) = messages
@@ -63,13 +91,19 @@ pub async fn fetch_body(
     // 2. 打开对应的文件夹（只读，不置 \Seen）。
     //
     // 少了这一步，服务器会拿**当前选中的邮箱**去查这个 UID → 返回空结果。
-    xremail_protocol_imap::examine_checked(session, remote_name)
-        .await
-        .map_err(map_protocol_error)?;
+    //
+    // 必须带超时：async-imap 的 `examine` 不会自己超时。
+    xremail_protocol_imap::examine_checked_with_timeout(
+        session,
+        remote_name,
+        options.command_timeout,
+    )
+    .await
+    .map_err(map_protocol_error)?;
 
     // 3. 拉整封（PEEK：不置 \Seen）。
     let command = format!("UID FETCH {uid} (UID BODY.PEEK[])");
-    let outcome = run_checked_with_timeout(session, &command)
+    let outcome = run_checked_with_timeout_for(session, &command, options.command_timeout)
         .await
         .map_err(map_protocol_error)?;
 
