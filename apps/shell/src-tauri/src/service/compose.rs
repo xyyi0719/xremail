@@ -394,7 +394,12 @@ impl ComposeService {
         }
 
         // 4) 抢占：两个发送器同时抢，只有一个能拿到。
-        let claimed = send_queue_dao::claim_for_sending(&self.pool, &id, now).await?;
+        //
+        // 认领时记下本进程的启动标识："下次启动对账"只回收**别人**的行，
+        // 不会把本进程还在发的信翻成「结果未知」。
+        let claimed =
+            send_queue_dao::claim_for_sending(&self.pool, &id, xremail_sync::boot_id(), now)
+                .await?;
         if !claimed {
             return Err(AppError::Invalid(
                 "这封信正在被另一个发送器处理，请稍后再试".to_string(),
@@ -442,7 +447,8 @@ impl ComposeService {
         if !requeued {
             return Err(AppError::Invalid("重新提交失败：状态已经变了".to_string()));
         }
-        let claimed = send_queue_dao::claim_for_sending(&self.pool, id, now).await?;
+        let claimed =
+            send_queue_dao::claim_for_sending(&self.pool, id, xremail_sync::boot_id(), now).await?;
         if !claimed {
             return Err(AppError::Invalid(
                 "这封信正在被另一个发送器处理，请稍后再试".to_string(),

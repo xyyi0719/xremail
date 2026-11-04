@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        UPDATE mail_operation\n        SET state = ?, error_kind = ?, error_message = ?, updated_at = ?\n        WHERE id = ?\n          AND state IN ('queued', 'running', 'retryable', 'uncertain')\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "f18b1a4a1ab419ab4068cfd7a02283ce8ba3a6906d4eb447844a5b24d67349fb"
+}

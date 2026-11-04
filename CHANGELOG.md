@@ -7,6 +7,17 @@
 ## [Unreleased]
 
 ### Added
+- **假 IMAP 服务器的 `IDLE` 与主动推送**（2026-11-03）
+  - `crates/xremail-testkit/src/server.rs`：`IDLE` 命令（回 `+ idling` → 等
+    `DONE` → 用**原 tag** 回 `OK`）、服务器级 `PushRegistry`（登记
+    「哪些连接正在 IDLE、选中的是哪个文件夹」）
+  - 对外提供推送入口：`* n EXISTS` / `* n EXPUNGE` 只送给**正在那个文件夹
+    IDLE** 的连接，离开 `IDLE` 后不再收到；这就是测试「推送不漏、不串文件夹」的基础
+  - 错误路径也覆盖：未 `SELECT` 就 `IDLE` → `NO`；`IDLE` 期间发别的命令 → `BAD`；
+    故障注入（`faults`）对 `IDLE` 同样生效
+  - 用例 7 个（`crates/xremail-testkit/tests/idle.rs`）
+  - **未做**：客户端侧 `IDLE`（`crates/xremail-sync` 里还没有 IDLE 保持与
+    重连逻辑），所以调度器目前仍只会轮询
 - **移动 / 删除的写路径与本地排队**（2026-11-03）
   - 新增 `crates/xremail-sync/src/transfer_push.rs`：`push_transfers`
     + 纯函数 `route_for`（能在不连服务器的情况下测路由）
@@ -21,8 +32,8 @@
   - 存储：迁移 `0005` 给 `mail_operation` 加 `destination_folder_id`，
     `OperationKind` 扩为 `flags` / `move` / `delete`
   - 命令 `move_messages` / `delete_messages`（只入队，能连上就立即提交）
-  - 用例 24 个（`tests/push_transfers.rs` 8 个端到端 +
-    `apps/shell/tests/move_delete_intent.rs` 8 个服务层 + `route_for` 单测 8 个）
+  - 用例 16 个（`crates/xremail-sync/tests/push_transfers.rs` 8 个端到端 +
+    `crates/xremail-sync/src/transfer_push.rs` 里 `route_for` 等 8 个单测）
 - **`COPY` / `MOVE` / `EXPUNGE` 协议层与假服务器支持**（2026-11-03）
   - 新增 `crates/xremail-protocol-imap/src/transfer.rs`：`copy_messages` /
     `move_messages` / `mark_deleted` / `uid_expunge`，加 4 个命令构造函数
@@ -40,6 +51,26 @@
     `UID COPY` / `UID MOVE` / `EXPUNGE` / `UID EXPUNGE`，并按 RFC 6851
     让 `MOVE` **只删被移动的那些**（不碰别人标删的）
   - 用例 9 个（`tests/transfer.rs`）
+
+- **启动对账：进程崩溃后的恢复**（2026-11-03）
+  - 新增 `crates/xremail-sync/src/reconcile.rs`：`reconcile_account_as` + 纯函数
+    `plan_reconcile`（把「观测 → 决定」从 IO 拆出来，可单测）
+  - **目标不是猜服务器做了什么**，而是把没人负责的行标成没人负责，
+    交给下一轮回读确认去核对（`push_flags` / `push_transfers` 天然幂等）
+  - **按 boot 归属回收**：`running` 只说明有人认领了，不说明认领者还活着。
+    认领时写 `owner_boot`（迁移 `0006`），对账只收
+    `owner_boot IS NULL OR owner_boot <> 本次 boot` 的行。
+    没有这层守卫，同一台机器上另一个**还活着**的进程的存途行会被翻成「结果未知」
+  - **先回收、后判过期——顺序本身是语义**：反过来的话，一条属于上次进程、
+    次数也已到顶的 `running` 会被 `expire_exhausted` 的状态过滤漏掉，
+    永远卡在 `running`：既没人推它，也没人报错
+  - **`uncertain` 绝不改回 `queued` / `retryable`**：那等于替服务器判断
+    「上次没执行」。只有人的显式决定能改它
+  - 同时收掉孤儿操作（文件夹已删 → `folder_missing`；移动目标已删 →
+    `destination_missing`）与旧 epoch 操作（→ `epoch_changed`）
+  - **幂等**：重复执行都不动手（当前触发点只有**应用启动一处**，
+    `apps/shell/src-tauri/src/lib.rs:140`；actor 的 `Startup` 轮尚未调它）
+  - 用例 11 个（`crates/xremail-sync/tests/crash_recovery.rs`）
 
 - **账户调度器（AccountActor）与后台任务 panic 边界**（2026-11-03）
   - **调度器**（`crates/xremail-sync/src/actor.rs`）：一个账户一个 actor，

@@ -73,14 +73,40 @@ impl FlagPushReport {
 /// 流程：
 /// 1. 取出该文件夹的未完结操作；
 /// 2. 绑定**旧 epoch** 的隔离掉（不套用到新 UID 上）；
-/// 3. 按 UID 分组，逐封：
+/// 3. **认领**每条操作（`queued`/`retryable`/`uncertain` → `running`，记下 `owner_boot`）；
+/// 4. 按 UID 分组，逐封：
 ///    读快照 → 重放意图算出净变化 → 发 `STORE` → **回读确认**；
-/// 4. 按结果更新操作状态，并把本地邮件的标记对齐到服务器确认过的状态。
+/// 5. 按结果更新操作状态，并把本地邮件的标记对齐到服务器确认过的状态。
+///
+/// ## 为什么要先认领
+///
+/// 认领是**唯一的提交权闸门**（[`operation::claim_for_push`]）。
+/// 两个提交者（例如 actor 的定时轮与 API 层的即时提交）同时看到同一批意图时，
+/// 只有认领到的一方发命令；另一方什么都不做，并且**不算失败**。
+/// 没有这道闸门时，同一批 `STORE` 会被发两遍——能活下来全靠服务器的条件写兼容，
+/// 那是靠外部兵兜底，不是靠我们不犯错。
+/// 把某个文件夹里待提交的标记意图回写到服务器。
+///
+/// 认领时用本进程的启动标识（[`crate::boot::boot_id`]）。
+/// 需要模拟「另一代进程」的测试用 [`push_flags_as`]。
 pub async fn push_flags(
     pool: &SqlitePool,
     session: &mut Session,
     folder: &Folder,
     now_ms: i64,
+) -> AppResult<FlagPushReport> {
+    push_flags_as(pool, session, folder, now_ms, crate::boot::boot_id()).await
+}
+
+/// 同 [`push_flags`]，但显式指定认领归属。
+///
+/// `boot_id` 只影响「这行算谁的」：对账时只回收**别人**的行。
+pub async fn push_flags_as(
+    pool: &SqlitePool,
+    session: &mut Session,
+    folder: &Folder,
+    now_ms: i64,
+    boot_id: &str,
 ) -> AppResult<FlagPushReport> {
     let mut report = FlagPushReport::default();
 
@@ -144,7 +170,31 @@ pub async fn push_flags(
         .map_err(|error| AppError::Protocol(format!("以可写方式打开文件夹失败: {error}")))?;
 
     for (uid, ops) in by_uid {
-        let intents: Vec<FlagIntent> = ops
+        // 认领这一组：只对认领到的操作发命令。
+        //
+        // 认领失败有两种原因，处置相同（都不做事）：
+        // * 被另一个提交者抢到手了——它会发现净变化为零或自己提交，不差我一个；
+        // * `attempts` 已到顶——由对账收成 `failed / retry_exhausted`。
+        // 两者都**不是错误**，不能计进 `retryable`。
+        let mut claimed: Vec<&MailOperation> = Vec::with_capacity(ops.len());
+        for op in &ops {
+            if operation::claim_for_push(
+                pool,
+                &op.id,
+                boot_id,
+                crate::reconcile::MAX_OPERATION_ATTEMPTS,
+                now_ms,
+            )
+            .await?
+            {
+                claimed.push(op);
+            }
+        }
+        if claimed.is_empty() {
+            continue;
+        }
+
+        let intents: Vec<FlagIntent> = claimed
             .iter()
             .map(|op| {
                 FlagIntent::new(
@@ -164,7 +214,7 @@ pub async fn push_flags(
                 // 算成功：读到的快照本身就是服务器的确认。
                 report.succeeded += 1;
                 report.noop += 1;
-                for op in &ops {
+                for op in &claimed {
                     operation::update_operation_state(
                         pool,
                         &op.id,
@@ -189,7 +239,7 @@ pub async fn push_flags(
             Ok(Outcome::Confirmed { flags, submitted }) => {
                 report.succeeded += 1;
                 report.submitted += submitted;
-                for op in &ops {
+                for op in &claimed {
                     operation::update_operation_state(
                         pool,
                         &op.id,
@@ -213,7 +263,7 @@ pub async fn push_flags(
             }
             Err(SubmitError::Retryable { message }) => {
                 report.retryable += 1;
-                for op in &ops {
+                for op in &claimed {
                     operation::mark_operation_retryable(
                         pool,
                         &op.id,
@@ -226,7 +276,7 @@ pub async fn push_flags(
             }
             Err(SubmitError::Uncertain { message }) => {
                 report.uncertain += 1;
-                for op in &ops {
+                for op in &claimed {
                     operation::update_operation_state(
                         pool,
                         &op.id,
@@ -240,7 +290,7 @@ pub async fn push_flags(
             }
             Err(SubmitError::Failed { message }) => {
                 report.failed += 1;
-                for op in &ops {
+                for op in &claimed {
                     operation::update_operation_state(
                         pool,
                         &op.id,

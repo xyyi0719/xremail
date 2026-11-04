@@ -13,8 +13,15 @@
 //!   │
 //!   ├──不该重试────> failed
 //!   │
+//!   ├──认领提交────> running ──> succeeded / retryable / failed / uncertain
+//!   │
 //!   └──不知道执行了没> uncertain
 //! ```
+//!
+//! `running` 是「有人认领了，正发给服务器」的**短暂**状态。它只说明认领，
+//! 不说明认领者还活着（`owner_boot`，见迁移 `0006_operation_owner.sql`）。
+//! 进程死在 `running` 上，重启后由 `reconcile` 收成 `uncertain`——
+//! **不直接重试**，因为命令可能已经到达服务器。
 //!
 //! `uncertain` 尤其重要：命令发出去了但没收到确认，
 //! **不能盲目重试**——可能已经执行过了。
@@ -221,7 +228,134 @@ pub async fn list_all_pending_operations(
     rows.iter().map(row_to_operation).collect()
 }
 
+/// 认领一条操作：`queued` / `retryable` / `uncertain` → `running`，并记下归属。
+///
+/// 这是**唯一的提交权闸门**：两个提交者同时认领同一行，只有一个能改到行，
+/// 另一个拿到 `false`（什么都不做，也**不算失败**——不是它认领的）。
+///
+/// ## 为什么认领时不自增 `attempts`
+///
+/// 尝试次数要表达的是「失败了几次」。若认领也自增，那么一次失败会烧掉两个配额，
+/// `attempts` 就不再是失败次数而是「失败次数 + 认领次数」，
+/// 正常抖动就会被提前判成 `retry_exhausted`。
+/// 所以自增点**只有** [`mark_operation_retryable`] 一处。
+///
+/// 配额由 `AND attempts < ?` 卡住：到顶的行认领失败，由对账统一收成
+/// `failed / retry_exhausted`（见 `xremail_sync::reconcile`）。
+pub async fn claim_for_push(
+    pool: &SqlitePool,
+    id: &str,
+    boot_id: &str,
+    max_attempts: i64,
+    now_ms: i64,
+) -> AppResult<bool> {
+    let result = sqlx::query!(
+        r#"
+        UPDATE mail_operation
+        SET state = 'running', started_at = ?, owner_boot = ?, updated_at = ?
+        WHERE id = ?
+          AND state IN ('queued', 'retryable', 'uncertain')
+          AND attempts < ?
+        "#,
+        now_ms,
+        boot_id,
+        now_ms,
+        id,
+        max_attempts
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| map_sqlx(e, "claim_for_push"))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// 启动对账：把「**不是本 boot 留下的**」`running` 收成 `uncertain`。
+///
+/// ## 为什么不是无条件扫所有 `running`
+///
+/// `owner_boot` 守卫是这一条的全部价值：同一台机器上的另一个进程
+/// （或同一进程里另一个提交者）正在提交的行**不是残骸**。
+/// 无条件扫会把活着的操作翻成「结果未知」，让用户白确认一次。
+///
+/// `owner_boot IS NULL` 必须单独判——老数据没有归属，按「不是我的」处理，
+/// 否则升级上来的库永远扫不到那批行（那正是本 TODO 要修的东西）。
+///
+/// 收成 `uncertain` 而不是 `queued`/`retryable`：命令可能已经到服务器了，
+/// 让下一轮回读去核对（`push_flags` / `push_transfers` 的幂等性），
+/// 而不是替服务器判断「没执行」然后重发一次。
+pub async fn reclaim_running(
+    pool: &SqlitePool,
+    account_id: &str,
+    boot_id: &str,
+    now_ms: i64,
+) -> AppResult<usize> {
+    let result = sqlx::query!(
+        r#"
+        UPDATE mail_operation
+        SET state = 'uncertain',
+            error_kind = 'interrupted',
+            error_message = ?,
+            owner_boot = NULL,
+            started_at = NULL,
+            updated_at = ?
+        WHERE account_id = ?
+          AND state = 'running'
+          AND (owner_boot IS NULL OR owner_boot <> ?)
+        "#,
+        "上次提交过程中进程中断，结果未知",
+        now_ms,
+        account_id,
+        boot_id
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| map_sqlx(e, "reclaim_running"))?;
+
+    Ok(result.rows_affected() as usize)
+}
+
+/// 把尝试次数到顶的未完结操作收成 `failed / retry_exhausted`。
+///
+/// 单独扫而不是在提交路径里顺手判：中途某处顺手标 `failed` 会多出第二套口径，
+/// 而「什么时候算彻底放弃」应该是**一个人能一眼看全**的规则。
+///
+/// 不收 `running`：那一批要么属于本 boot 的在途操作（不该动），
+/// 要么已经被 [`reclaim_running`] 先收成了 `uncertain`（对账的顺序保证）。
+pub async fn expire_exhausted(
+    pool: &SqlitePool,
+    account_id: &str,
+    max_attempts: i64,
+    now_ms: i64,
+) -> AppResult<usize> {
+    let result = sqlx::query!(
+        r#"
+        UPDATE mail_operation
+        SET state = 'failed',
+            error_kind = 'retry_exhausted',
+            error_message = ?,
+            updated_at = ?
+        WHERE account_id = ?
+          AND state IN ('queued', 'retryable', 'uncertain')
+          AND attempts >= ?
+        "#,
+        "重试次数已用完，操作放弃（可能是服务器一直拒绝这条意图）",
+        now_ms,
+        account_id,
+        max_attempts
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| map_sqlx(e, "expire_exhausted"))?;
+
+    Ok(result.rows_affected() as usize)
+}
+
 /// 更新一条操作的状态。
+///
+/// 只允许在**未完结**的状态之间迁移：`succeeded` / `failed` 是终态，
+/// 不许被改回去。没有这条守卫时，一条已经确认成功的操作可能被后到的
+/// 失败分支覆盖成 `retryable`，然后重放一遍——那是靠时序碰运气的正确性。
 pub async fn update_operation_state(
     pool: &SqlitePool,
     id: &str,
@@ -237,6 +371,7 @@ pub async fn update_operation_state(
         UPDATE mail_operation
         SET state = ?, error_kind = ?, error_message = ?, updated_at = ?
         WHERE id = ?
+          AND state IN ('queued', 'running', 'retryable', 'uncertain')
         "#,
         state_text,
         error_kind,
@@ -252,6 +387,11 @@ pub async fn update_operation_state(
 }
 
 /// 增加一条操作的尝试次数，并置为可重试。
+///
+/// **这是 `attempts` 唯一的自增点**。若认领（[`claim_for_push`]）也自增，
+/// 一次失败会烧掉两个配额，正常抖动就会被提前判成 `retry_exhausted`。
+///
+/// 同样只允许从未完结状态迁过来：终态不能被一次后到的失败覆盖成 `retryable`。
 pub async fn mark_operation_retryable(
     pool: &SqlitePool,
     id: &str,
@@ -265,6 +405,7 @@ pub async fn mark_operation_retryable(
         SET state = 'retryable', attempts = attempts + 1,
             error_kind = ?, error_message = ?, updated_at = ?
         WHERE id = ?
+          AND state IN ('queued', 'running', 'retryable', 'uncertain')
         "#,
         error_kind,
         error_message,

@@ -176,7 +176,21 @@
   - epoch 切换在**一个事务**内完成（清旧世代 → 写新邮件 → 删服务器已删的 → 更新游标）
   - 绑定旧 epoch 的待提交操作**隔离**（标记 `failed`），绝不套用到新 UID 上
   - 用例：`epoch_change_triggers_a_rebuild`、`operations_bound_to_the_old_epoch_are_quarantined`
-- [ ] 断线恢复（崩溃后重启对账）。
+- [x] 断线恢复（崩溃后重启对账）（2026-11-03）：`crates/xremail-sync/src/reconcile.rs`。
+  - 目标不是「猜服务器做了什么」，而是**把没人负责的行标成没人负责**，
+    交给下一轮回读确认去核对（`push_flags` / `push_transfers` 天然幂等）
+  - **按 boot 归属回收**：`running` 只说明有人认领了，不说明认领者还活着。
+    认领时写 `owner_boot`（迁移 `0006_operation_owner.sql`），对账只收
+    `owner_boot IS NULL OR owner_boot <> 本次 boot` 的行
+  - **先回收、后判过期**（顺序本身是语义）：反过来，一条属于上次进程、
+    次数也已到顶的 `running` 会被 `expire_exhausted` 漏掉，永远卡在 `running`
+  - `uncertain` **绝不**改回 `queued` / `retryable`：那等于替服务器判断
+    「上次没执行」。只有人的显式决定能改它
+  - 同时收掉：孤儿操作（文件夹已删 → `folder_missing`；移动目标已删 →
+    `destination_missing`）、旧 epoch 操作（→ `epoch_changed`）
+  - 幂等：重复执行都不动手（触发点是**应用启动一处**，
+    `apps/shell/src-tauri/src/lib.rs:140`；actor 的 `Startup` 轮尚未调它）
+  - 用例：`tests/crash_recovery.rs` 11 个
 - [x] **账户调度器**（2026-11-03）：`crates/xremail-sync/src/actor.rs`。
   - 一个账户一个 actor，彼此隔离（一个账户的服务器卡住不拖住另一个）
   - 调度后立即先同步一轮 → 按账户自己的 `poll_interval_secs` 轮询；
@@ -388,10 +402,12 @@ Gmail 将来有需求再开独立决策：授权流程、scope、个人使用与
 三家真实邮箱的 `UID STORE` 实测记录在 [PROTOCOLS.md](PROTOCOLS.md)。
 
 **下一批建议（更新于 2026-11-03）**：调度器、R13 的 panic 边界、
-`COPY` / `MOVE` 协议 + 假服务器支持、**移动/删除的写路径**均已完工。
-接下来依次是：**断线恢复（崩溃后对账）**、
-**`IDLE`**（先给假服务器补 `IDLE`）；
-它们比 HTML 正文渲染与 SMTP 都更接近核心可靠度。
+`COPY` / `MOVE` 协议 + 假服务器支持、**移动/删除的写路径**、
+**断线恢复（崩溃后对账）**均已完工。
+剩下最接近核心可靠度的两件是：
+**`IDLE`**（先给假服务器补 `IDLE`）、**断线重连**（`NO` / `BYE` 后重建会话，
+不是重启对账）；它们比 HTML 正文渲染与 SMTP（沃邮箱卡在静态 RSA 套件）
+都更贴近「开着就不掉线」这个目标。
 
 **已完成（2026-10-23）**：三家测试账号已准备并完成只读实测（凭据仅在本机配置）；
 只读 probe、假服务器、同步纯函数、同步引擎（拉取 + 回写 + 按需正文）、

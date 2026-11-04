@@ -36,12 +36,14 @@
 
 pub mod actor;
 pub mod body;
+pub mod boot;
 pub mod diff;
 pub mod epoch;
 pub mod intent;
 pub mod net;
 pub mod pull;
 pub mod push;
+pub mod reconcile;
 pub mod sync;
 pub mod transfer_push;
 
@@ -50,6 +52,7 @@ pub use actor::{
     Scheduler, WakeReason, system_clock,
 };
 pub use body::{fetch_body, read_body};
+pub use boot::boot_id;
 pub use diff::{UidDiff, UidSet, diff_uids};
 pub use epoch::{EpochTransition, PendingOperationBinding, StoredEpoch, plan_epoch_transition};
 pub use intent::{
@@ -57,6 +60,10 @@ pub use intent::{
     stale_intents,
 };
 pub use pull::{FolderSyncReport, flags_from_imap, pull_folder};
-pub use push::{FlagPushReport, push_flags};
-pub use sync::{SyncSummary, sync_account};
-pub use transfer_push::{TransferPushReport, push_transfers};
+pub use push::{FlagPushReport, push_flags, push_flags_as};
+pub use reconcile::{
+    MAX_OPERATION_ATTEMPTS, OperationObservation, ReconcileDecision, ReconcileReport,
+    plan_reconcile, reconcile_account, reconcile_account_as,
+};
+pub use sync::{SyncSummary, sync_account, sync_account_as};
+pub use transfer_push::{TransferPushReport, push_transfers, push_transfers_as};

@@ -133,12 +133,29 @@ fn move_route(has_move: bool, has_uidplus: bool, destination: &str) -> Route {
 /// 把某个文件夹里待提交的移动/删除意图回写到服务器。
 ///
 /// 流程与 [`crate::push_flags`] 同构：取未完结操作 → 隔离旧 epoch →
-/// 按能力选路由 → 发命令 → **回读确认** → 更新状态。
+/// **认领** → 按能力选路由 → 发命令 → **回读确认** → 更新状态。
+///
+/// 认领这一步的意义见 [`crate::push_flags`] 的同名说明：
+/// 它是唯一的提交权闸门，没认领到的方什么都不做且**不算失败**。
+/// 把某个文件夹里待提交的移动/删除意图回写到服务器。
+///
+/// 认领时用本进程的启动标识（[`crate::boot::boot_id`]）。
 pub async fn push_transfers(
     pool: &sqlx::SqlitePool,
     session: &mut Session,
     folder: &Folder,
     now_ms: i64,
+) -> AppResult<TransferPushReport> {
+    push_transfers_as(pool, session, folder, now_ms, crate::boot::boot_id()).await
+}
+
+/// 同 [`push_transfers`]，但显式指定认领归属。
+pub async fn push_transfers_as(
+    pool: &sqlx::SqlitePool,
+    session: &mut Session,
+    folder: &Folder,
+    now_ms: i64,
+    boot_id: &str,
 ) -> AppResult<TransferPushReport> {
     let mut report = TransferPushReport::default();
 
@@ -200,6 +217,22 @@ pub async fn push_transfers(
 
     // 5. 逐条提交。
     for op in &transfers {
+        // 认领：没抢到（或次数已到顶）就跳过。
+        //
+        // `MOVE` 不幂等（重发会多出一份），所以这道闸门在这里比在
+        // `push_flags` 里更要紧：宁可这轮不发，也不能发两遍。
+        if !operation::claim_for_push(
+            pool,
+            &op.id,
+            boot_id,
+            crate::reconcile::MAX_OPERATION_ATTEMPTS,
+            now_ms,
+        )
+        .await?
+        {
+            continue;
+        }
+
         let destination = match op.kind {
             OperationKind::Move => {
                 match destination_of(pool, op).await? {

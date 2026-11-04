@@ -421,20 +421,36 @@ pub async fn queue_for_sending(
     Ok(result.rows_affected() > 0)
 }
 
-/// 发送器取走一条：`queued` / `retryable` → `running`。
+/// 发送器取走一条：`queued` / `retryable` → `running`，并记下提交归属。
 ///
 /// 这是**唯一的发送权闸门**：两个发送器同时取同一条，
 /// 只有一个能改到行（另一个拿到 `false`）。
-pub async fn claim_for_sending(pool: &SqlitePool, id: &str, now_ms: i64) -> AppResult<bool> {
+///
+/// `owner_boot` 的作用见迁移 `0006_operation_owner.sql`：
+/// 进程死在 `running` 上之后，重启时要能区分「这条是残骸」与
+/// 「这条是另一个还活着的进程正在发的」，否则会把活件翻成「结果未知」。
+/// 同 [`claim_for_sending`]，但显式指定认领归属。
+///
+/// 需要模拟「上一次进程留下的行」的测试用它。
+pub async fn claim_for_sending(
+    pool: &SqlitePool,
+    id: &str,
+    boot_id: &str,
+    now_ms: i64,
+) -> AppResult<bool> {
     let result = sqlx::query!(
         r#"
         UPDATE send_queue
         SET state = 'running',
             attempts = attempts + 1,
+            started_at = ?,
+            owner_boot = ?,
             updated_at = ?
         WHERE id = ?
           AND state IN ('queued', 'retryable')
         "#,
+        now_ms,
+        boot_id,
         now_ms,
         id
     )
@@ -568,18 +584,34 @@ pub async fn mark_uncertain(
 /// 万一服务器已经收下了，用户就会收到两封。
 ///
 /// 宁可让人来看一眼，也不替服务器做这个判断。
-pub async fn reclaim_running(pool: &SqlitePool, account_id: &str, now_ms: i64) -> AppResult<usize> {
+///
+/// ## `owner_boot` 守卫
+///
+/// 只收「不是本 boot 留下的」行：另一个还活着的进程正在发的信不是残骸。
+/// `owner_boot IS NULL` 单独判——老数据没有归属，按「不是我的」处理，
+/// 否则升级上来的库永远收不到那批行。
+pub async fn reclaim_running(
+    pool: &SqlitePool,
+    account_id: &str,
+    boot_id: &str,
+    now_ms: i64,
+) -> AppResult<usize> {
     let result = sqlx::query!(
         r#"
         UPDATE send_queue
         SET state = 'uncertain',
             error_kind = 'interrupted',
             error_message = '上次发送过程中进程中断，结果未知',
+            owner_boot = NULL,
+            started_at = NULL,
             updated_at = ?
-        WHERE account_id = ? AND state = 'running'
+        WHERE account_id = ?
+          AND state = 'running'
+          AND (owner_boot IS NULL OR owner_boot <> ?)
         "#,
         now_ms,
-        account_id
+        account_id,
+        boot_id
     )
     .execute(pool)
     .await

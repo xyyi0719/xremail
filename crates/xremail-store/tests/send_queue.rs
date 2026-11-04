@@ -313,7 +313,11 @@ async fn sending_walks_the_documented_state_machine() {
     assert_eq!(back.message_id.as_deref(), Some("<m1@x>"));
 
     // queued → running → succeeded
-    assert!(send_queue::claim_for_sending(&pool, "s1", 2).await.unwrap());
+    assert!(
+        send_queue::claim_for_sending(&pool, "s1", "boot-a", 2)
+            .await
+            .unwrap()
+    );
     assert!(send_queue::mark_succeeded(&pool, "s1", 3).await.unwrap());
 
     let back = send_queue::get_entry(&pool, "s1").await.unwrap().unwrap();
@@ -335,8 +339,12 @@ async fn only_one_sender_can_claim_a_queued_message() {
         .unwrap();
 
     // 两个发送器同时取同一条：只有一个能改到行。
-    let first = send_queue::claim_for_sending(&pool, "s1", 2).await.unwrap();
-    let second = send_queue::claim_for_sending(&pool, "s1", 2).await.unwrap();
+    let first = send_queue::claim_for_sending(&pool, "s1", "boot-a", 2)
+        .await
+        .unwrap();
+    let second = send_queue::claim_for_sending(&pool, "s1", "boot-a", 2)
+        .await
+        .unwrap();
 
     assert!(first, "第一个发送器应该取到这封信");
     assert!(!second, "第二个发送器不该取到同一封信——那会发两遍");
@@ -354,7 +362,9 @@ async fn retryable_failure_can_be_claimed_again() {
     send_queue::queue_for_sending(&pool, "s1", b"bytes", "<m1@x>", 1)
         .await
         .unwrap();
-    send_queue::claim_for_sending(&pool, "s1", 2).await.unwrap();
+    send_queue::claim_for_sending(&pool, "s1", "boot-a", 2)
+        .await
+        .unwrap();
     assert!(
         send_queue::mark_retryable(&pool, "s1", "connection", "连不上", 3)
             .await
@@ -367,7 +377,11 @@ async fn retryable_failure_can_be_claimed_again() {
     assert!(back.message_bytes.is_some(), "重试要能拿到原来那份字节");
 
     // 可重试 → 再取一次（发同样的字节）。
-    assert!(send_queue::claim_for_sending(&pool, "s1", 4).await.unwrap());
+    assert!(
+        send_queue::claim_for_sending(&pool, "s1", "boot-a", 4)
+            .await
+            .unwrap()
+    );
     let back = send_queue::get_entry(&pool, "s1").await.unwrap().unwrap();
     assert_eq!(back.attempts, 2);
     assert_eq!(back.message_bytes.as_deref(), Some(&b"bytes"[..]));
@@ -386,7 +400,9 @@ async fn uncertain_message_is_not_auto_retryable() {
     send_queue::queue_for_sending(&pool, "s1", b"bytes", "<m1@x>", 1)
         .await
         .unwrap();
-    send_queue::claim_for_sending(&pool, "s1", 2).await.unwrap();
+    send_queue::claim_for_sending(&pool, "s1", "boot-a", 2)
+        .await
+        .unwrap();
     assert!(
         send_queue::mark_uncertain(&pool, "s1", "no_reply", "没收到应答", 3)
             .await
@@ -420,10 +436,16 @@ async fn interrupted_send_becomes_uncertain_not_retryable() {
     send_queue::queue_for_sending(&pool, "s1", b"bytes", "<m1@x>", 1)
         .await
         .unwrap();
-    send_queue::claim_for_sending(&pool, "s1", 2).await.unwrap();
+    send_queue::claim_for_sending(&pool, "s1", "boot-a", 2)
+        .await
+        .unwrap();
 
-    // 进程死在发信途中。
-    let reclaimed = send_queue::reclaim_running(&pool, "a1", 3).await.unwrap();
+    // 进程死在发信途中，下一次启动（boot-b）对账。
+    // 必须换一个 boot：同一个 boot 意味着「那个进程还活着」，不应被回收
+    // （见 `the_live_process_rows_are_not_reclaimed`）。
+    let reclaimed = send_queue::reclaim_running(&pool, "a1", "boot-b", 3)
+        .await
+        .unwrap();
     assert_eq!(reclaimed, 1);
 
     let back = send_queue::get_entry(&pool, "s1").await.unwrap().unwrap();
@@ -431,6 +453,38 @@ async fn interrupted_send_becomes_uncertain_not_retryable() {
         back.state,
         SendState::Uncertain,
         "中断的发送是「不知道」，不是「没发成功」——标成可重试就会重复投递"
+    );
+}
+
+#[tokio::test]
+async fn the_live_process_rows_are_not_reclaimed() {
+    // 这条钉的是 `owner_boot` 守卫的全部价值：
+    // 若启动时无条件扫所有 `running`，同一台机器上另一个**还活着**的进程
+    // 正在发的信会被翻成「结果未知」，用户白确认一次、还烧掉一次尝试配额。
+    let pool = fresh_pool().await;
+    account::upsert_account(&pool, &sample_account("a1"))
+        .await
+        .unwrap();
+
+    let entry = draft("s1", "a1");
+    send_queue::save_draft(&pool, &entry).await.unwrap();
+    send_queue::queue_for_sending(&pool, "s1", b"bytes", "<m1@x>", 1)
+        .await
+        .unwrap();
+    send_queue::claim_for_sending(&pool, "s1", "boot-a", 2)
+        .await
+        .unwrap();
+
+    let reclaimed = send_queue::reclaim_running(&pool, "a1", "boot-a", 3)
+        .await
+        .unwrap();
+    assert_eq!(reclaimed, 0, "自己认领的行不是残骸，不该被自己回收");
+
+    let back = send_queue::get_entry(&pool, "s1").await.unwrap().unwrap();
+    assert_eq!(
+        back.state,
+        SendState::Running,
+        "活着的发送应留在 running，被回收就变成白让人确认一次"
     );
 }
 
@@ -446,7 +500,9 @@ async fn user_can_explicitly_resend_an_uncertain_message_with_same_bytes() {
     send_queue::queue_for_sending(&pool, "s1", b"bytes", "<m1@x>", 1)
         .await
         .unwrap();
-    send_queue::claim_for_sending(&pool, "s1", 2).await.unwrap();
+    send_queue::claim_for_sending(&pool, "s1", "boot-a", 2)
+        .await
+        .unwrap();
     send_queue::mark_uncertain(&pool, "s1", "no_reply", "没收到应答", 3)
         .await
         .unwrap();
@@ -474,7 +530,11 @@ async fn state_transitions_only_apply_to_the_state_they_come_from() {
     send_queue::save_draft(&pool, &entry).await.unwrap();
 
     // 还在草稿态时，running 相关的迁移都不该生效。
-    assert!(!send_queue::claim_for_sending(&pool, "s1", 1).await.unwrap());
+    assert!(
+        !send_queue::claim_for_sending(&pool, "s1", "boot-a", 1)
+            .await
+            .unwrap()
+    );
     assert!(!send_queue::mark_succeeded(&pool, "s1", 1).await.unwrap());
     assert!(
         !send_queue::mark_failed(&pool, "s1", "e", "m", 1)

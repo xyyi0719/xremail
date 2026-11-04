@@ -44,11 +44,26 @@ pub struct SyncSummary {
 /// 同步一个账户的全部文件夹。
 ///
 /// `session` 必须是**已登录**的会话。
+///
+/// 认领时用本进程的启动标识（[`crate::boot::boot_id`]），
+/// 用来标记「这批待提交操作是我在发」（见迁移 `0006_operation_owner.sql`）。
+/// 它不参与同步语义，也不落日志。
 pub async fn sync_account(
     pool: &SqlitePool,
     session: &mut Session,
     account: &Account,
     now_ms: i64,
+) -> AppResult<SyncSummary> {
+    sync_account_as(pool, session, account, now_ms, crate::boot::boot_id()).await
+}
+
+/// 同 [`sync_account`]，但显式指定认领归属。
+pub async fn sync_account_as(
+    pool: &SqlitePool,
+    session: &mut Session,
+    account: &Account,
+    now_ms: i64,
+    boot_id: &str,
 ) -> AppResult<SyncSummary> {
     // 只支持隐式 TLS：不静默降级。
     if account.server.imap_tls != TlsMode::Implicit {
@@ -116,7 +131,7 @@ pub async fn sync_account(
                 //
                 // 这一步让 `retryable` 的操作有了自动重试的机会——
                 // 在此之前只有用户手动点一下才会回写，失败一次就永远躺着。
-                flush_pending(pool, session, &folder, now_ms).await;
+                flush_pending(pool, session, &folder, now_ms, boot_id).await;
             }
             Err(error) => {
                 tracing::warn!(
@@ -137,7 +152,13 @@ pub async fn sync_account(
 /// 失败**不影响**拉取结果：发不出去就留在队列里，下一轮再试。
 /// 这里刻意不向上抛错：一个文件夹提交不了不该让整轮同步失败，
 /// 更不该把已拉回来的数据丢掉。
-async fn flush_pending(pool: &SqlitePool, session: &mut Session, folder: &Folder, now_ms: i64) {
+async fn flush_pending(
+    pool: &SqlitePool,
+    session: &mut Session,
+    folder: &Folder,
+    now_ms: i64,
+    boot_id: &str,
+) {
     // 重新读一遍：`pull_folder` 可能刚换过 epoch。
     let fresh = match folder_dao::get_folder(pool, &folder.id).await {
         Ok(Some(fresh)) => fresh,
@@ -148,7 +169,7 @@ async fn flush_pending(pool: &SqlitePool, session: &mut Session, folder: &Folder
         }
     };
 
-    match crate::push::push_flags(pool, session, &fresh, now_ms).await {
+    match crate::push::push_flags_as(pool, session, &fresh, now_ms, boot_id).await {
         Ok(report) if !report.is_noop() => tracing::debug!(
             folder = %fresh.remote_name,
             succeeded = report.succeeded,
@@ -165,7 +186,7 @@ async fn flush_pending(pool: &SqlitePool, session: &mut Session, folder: &Folder
         ),
     }
 
-    match crate::transfer_push::push_transfers(pool, session, &fresh, now_ms).await {
+    match crate::transfer_push::push_transfers_as(pool, session, &fresh, now_ms, boot_id).await {
         Ok(report) if !report.is_noop() => tracing::debug!(
             folder = %fresh.remote_name,
             moved = report.moved,

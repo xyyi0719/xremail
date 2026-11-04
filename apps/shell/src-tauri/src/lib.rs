@@ -117,6 +117,52 @@ fn init_storage(app: &tauri::AppHandle) -> Result<AppState, Box<dyn std::error::
         Ok::<_, xremail_core::AppError>(pool)
     })?;
 
+    // 启动对账：把上一次进程死在 `running` 上的行收成 `uncertain`。
+    //
+    // 为什么必须在**这里**做，而不只依赖调度器：
+    // 调度器只对「已交给它调度」的账户跑（目前靠用户主动触发），
+    // 而崩溃恢复必须对**每个**账户都发生——否则那些没被调度的账户，
+    // 其残骸会永久停在 `running`，谁也推不动它。
+    //
+    // **尽力而为**：对账失败不拦启动。它只是「整理上次的残骸」，
+    // 失败最坏的结果是那几行多停一轮，下一轮同步或下次启动会再收一遍
+    // （`reconcile_account` 幂等）。
+    tauri::async_runtime::block_on(async {
+        let accounts = match xremail_store::dao::account::list_accounts(&pool).await {
+            Ok(accounts) => accounts,
+            Err(error) => {
+                tracing::warn!(%error, "启动对账：读账户失败");
+                return;
+            }
+        };
+
+        for account in accounts {
+            match xremail_sync::reconcile_account(
+                &pool,
+                &account.id,
+                crate::service::current_time_ms(),
+            )
+            .await
+            {
+                Ok(report) if !report.is_noop() => {
+                    tracing::info!(
+                        account = %account.email,
+                        reclaimed_operations = report.reclaimed_operations,
+                        reclaimed_sends = report.reclaimed_sends,
+                        expired = report.expired,
+                        quarantined = report.quarantined,
+                        failed_orphans = report.failed_orphans,
+                        "启动对账：收掉上次进程留下的残骸"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, account = %account.email, "启动对账失败");
+                }
+            }
+        }
+    });
+
     Ok(AppState::new(
         data_dir,
         AccountService::new(pool.clone()),

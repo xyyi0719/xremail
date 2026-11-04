@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        UPDATE send_queue\n        SET state = 'uncertain',\n            error_kind = 'interrupted',\n            error_message = '上次发送过程中进程中断，结果未知',\n            owner_boot = NULL,\n            started_at = NULL,\n            updated_at = ?\n        WHERE account_id = ?\n          AND state = 'running'\n          AND (owner_boot IS NULL OR owner_boot <> ?)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "2a7f2c401ab68e4f343481ee7fe25fad6c68614a4b87ddade27319509baf3c9f"
+}

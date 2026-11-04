@@ -1,6 +1,10 @@
 # ---- Rust ----
 /target
 **/target/
+
+# `cargo sqlx prepare` 用的临时数据库（见 docs/DEVELOPMENT 或 CI 脚本）。
+# 它只是迁移应用后的空库，用于编译期校验 SQL，随时可重建。
+/.sqlx-prep/
 *.rs.bk
 *.pdb
 *.rlib

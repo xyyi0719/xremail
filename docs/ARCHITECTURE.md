@@ -163,14 +163,48 @@ UIDVALIDITY 不得为 0（RFC 3501），收到 0 视为协议错误。
 `mail_operation` / `send_queue` 对邮件只做**逻辑引用**（不设外键）：epoch 切换后旧 UID 失效，
 这些操作应被隔离并保留冲突原因，而不是随邮件一起被级联删除。
 
-## 5. 本地操作与恢复
+### 4.4 启动对账（崩溃恢复）
+
+进程可能在**任何**时刻死掉（断电、崩溃、被系统杀掉），而死的位置决定了服务器上
+到底发生了什么：死在**发命令之前**可以安全重放，死在**发出之后、收到确认之前**
+重放就是重复执行。本地唯一能观测到的是「这一行是不是还停在 `running`」。
+
+所以对账的目标**不是猜服务器做了什么**，而是把没人负责的行标成没人负责，
+交给下一轮的回读确认去核对（`push_flags` / `push_transfers` 天然幂等）。
+
+**实现落点（2026-11-03，`crates/xremail-sync/src/reconcile.rs`）**：
+
+* **按 boot 归属回收**。`running` 只说明有人认领了，不说明认领者还活着。
+  认领时写 `owner_boot`（迁移 `0006_operation_owner.sql`，`claim_for_push` /
+  `claim_for_sending`），对账只收 `owner_boot IS NULL OR owner_boot <> 本次 boot` 的行；
+  `IS NULL` 单独判是因为升级上来的老数据没有归属，按「不是我的」处理。
+  没有这层守卫，同一台机器上另一个**还活着**的进程的存途行会被翻成「结果未知」。
+* **先回收、后判过期——顺序本身是语义**。反过来的话，一条属于上次进程、
+  次数也已到顶的 `running` 会被 `expire_exhausted` 的状态过滤（`queued` /
+  `retryable` / `uncertain`）漏掉，永远卡在 `running`：既没人推它，也没人报错。
+* **`uncertain` 绝不改回 `queued` / `retryable`**。那等于替服务器判断「上次没执行」，
+  而那正是我们不知道的事；唯一能改它的是**人的显式决定**
+  （与 `send_queue::retry_uncertain` 同一套哲学，见 §5）。
+* **只碰操作队列的状态与错误字段，不碰 `message`**。邮件本身的标记由回读对齐，
+  对账不能凭空造第二套真相。
+* **同时收掉的残骸**：孤儿操作（文件夹已删 → `folder_missing`；移动目标已删 →
+  `destination_missing`）、绑定旧 epoch 的操作（→ `epoch_changed`，与 §4.3 一致）。
+* **幂等**。触发点是应用启动（`apps/shell/src-tauri/src/lib.rs:140`）——
+  **必须**在这里做而不是只靠调度器：调度器只对「已交给它调度」的账户跑，
+  而崩溃恢复必须对**每个**账户都发生。幂等是为了容忍重复调用，
+  **不是**因为现在已经有两处触发点（目前只有启动一处）。
+  **未做**：actor 的 `Startup` 轮还没调它。
+* 纯函数 `plan_reconcile` 把「观测 → 决定」从 IO 里拆出来，可单测；
+  `reconcile_account_as` 是执行的壳。
+* 用例：`crates/xremail-sync/tests/crash_recovery.rs` 11 个（含「活着的进程的行不动」
+  「次数到顶的 `running` 先回收再判死」「幂等」三条关键的）。
 
 将队列分为 **mail_operation**（flag/move/delete/append）与 **send_queue**（SMTP）。名称可在迁移时定稿，避免一个模糊 outbox 混淆语义。
 
 - 一次本地命令在同事务内写操作意图与本地投影；提交后返回/发事件。
 - UI 可立即显示带 pending 标识的本地结果，不能把它显示为服务器确认。
 - 状态至少区分 queued、running、succeeded、retryable、failed、uncertain；具体枚举在实现时通过测试固定。
-- 记录操作 ID、目标身份/epoch、基线版本、attempts、错误类别。进程中断的 running 必须按操作类型核对，而非一律重放。
+- 记录操作 ID、目标身份/epoch、基线版本、attempts、错误类别。进程中断的 running 必须按操作类型核对，而非一律重放（启动对账怎么收残骸见 §4.4）。
 
 | 操作 | 重试原则 |
 |---|---|
@@ -184,10 +218,11 @@ Message-ID、稳定操作 ID 有助于排查，但不能保证 SMTP 去重。明
 **实现落点（2026-10-23，后经 2026-11-03 核实修正）**：状态枚举已定在 `xremail-core::model::OperationState`
 （六态，取值与 `mail_operation.state` 列一致）；`xremail-store::dao::operation` 提供入队、
 列未完结操作、更新状态。**已实现的类别**：flag（2026-10-26）、append（2026-10-30，发信存副本）、
-SMTP（2026-10-28，`send_queue` 独立队列）。**协议层已就绪、队列尚未定义**：move / delete
-——`crates/xremail-protocol-imap/src/transfer.rs` 已提供 `copy_messages` / `move_messages` /
-`mark_deleted` / `uid_expunge` 与假服务器支持（2026-11-03），
-但 `OperationKind` 仍只有 `flags` 一种，加 move 需要先给 `mail_operation` 加目标文件夹。
+move / delete（2026-11-03）、SMTP（2026-10-28，`send_queue` 独立队列）。
+`OperationKind` 三值：`flags` / `move` / `delete`（`crates/xremail-core/src/model.rs:463`），
+移动的目标文件夹记在 `MailOperation::destination_folder_id`（迁移 `0005_operation_destination.sql`）；
+协议层 `crates/xremail-protocol-imap/src/transfer.rs` 提供 `copy_messages` / `move_messages` /
+`mark_deleted` / `uid_expunge` 与假服务器支持。
 
 **实现落点（2026-10-26）**：flag 类操作**已真正回写服务器**。
 链路：`MessageService::set_flag_intent` 先落一条 `mail_operation`（`queued`）→
