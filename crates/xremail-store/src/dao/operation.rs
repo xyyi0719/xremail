@@ -25,14 +25,49 @@
 //!
 //! `uncertain` 尤其重要：命令发出去了但没收到确认，
 //! **不能盲目重试**——可能已经执行过了。
+//!
+//! ## 闸门是「每封邮件」，不是「每条操作」
+//!
+//! 移动 / 删除类（`OperationKind::Move` / `OperationKind::Delete`）有两条
+//! **每封邮件级**的约束，两层合起来才顶用（R34）：
+//!
+//! 1. **入队去重**（[`enqueue_operation`]）：同一封邮件已有未完结的同通道操作时不再
+//!    插入第二条——挡住「同一动作被点了两次」。
+//! 2. **认领互斥**（[`claim_for_push`]）：同一时刻只放行一条 `running`——挡住两条
+//!    flush 并发时各认领一条、各发一次 `MOVE`（目标文件夹里出两份）。
+//!
+//! 只有第 1 层不够：两条 flush 可能同时认领**不同**的行（历史遗留的重复行就摆在库里）。
+//! 只有第 2 层也不够：重复行会一直留在队列里，一条做完另一条再去碰一封已经不存在的邮件。
+//!
+//! flag 通道（`OperationKind::Flags`）**不参与**这两条约束：它有自己的合并逻辑
+//! （按 `seq` 定序、以服务器快照为准，见 [ARCHITECTURE §6](../../../../docs/ARCHITECTURE.md)），
+//! 多行 flag 意图叠在一起是合法的。
 
 use sqlx::FromRow;
 use sqlx::SqlitePool;
-use xremail_core::AppResult;
+use xremail_core::{AppError, AppResult};
 use xremail_core::model::{FlagIntentPayload, MailOperation, OperationKind, OperationState};
 
 use crate::codec::{addresses_from_json, addresses_to_json, enum_from_text, enum_to_text};
 use crate::error::map_sqlx;
+
+/// `enqueue_operation` 撞上 `idx_mail_operation_seq` 唯一索引时的重试次数。
+///
+/// 并发取 `MAX(seq) + 1` 有两处会撞：另一个入队者先提交了同一个 `seq`
+/// （唯一索引兜住），或者自己升级写锁时拿到 `SQLITE_BUSY_SNAPSHOT`。
+/// 两种都不是**数据**错误，是「再来一次就好」，所以重试；
+/// 用尽仍失败时按 `Storage`（可重试）报错，不 panic、不静默丢意图。
+const ENQUEUE_SEQ_RETRIES: u32 = 8;
+
+/// 移动 / 删除通道的 `kind` 取值：**每封邮件同时只能有一条在途**的判定依据。
+///
+/// 两个 `kind` 都是「把这封信从源文件夹搬走」的意图——不管目标是另一个文件夹
+/// 还是垃圾箱。同一封邮件上排两条，并发 flush 时就会各发一次 `MOVE`
+/// （没有 `MOVE` 的服务器上是 `COPY` + `STORE \Deleted`），目标里多出两份。
+///
+/// flag 通道**刻意不在**这里：它的载荷可以安全地叠在一起（按 `seq` 定序、
+/// 以服务器快照重算净变化），强行合并反而会丢掉用户的意图。
+const TRANSFER_KIND_VALUES: &str = "'move', 'delete'";
 
 /// `mail_operation` 表的一行。
 #[derive(Debug, Clone, FromRow)]

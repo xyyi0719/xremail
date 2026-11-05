@@ -314,15 +314,12 @@ pub async fn push_flags_as_with_options(
             Err(SubmitError::Uncertain { message }) => {
                 report.uncertain += 1;
                 for op in &claimed {
-                    operation::update_operation_state(
-                        pool,
-                        &op.id,
-                        OperationState::Uncertain,
-                        Some("unknown"),
-                        Some(&message),
-                        now_ms,
-                    )
-                    .await?;
+                    // 必须走 `mark_operation_uncertain` 而不是 `update_operation_state`（R26）：
+                    // 只有它会自增 `attempts`，而认领条件里有 `attempts < ?`。
+                    // 不自增 = 这条永远可以被重新认领 = 每轮同步都重发一次命令，
+                    // 「最多试 N 次就停」的上限永远到不了顶。
+                    operation::mark_operation_uncertain(pool, &op.id, "unknown", &message, now_ms)
+                        .await?;
                 }
             }
             Err(SubmitError::Failed { message }) => {

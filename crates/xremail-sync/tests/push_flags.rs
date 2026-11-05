@@ -415,6 +415,18 @@ async fn connection_loss_is_uncertain() {
             .unwrap();
     assert_eq!(count, 1);
 
+    // R26：`uncertain` 出口必须累加 `attempts`。
+    //
+    // 不累加的话，认领条件里的 `attempts < ?` 永远成立：每轮同步都会重新认领、
+    // 重新发一次 `STORE`（对 `MOVE` 就是每轮搬一次），「最多试 N 次」形同虚设。
+    // 这里直接读库里的 `attempts`：DAO 没有暴露读取单行计数的接口，
+    // 而这条用例要钉的恰恰是**库里的数**。
+    let attempts: i64 = sqlx::query_scalar("SELECT attempts FROM mail_operation LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(attempts, 1, "一次「结果未知」就该算一次尝试");
+
     fixture.server.shutdown().await;
 }
 
