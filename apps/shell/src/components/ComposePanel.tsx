@@ -316,13 +316,21 @@ function formatDateTime(ts: number): string {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
 
-/** 「再发一次」的二次确认。 */
-const RESEND_CONFIRM: PendingConfirm = {
-  kind: "resend",
-  title: "确认再发一次？",
-  text: "服务器没有确认这封信有没有送到。再发一次会真的发出一封新邮件——如果对方其实已经收到了第一封，他会收到两封。",
-  confirmLabel: "确认再发一次",
-};
+/**
+ * 「再发一次」的二次确认。
+ *
+ * 这里说的是**原来那封**再提交一次（Message-ID 不变），
+ * 不是另写一封新的——见 `confirmResend`。
+ */
+function resendConfirm(entryId: string): PendingConfirm {
+  return {
+    kind: "resend",
+    entryId,
+    title: "确认再发一次？",
+    text: "服务器没有确认这封信有没有送到。再发一次会把原来这封原样再提交一遍：如果对方其实已经收到了第一封，他会收到两封。",
+    confirmLabel: "确认再发一次",
+  };
+}
 
 /**
  * 「撤回来改」的二次确认。
@@ -802,12 +810,70 @@ function ComposePanel({ accountId, accountEmail, onClose }: Props) {
     [refreshDrafts],
   );
 
+  /**
+   * 「再发一次」：把**原来那封**未确认的信原样再提交一次。
+   *
+   * 注意这**不是** `handleSend({ fresh: true })`：那条路会新写一封草稿、
+   * 生成新的 Message-ID，于是对方可能收到两封**内容一样但来路不同**的信，
+   * 而且旧那封还挂在「未确认」名单里没人管。
+   * 走 `resend_uncertain` 则复用当初冻结的那份字节，Message-ID 不变。
+   */
+  const confirmResend = useCallback(
+    async (entryId: string) => {
+      setPendingConfirm(null);
+      setSending(true);
+      setFormError(null);
+      try {
+        const result = await invoke<SendResult>("resend_uncertain", {
+          entryId,
+        });
+        const next = describeSendResult(result);
+        setOutcome(next);
+        if (next.kind === "sent") {
+          // 这回服务器确认了：这封从「未确认」名单里拿掉。
+          setPendingUncertain((prev) => prev.filter((one) => one !== entryId));
+          setSent(true);
+          draftIdRef.current = null;
+          setActiveDraftId(null);
+          void refreshDrafts();
+        } else if (next.kind === "uncertain") {
+          // 还是没确认：名字照旧挂着，等用户再决定（再发 / 撤回）。
+          setPendingUncertain((prev) =>
+            prev.includes(entryId) ? prev : [...prev, entryId],
+          );
+        } else {
+          // 这次服务器明确拒绝了：这封**没出去**，留在名单里没意义，
+          // 让用户改完重发；同时把「撤回来改」留给它（失败的信也能撤回）。
+          setPendingUncertain((prev) => prev.filter((one) => one !== entryId));
+        }
+      } catch (e) {
+        // 命令直接失败 = 这次没有投递成功；原条目状态没准没动，
+        // 所以留在名单里，用户还能「撤回来改」。
+        setOutcome({
+          kind: "failed",
+          text: "再发一次失败",
+          detail: String(e),
+          messageId: null,
+          entryId,
+        });
+      } finally {
+        setSending(false);
+      }
+    },
+    [refreshDrafts],
+  );
+
   /** 二次确认框里的「确认」。 */
   const handleConfirmYes = useCallback(async () => {
     const pending = pendingConfirm;
     if (pending?.kind === "resend") {
-      setPendingConfirm(null);
-      await handleSend({ fresh: true });
+      const entryId = pending.entryId ?? outcome?.entryId ?? null;
+      if (entryId === null) {
+        setPendingConfirm(null);
+        setFormError("拿不到这封信的编号，没法再发一次");
+        return;
+      }
+      await confirmResend(entryId);
       return;
     }
     if (pending?.kind === "withdraw") {
@@ -819,7 +885,7 @@ function ComposePanel({ accountId, accountEmail, onClose }: Props) {
       }
       await confirmWithdraw(entryId);
     }
-  }, [pendingConfirm, outcome, handleSend, confirmWithdraw]);
+  }, [pendingConfirm, outcome, confirmResend, confirmWithdraw]);
 
   /** 还有没发出去的改动吗？ */
   const dirty = !isEmptyForm(form) && !sent;
@@ -853,13 +919,16 @@ function ComposePanel({ accountId, accountEmail, onClose }: Props) {
   const bccWarnings = addressWarnings(form.bcc);
 
   /**
-   * 除了当前这封之外、还挂着的未确认条目。
+   * 还挂着、但**当前结果区没在展示**的未确认条目。
    *
-   * 「再发一次」会发出新的一封，于是未确认的条目可能不止一个；
-   * 之前那封也得能撤回（不然用户只能看着它悬着）。
+   * 结果区正在展示的那封，它的「撤回来改」按钮在上面（跟「再发一次」并排）；
+   * 其余每一封都得能单独撤回（不然用户只能看着它悬着）。
+   * 「再发一次」之后结果区可能换成别的结果（比如「再发一次失败」），
+   * 那原来那封就落到下面这个名单里，所以这里比的是**名单里有没有**，
+   * 而不是跟 `outcome.entryId` 比。
    */
   const otherUncertain = pendingUncertain.filter(
-    (entryId) => entryId !== outcome?.entryId,
+    (entryId) => entryId !== outcome?.entryId || outcome.kind !== "uncertain",
   );
 
   return (
@@ -1158,7 +1227,14 @@ function ComposePanel({ accountId, accountEmail, onClose }: Props) {
                   type="button"
                   className="compose-uncertain-button"
                   aria-label="再发一次"
-                  onClick={() => setPendingConfirm(RESEND_CONFIRM)}
+                  onClick={() => {
+                    const entryId = outcome.entryId;
+                    if (!entryId) {
+                      setFormError("拿不到这封信的编号，没法再发一次");
+                      return;
+                    }
+                    setPendingConfirm(resendConfirm(entryId));
+                  }}
                 >
                   再发一次
                 </button>

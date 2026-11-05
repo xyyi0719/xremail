@@ -88,6 +88,7 @@ pub fn run() {
             cmd::get_draft,
             cmd::withdraw_draft,
             cmd::send_message,
+            cmd::resend_uncertain,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Xremail application")

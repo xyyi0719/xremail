@@ -51,7 +51,7 @@ describe("发送结果不确定时的二次确认", () => {
     expect(screen.getByRole("button", { name: "撤回来改" })).toBeInTheDocument();
   });
 
-  it("「再发一次」要先确认，确认之后才真的再发一封", async () => {
+  it("「再发一次」要先确认，确认之后走 resend_uncertain，而不是新写一封", async () => {
     const backend = backendWithAccount();
     backend.sendState = "uncertain";
     const { user } = await renderApp(backend);
@@ -66,12 +66,90 @@ describe("发送结果不确定时的二次确认", () => {
     const confirm = screen.getByTestId("compose-confirm");
     expect(confirm).toHaveTextContent("两封");
     // 还没确认 → 没有再发。
+    expect(backend.callsTo("resend_uncertain")).toHaveLength(0);
     expect(backend.callsTo("send_message")).toHaveLength(1);
 
+    // 这次让后端回「已发送」。
+    backend.resendState = "sent";
     await user.click(screen.getByRole("button", { name: "确认再发一次" }));
     await settle();
 
-    expect(backend.callsTo("send_message")).toHaveLength(2);
+    // 走的是「把原来那封再提交一次」，带的就是原来那封的条目 id。
+    const resends = backend.callsTo("resend_uncertain");
+    expect(resends).toHaveLength(1);
+    expect(resends[0].args.entryId).toBe("entry-1");
+    // 没有新写一封信：send_message 仍然只有最初那一次。
+    expect(backend.callsTo("send_message")).toHaveLength(1);
+    expect(backend.sentDrafts).toHaveLength(1);
+
+    // 结果改成「已发送」，且 Message-ID 就是原来那封的。
+    const result = screen.getByTestId("compose-send-result");
+    expect(result).toHaveTextContent("已发送");
+    expect(result).toHaveTextContent("<sent-1@example.com>");
+    // 名单里没有了，也没有「另外还有 N 封」的提示。
+    expect(
+      screen.queryByTestId("compose-uncertain-pending"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "撤回来改" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("「再发一次」之后仍然不确定时，这封留在未确认名单里", async () => {
+    const backend = backendWithAccount();
+    backend.sendState = "uncertain";
+    backend.resendState = "uncertain";
+    const { user } = await renderApp(backend);
+    await openCompose(user);
+
+    await sendUncertain(user);
+    await user.click(screen.getByRole("button", { name: "再发一次" }));
+    await settle();
+    await user.click(screen.getByRole("button", { name: "确认再发一次" }));
+    await settle();
+
+    expect(backend.callsTo("resend_uncertain")).toHaveLength(1);
+    expect(backend.callsTo("send_message")).toHaveLength(1);
+
+    // 还是不确定：结果区仍是「不确定」，两个动作都还在。
+    const result = screen.getByTestId("compose-send-result");
+    expect(result).toHaveTextContent("不确定");
+    expect(screen.getByRole("button", { name: "再发一次" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "撤回来改" })).toBeInTheDocument();
+
+    // 这封仍然能单独撤回（说明它还在名单里）。
+    await user.click(screen.getByRole("button", { name: "撤回来改" }));
+    await settle();
+    await user.click(screen.getByRole("button", { name: "确认撤回来" }));
+    await settle();
+    expect(backend.callsTo("withdraw_draft")[0].args.entryId).toBe("entry-1");
+  });
+
+  it("「再发一次」被后端拒绝时报失败，并保留「撤回来改」入口", async () => {
+    const backend = backendWithAccount();
+    backend.sendState = "uncertain";
+    backend.resendError = new Error("这封信正在被另一个发送器处理，请稍后再试");
+    const { user } = await renderApp(backend);
+    await openCompose(user);
+
+    await sendUncertain(user);
+    await user.click(screen.getByRole("button", { name: "再发一次" }));
+    await settle();
+    await user.click(screen.getByRole("button", { name: "确认再发一次" }));
+    await settle();
+
+    const result = screen.getByTestId("compose-send-result");
+    expect(result).toHaveTextContent("再发一次失败");
+    expect(result).toHaveTextContent("请稍后再试");
+    expect(backend.callsTo("send_message")).toHaveLength(1);
+
+    // 失败的结果区只有「改完再点发送」那个入口；
+    // 撤回来改挂在下面的「未确认」名单里（这封其实还是没确认）。
+    await user.click(screen.getByRole("button", { name: "撤回来改 entry-1" }));
+    await settle();
+    await user.click(screen.getByRole("button", { name: "确认撤回来" }));
+    await settle();
+    expect(backend.callsTo("withdraw_draft")[0].args.entryId).toBe("entry-1");
   });
 
   it("「再发一次」取消后不会重发", async () => {
@@ -88,6 +166,7 @@ describe("发送结果不确定时的二次确认", () => {
     await settle();
 
     expect(backend.callsTo("send_message")).toHaveLength(1);
+    expect(backend.callsTo("resend_uncertain")).toHaveLength(0);
     expect(screen.queryByTestId("compose-confirm")).not.toBeInTheDocument();
   });
 
@@ -132,9 +211,10 @@ describe("发送结果不确定时的二次确认", () => {
     expect(screen.getByTestId("compose-send-result")).toBeInTheDocument();
   });
 
-  it("「再发一次」之后，之前那封未确认的信也能单独撤回", async () => {
+  it("「再发一次」之后仍然不确定时，单独撤回会撤到原来那一封", async () => {
     const backend = backendWithAccount();
     backend.sendState = "uncertain";
+    backend.resendState = "uncertain";
     const { user } = await renderApp(backend);
     await openCompose(user);
 
@@ -144,12 +224,14 @@ describe("发送结果不确定时的二次确认", () => {
     await user.click(screen.getByRole("button", { name: "确认再发一次" }));
     await settle();
 
-    // 现在有两封结果未确认（entry-1 与 entry-2）。
-    const pending = screen.getByTestId("compose-uncertain-pending");
-    expect(pending).toHaveTextContent("1 封结果未确认");
+    // 再提交一次没有产生新的一封（Message-ID 不变），
+    // 所以名单里还是同一封，结果区仍然是不确定。
+    expect(backend.callsTo("resend_uncertain")).toHaveLength(1);
+    expect(screen.getByTestId("compose-send-result")).toHaveTextContent(
+      "不确定",
+    );
 
-    // 之前那封（entry-1）要能单独撤回。
-    await user.click(screen.getByRole("button", { name: "撤回来改 entry-1" }));
+    await user.click(screen.getByRole("button", { name: "撤回来改" }));
     await settle();
     await user.click(screen.getByRole("button", { name: "确认撤回来" }));
     await settle();
@@ -157,6 +239,9 @@ describe("发送结果不确定时的二次确认", () => {
     const calls = backend.callsTo("withdraw_draft");
     expect(calls).toHaveLength(1);
     expect(calls[0].args.entryId).toBe("entry-1");
+    // 撤回之后它变回草稿，可以接着改。
+    expect(screen.queryByTestId("compose-send-result")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("正文")).not.toBeDisabled();
   });
 
   it("明确失败与不确定的文案分得清", async () => {

@@ -45,6 +45,17 @@ export interface BackendOptions {
   sendDetail?: string | null;
   /** `send_message` 抛这个错。 */
   sendError?: Error | null;
+  /**
+   * `resend_uncertain` 返回的状态。
+   *
+   * 默认跟着 `sendState` 走（再提交一次的结果通常和刚才一样）；
+   * 想在「再发一次」之后换成别的结果，单独设它。
+   */
+  resendState?: SendResult["state"];
+  /** `resend_uncertain` 返回的说明。 */
+  resendDetail?: string | null;
+  /** `resend_uncertain` 抛这个错。 */
+  resendError?: Error | null;
   /** `save_draft` 抛这个错。 */
   saveDraftError?: Error | null;
   /**
@@ -84,6 +95,12 @@ export interface Backend {
   sendDetail: string | null;
   /** `send_message` 抛这个错。 */
   sendError: Error | null;
+  /** `resend_uncertain` 返回的状态。 */
+  resendState: SendResult["state"];
+  /** `resend_uncertain` 返回的说明。 */
+  resendDetail: string | null;
+  /** `resend_uncertain` 抛这个错。 */
+  resendError: Error | null;
   /** `save_draft` 抛这个错。 */
   saveDraftError: Error | null;
   /** 已经存过的草稿（按 `list_drafts` 的口径存着）。 */
@@ -176,6 +193,9 @@ export function createBackend(options: BackendOptions = {}): Backend {
     sendState: options.sendState ?? "sent",
     sendDetail: options.sendDetail ?? null,
     sendError: options.sendError ?? null,
+    resendState: options.resendState ?? options.sendState ?? "sent",
+    resendDetail: options.resendDetail ?? null,
+    resendError: options.resendError ?? null,
     saveDraftError: options.saveDraftError ?? null,
     drafts: [],
     draftDetails: new Map<string, DraftDetail>(),
@@ -353,6 +373,28 @@ export function createBackend(options: BackendOptions = {}): Backend {
         state: backend.sendState,
         detail:
           backend.sendDetail ?? DEFAULT_SEND_DETAIL[backend.sendState],
+      };
+    },
+    // 「再发一次」：把原来那封**原样再提交一次**（不是新写一封）。
+    // 所以条目数不变、Message-ID 不变，只更新那一条的状态。
+    resend_uncertain: (args) => {
+      if (backend.resendError) {
+        throw backend.resendError;
+      }
+      const entryId = String(args.entryId);
+      const entry = backend.sentEntries.find((one) => one.entryId === entryId);
+      if (!entry) {
+        // 真实后端：`发信记录 {id} 不存在`。
+        throw new Error(`发信记录 ${entryId} 不存在`);
+      }
+      entry.state = backend.resendState;
+      // 条目 id 里带着它当初是第几封，用来自洽地造出同一个 Message-ID。
+      return {
+        messageId: `<sent-${entryId.replace(/^entry-/, "")}@example.com>`,
+        entryId,
+        state: backend.resendState,
+        detail:
+          backend.resendDetail ?? DEFAULT_SEND_DETAIL[backend.resendState],
       };
     },
     // 撤回一封发出去的信：它变回可编辑的草稿。

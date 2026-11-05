@@ -781,6 +781,47 @@ pub async fn withdraw_draft(state: State<'_, AppState>, entry_id: String) -> Res
         .map_err(|e| user_error(&e))
 }
 
+/// 把一封「结果未确认」的信**原样再提交一次**（「再发一次」）。
+///
+/// 和 [`send_message`] 的区别是**发的是什么**：
+/// 这条重提交的是库里**冻结的那份字节**（`Message-ID` 不变），
+/// 而 `send_message` 会重新构建一封新信（新 `Message-ID`）——
+/// 后者在「对方其实已经收到第一封」时会变成两封对端认不出来的重信。
+///
+/// **必须由用户确认**（前端弹二次确认）。返回形状与 [`send_message`] 一致，
+/// 所以前端可以用同一套 `describeSendResult` 翻译三种结局：
+/// 再提交之后依然可能是 `uncertain`（服务器这次又没给应答）。
+#[tauri::command]
+pub async fn resend_uncertain(
+    state: State<'_, AppState>,
+    entry_id: String,
+) -> Result<SendResult, String> {
+    // 账户 id 由**库里那条记录**决定，不信前端传的：
+    // 前端手里只有条目 id，账户是这条发信记录的属性。
+    let entry = xremail_store::dao::send_queue::get_entry(state.pool(), &entry_id)
+        .await
+        .map_err(|e| user_error(&e))?
+        .ok_or_else(|| format!("发信记录 {entry_id} 不存在"))?;
+
+    let account = state
+        .accounts
+        .get(&entry.account_id)
+        .await
+        .map_err(|e| user_error(&e))?
+        .ok_or_else(|| format!("账户 {} 不存在", entry.account_id))?;
+
+    // 凭据：内存里的优先，没有再去平台钥匙串取（和发信同一条口径）。
+    let Some(credential) = resolve_credential(&state, &account).await? else {
+        return Err("还没有这个账户的授权码，请先保存后再发送".to_string());
+    };
+
+    state
+        .compose
+        .resend_uncertain(&entry.account_id, &entry_id, &credential)
+        .await
+        .map_err(|e| user_error(&e))
+}
+
 /// 发送一封信。
 ///
 /// 返回值把三种结局分开说（`sent` / `uncertain` / `failed`），

@@ -16,6 +16,7 @@
 
 use sqlx::SqlitePool;
 use xremail_api::{NewAccountRequest, SecretValue};
+use xremail_core::AppError;
 use xremail_core::model::{ProviderKind, SendState, SmtpAuth, SyncMode, TlsMode};
 use xremail_protocol_imap::TlsTrust as ImapTlsTrust;
 use xremail_protocol_smtp::TlsTrust;
@@ -610,6 +611,89 @@ async fn an_uncertain_send_can_be_withdrawn_back_to_a_draft() {
         .await
         .unwrap();
     assert_eq!(drafts.len(), 1);
+
+    server.shutdown().await;
+}
+
+// ------------------------------------------------------ 再发一次（R30）
+
+#[tokio::test]
+async fn an_uncertain_send_is_resubmitted_with_the_same_message_id() {
+    // 第一轮：服务器收完 DATA 不回应答 → 结果未确认。
+    let (fixture, server) = Fixture::with_server(secure_config().dropping_data_response()).await;
+
+    let first = fixture
+        .service
+        .send(&draft(&fixture.account_id), &credential())
+        .await
+        .expect("首轮发送失败");
+    assert_eq!(first.state, SendResultState::Uncertain);
+    let frozen = fixture.stored().await;
+    let frozen_bytes = frozen
+        .message_bytes
+        .clone()
+        .expect("入队之后就该有冻结的字节");
+    assert_eq!(frozen.attempts, 1, "第一次认领把 attempts 记成 1");
+
+    // 用户确认「再发一次」：重提交的是**库里那份字节**，不是重新构建的信。
+    let second = fixture
+        .service
+        .resend_uncertain(&fixture.account_id, &first.entry_id, &credential())
+        .await
+        .expect("再发一次失败");
+    assert_eq!(second.state, SendResultState::Uncertain);
+    assert_eq!(second.entry_id, first.entry_id);
+    assert_eq!(
+        second.message_id, first.message_id,
+        "再发一次必须是**同一封**（Message-ID 不变），否则对端认不出来"
+    );
+
+    // 服务器一共收到两份字节，且**一模一样**。
+    let received = server.messages();
+    assert_eq!(received.len(), 2, "两轮各提交一次");
+    assert_eq!(
+        received[1], frozen_bytes,
+        "重提交的必须是冻结的那份字节，不能重新构建"
+    );
+
+    // R26/R32 的 attempts：自增只发生在 `claim_for_sending` 里，
+    // `retry_uncertain` 自己不动它——所以这里是 1 → 2，一次次累加。
+    assert_eq!(fixture.stored().await.attempts, 2);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn only_an_uncertain_entry_can_be_resubmitted() {
+    // 服务器明确拒收 → `failed`，不是「不确定」，不该走这条人工出口。
+    let (fixture, server) =
+        Fixture::with_server(secure_config().rejecting_recipient("friend@example.com", 550)).await;
+
+    let result = fixture
+        .service
+        .send(&draft(&fixture.account_id), &credential())
+        .await
+        .unwrap();
+    assert_eq!(result.state, SendResultState::Failed);
+
+    let error = fixture
+        .service
+        .resend_uncertain(&fixture.account_id, &result.entry_id, &credential())
+        .await
+        .expect_err("明确失败的信不能「再发一次」");
+    assert!(
+        matches!(&error, AppError::Invalid(detail) if detail.contains("结果未确认")),
+        "报错要说清楚只有「结果未确认」的信能再发，实际是：{error}"
+    );
+
+    // 拒收只发生一次：被拒的那封没被重新提交。
+    // （假服务器把「被拒」的那封也记进 `messages()`，所以这里比的是
+    // 「再发一次前后没有多出一封」，而不是总数恰好为 1。）
+    assert_eq!(
+        fixture.stored().await.attempts,
+        1,
+        "被拒的信不该因为「再发一次」多出一次投递尝试"
+    );
 
     server.shutdown().await;
 }

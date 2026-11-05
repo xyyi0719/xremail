@@ -86,6 +86,7 @@ fn app() -> (tauri::App<MockRuntime>, tauri::WebviewWindow<MockRuntime>) {
             cmd::set_message_flag,
             cmd::save_draft,
             cmd::send_message,
+            cmd::resend_uncertain,
         ])
         .build(mock_context(noop_assets()))
         .expect("构建 mock 应用失败");
@@ -712,5 +713,28 @@ fn send_message_without_a_credential_says_so() {
     assert!(
         err.to_string().contains("授权码"),
         "报错应当说明缺授权码，实际是：{err}"
+    );
+}
+
+/// 「再发一次」命令的**线格式**与错误口径（R30）。
+///
+/// 这条命令是 `uncertain` 的人工出口：前端拿到 `entryId` 调它，
+/// 返回的必须和 `send_message` **同一个形状**（`messageId` / `entryId` /
+/// `state` / `detail`，camelCase），否则前端复用的 `describeSendResult`
+/// 会拿到 `undefined`，把三种结局说成一句「发送失败」。
+#[test]
+fn resend_uncertain_reports_camel_case_fields_and_a_missing_entry() {
+    let (_app, webview) = app();
+
+    // 库里没有这条发信记录 → 明确说找不到，而不是笼统地失败。
+    let err = get_ipc_response(
+        &webview,
+        request("resend_uncertain", json!({ "entryId": "no-such-entry" })),
+    )
+    .expect_err("不存在的发信记录应当报错");
+
+    assert!(
+        err.to_string().contains("no-such-entry"),
+        "报错里要带上那个 id，实际是：{err}"
     );
 }

@@ -349,6 +349,20 @@ export interface SendResult {
 }
 
 /**
+ * 把一封「结果未确认」的信**原样再提交一次**（`resend_uncertain` 的参数）。
+ *
+ * 与 `send_message` 的区别：这里不带草稿内容，只带条目 id——
+ * 后端会把当初冻结的那份字节重新投递，Message-ID 不变，
+ * 所以对端认得出「这是原来那封」，而不是又一封新邮件。
+ *
+ * 返回的仍是 `SendResult`：再提交一次之后照样可能 `sent` / `uncertain` / `failed`。
+ */
+export interface ResendUncertainArgs {
+  /** 发信条目 id（`SendResult.entryId`）。 */
+  entryId: string;
+}
+
+/**
  * 把标记意图的结果翻译成一句给用户看的话。
  *
  * 为什么每种状态都单独说一句：见 `FlagIntentState` 的说明——
