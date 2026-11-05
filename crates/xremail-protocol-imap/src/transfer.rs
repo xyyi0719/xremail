@@ -31,9 +31,12 @@
 //! `UIDPLUS`（见 `docs/PROTOCOLS.md` 的认证后能力集），163 缺的是 `MOVE`。
 //! 判断一律走能力集，不要凭服务商名字猜。
 
+use std::time::Duration;
+
 use imap_proto::rfc4315::UidSetMember;
 use imap_proto::{Response, ResponseCode, Status};
 
+use crate::command::DEFAULT_COMMAND_TIMEOUT;
 use crate::connection::Session;
 use crate::error::ProtocolError;
 
@@ -121,9 +124,19 @@ pub async fn copy_messages(
     uids: &[u32],
     mailbox: &str,
 ) -> Result<TransferOutcome, ProtocolError> {
+    copy_messages_with_timeout(session, uids, mailbox, DEFAULT_COMMAND_TIMEOUT).await
+}
+
+/// 把一批 UID 复制到另一个文件夹，超时由调用方给。
+pub async fn copy_messages_with_timeout(
+    session: &mut Session,
+    uids: &[u32],
+    mailbox: &str,
+    timeout: Duration,
+) -> Result<TransferOutcome, ProtocolError> {
     ensure_usable(uids)?;
     let command = build_copy_command(uids, mailbox);
-    run_transfer(session, &command, uids).await
+    run_transfer_with_timeout(session, &command, uids, timeout).await
 }
 
 /// 把一批 UID 移动到另一个文件夹（需要服务器支持 `MOVE`）。
@@ -132,9 +145,19 @@ pub async fn move_messages(
     uids: &[u32],
     mailbox: &str,
 ) -> Result<TransferOutcome, ProtocolError> {
+    move_messages_with_timeout(session, uids, mailbox, DEFAULT_COMMAND_TIMEOUT).await
+}
+
+/// 把一批 UID 移动到另一个文件夹，超时由调用方给。
+pub async fn move_messages_with_timeout(
+    session: &mut Session,
+    uids: &[u32],
+    mailbox: &str,
+    timeout: Duration,
+) -> Result<TransferOutcome, ProtocolError> {
     ensure_usable(uids)?;
     let command = build_move_command(uids, mailbox);
-    run_transfer(session, &command, uids).await
+    run_transfer_with_timeout(session, &command, uids, timeout).await
 }
 
 /// 给一批 UID 打 `\Deleted`。
@@ -144,11 +167,31 @@ pub async fn mark_deleted(session: &mut Session, uids: &[u32]) -> Result<(), Pro
     run_simple(session, &command, "UID STORE \\Deleted").await
 }
 
+/// 给一批 UID 打 `\Deleted`，超时由调用方给。
+pub async fn mark_deleted_with_timeout(
+    session: &mut Session,
+    uids: &[u32],
+    timeout: Duration,
+) -> Result<(), ProtocolError> {
+    ensure_usable(uids)?;
+    let command = build_store_deleted_command(uids);
+    run_simple_with_timeout(session, &command, "UID STORE \\Deleted", timeout).await
+}
+
 /// `UID EXPUNGE` 一批 UID（需要服务器支持 `UIDPLUS`）。
 pub async fn uid_expunge(session: &mut Session, uids: &[u32]) -> Result<(), ProtocolError> {
+    uid_expunge_with_timeout(session, uids, DEFAULT_COMMAND_TIMEOUT).await
+}
+
+/// `UID EXPUNGE` 一批 UID，超时由调用方给。
+pub async fn uid_expunge_with_timeout(
+    session: &mut Session,
+    uids: &[u32],
+    timeout: Duration,
+) -> Result<(), ProtocolError> {
     ensure_usable(uids)?;
     let command = build_uid_expunge_command(uids);
-    run_simple(session, &command, "UID EXPUNGE").await
+    run_simple_with_timeout(session, &command, "UID EXPUNGE", timeout).await
 }
 
 /// 入参检查：空集合与超长集合都**不能**发出去。
@@ -200,13 +243,13 @@ fn quote_mailbox(mailbox: &str) -> String {
     quoted
 }
 
-/// 跑一条「只看成败」的命令。
+/// 跑一条「只看成败」的命令（超时用 [`DEFAULT_COMMAND_TIMEOUT`]）。
 async fn run_simple(
     session: &mut Session,
     command: &str,
     label: &str,
 ) -> Result<(), ProtocolError> {
-    match run_until_tagged(session, command).await? {
+    match run_until_tagged(session, command, DEFAULT_COMMAND_TIMEOUT).await? {
         TaggedOutcome::Ok(_) => Ok(()),
         TaggedOutcome::Failed(detail) => {
             Err(ProtocolError::Imap(format!("{label} 失败: {detail}")))
@@ -214,13 +257,32 @@ async fn run_simple(
     }
 }
 
-/// 跑一条 COPY / MOVE，并从 `COPYUID` 里取 UID 映射。
-async fn run_transfer(
+/// 跑一条「只看成败」的命令，并给出调用方的命令超时。
+///
+/// `command_timeout` 来自 `SyncPolicy`；传进来才能让配置生效，
+/// 而不是让一次 `STORE` 卡住整个账户（R27/R38）。
+pub async fn run_simple_with_timeout(
+    session: &mut Session,
+    command: &str,
+    label: &str,
+    timeout: Duration,
+) -> Result<(), ProtocolError> {
+    match run_until_tagged(session, command, timeout).await? {
+        TaggedOutcome::Ok(_) => Ok(()),
+        TaggedOutcome::Failed(detail) => {
+            Err(ProtocolError::Imap(format!("{label} 失败: {detail}")))
+        }
+    }
+}
+
+/// 跑一条 COPY / MOVE，并从 `COPYUID` 里取 UID 映射，超时由调用方给。
+async fn run_transfer_with_timeout(
     session: &mut Session,
     command: &str,
     requested: &[u32],
+    timeout: Duration,
 ) -> Result<TransferOutcome, ProtocolError> {
-    match run_until_tagged(session, command).await? {
+    match run_until_tagged(session, command, timeout).await? {
         TaggedOutcome::Ok(details) => {
             let (source_uid_validity, source_uids, destination_uids) = match details.copy_uid {
                 Some(code) => (
@@ -289,7 +351,32 @@ struct CopyUid {
 /// 关键点：别的命令发来的 untagged 响应（`EXISTS` / `EXPUNGE` / `FETCH` …）
 /// 与本命令无关，**忽略并继续读**。移动/删除会让文件夹变空，
 /// 服务器会连着推好几条 untagged 响应，不能遇到一条就收工。
+///
+/// ## 为什么要超时
+///
+/// 以前这里是**无上限**的读循环：服务器收了命令却不回话（网络半开、
+/// 中间设备吞包、服务器内部卡死），这个 await 就永远不返回，
+/// 整个账户的 actor 被一条 `COPY` 拖死——连「失败」都报不出来（R38）。
+/// 现在整条命令（发送 + 读到 tagged）都包在 `timeout` 里。
+///
+/// 超时返回 [`ProtocolError::Timeout`]，**调用方必须把它当成「结果未知」**：
+/// 命令可能已经在服务器上执行了，衔接其后的未知 untagged 响应也可能还堵在
+/// 连接里。绝不能在超时之后接着用这条会话发下一条命令。
 async fn run_until_tagged(
+    session: &mut Session,
+    command: &str,
+    timeout: Duration,
+) -> Result<TaggedOutcome, ProtocolError> {
+    match tokio::time::timeout(timeout, read_until_tagged(session, command)).await {
+        Ok(result) => result,
+        Err(_) => Err(ProtocolError::Timeout(format!(
+            "命令超时（{timeout:?}）: {command}"
+        ))),
+    }
+}
+
+/// [`run_until_tagged`] 的本体（不含超时）。
+async fn read_until_tagged(
     session: &mut Session,
     command: &str,
 ) -> Result<TaggedOutcome, ProtocolError> {

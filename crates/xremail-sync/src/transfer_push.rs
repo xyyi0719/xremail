@@ -11,11 +11,15 @@
 //! | 场景 | 发什么 |
 //! |---|---|
 //! | 有 `MOVE` | 一条 `UID MOVE` |
-//! | 没有 `MOVE` | `UID COPY` → `UID STORE +FLAGS (\Deleted)` → **有 `UIDPLUS` 才** `UID EXPUNGE`（163 是这一类） |
-//! | 没有 `MOVE` 也没有 `UIDPLUS` | 停在「已标删」（三家实测都支持 `UIDPLUS`，这档只为兜底） |
+//! | 没有 `MOVE`、有 `UIDPLUS` | `UID COPY` → `UID STORE +FLAGS (\Deleted)` → `UID EXPUNGE`（163 是这一类） |
+//! | 没有 `MOVE` 也没有 `UIDPLUS` | **不发**，操作直接记 `Failed` 并报给用户（见 [`NO_UIDPLUS`]） |
 //!
 //! **裸 `EXPUNGE` 一律不用**：它会把这个文件夹里所有带 `\Deleted` 的信都删掉，
 //! 包括别的客户端（手机、网页版）标了还没提交的。那也是用户的数据。
+//!
+//! 第二、三档的差别是**能不能真的把信弄走**：没有 `UIDPLUS` 时 `COPY` + 标删
+//! 只会让源文件夹多一封 `\Deleted`、目标文件夹多一份副本，那封信**还在原地**。
+//! 把它记成「移动成功」是假话（R35），所以宁可失败等人决定。
 //!
 //! ## 删除 = 进垃圾箱（保守优先）
 //!
@@ -34,15 +38,18 @@
 //! 也可能是别人挪走了——两种情况下「再挪一次」都是错的
 //! （RFC 6851 的 `MOVE` 不是幂等的）。
 
-use xremail_core::model::{Folder, MailOperation, MessageFlags, OperationKind, OperationState};
+use std::time::Duration;
+
+use xremail_core::model::{Folder, MailOperation, OperationKind, OperationState};
 use xremail_core::{AppError, AppResult};
 use xremail_protocol_imap::folders::role_by_name;
 use xremail_protocol_imap::{
-    CommandOutcome, Session, copy_messages, mark_deleted, move_messages, uid_expunge,
+    CommandOutcome, Session, copy_messages_with_timeout, has_capability, mark_deleted_with_timeout,
+    move_messages_with_timeout, uid_expunge_with_timeout,
 };
 use xremail_store::dao::{folder as folder_dao, message as message_dao, operation};
 
-use crate::net::run_checked_with_timeout;
+use crate::net::{SyncOptions, run_checked_with_timeout_for};
 use crate::push::{SubmitError, classify_submit_error};
 
 /// 一轮移动/删除回写的结果。
@@ -66,8 +73,23 @@ pub struct TransferPushReport {
 
 impl TransferPushReport {
     /// 是否没有需要服务器处理的东西。
+    ///
+    /// 七个计数**全为 0** 才算空转（R36）：漏掉 `uncertain` / `quarantined` /
+    /// `noop` 的话，一条「结果未知」的操作也会被报成「没事可做」，
+    /// 上层据此判断的就成了假话。
     pub fn is_noop(&self) -> bool {
-        self.moved == 0 && self.deleted == 0 && self.retryable == 0 && self.failed == 0
+        self.total() == 0
+    }
+
+    /// 本轮一共处理了几条操作（应当是七项之和）。
+    pub fn total(&self) -> usize {
+        self.moved
+            + self.deleted
+            + self.retryable
+            + self.failed
+            + self.uncertain
+            + self.quarantined
+            + self.noop
     }
 }
 
@@ -80,16 +102,27 @@ impl TransferPushReport {
 pub(crate) enum Route {
     /// 一条 `UID MOVE`。
     Move { destination: String },
-    /// `UID COPY` → 标删 →（可选）`UID EXPUNGE`。
-    CopyDelete { destination: String, expunge: bool },
+    /// `UID COPY` → 标删 → `UID EXPUNGE`（走这条一定得有 `UIDPLUS`）。
+    CopyDelete { destination: String },
     /// 就地删除（没有垃圾箱可去）。
-    Expunge { expunge: bool },
+    Expunge,
 }
+
+/// 没有 `UIDPLUS` 时给出的拒绝理由（R35）。
+///
+/// 没有 `UIDPLUS` 时能做的最多是「标 `\Deleted`」，而**裸 `EXPUNGE` 一律不用**
+/// （会连带删掉别的客户端标了还没提交的信）。于是源文件夹里那封信**还在**：
+/// 既没有搬进目标文件夹，也没有真的消失。把它记成成功，等于对用户说
+/// 「已经移走了」——下次拉取它又回来了，用户会以为是丢信了。
+/// 所以这里**拒绝**，让操作落到 `Failed` 并被界面报出来，由人决定怎么办。
+const NO_UIDPLUS: &str = "服务器不支持 UIDPLUS：既不能安全地 expunge，也做不到真正的移走/删除。这个结果不算成功，需要你决定怎么处理";
 
 /// 算出一条操作的路由。
 ///
 /// `destination`：`Move` 操作显式给的目标邮箱名。
 /// `trash`：账户里垃圾箱的邮箱名（`Delete` 用它）。
+///
+/// 没有 `UIDPLUS` 时一律 `Err`（理由见 [`NO_UIDPLUS`]）。
 pub(crate) fn route_for(
     kind: OperationKind,
     has_move: bool,
@@ -100,13 +133,12 @@ pub(crate) fn route_for(
     match kind {
         // 删除优先挪进垃圾箱：能撤销的动作比不能撤销的安全。
         OperationKind::Delete => match trash {
-            Some(trash) => Ok(move_route(has_move, has_uidplus, trash)),
-            None => Ok(Route::Expunge {
-                expunge: has_uidplus,
-            }),
+            Some(trash) => move_route(has_move, has_uidplus, trash),
+            None if has_uidplus => Ok(Route::Expunge),
+            None => Err(NO_UIDPLUS),
         },
         OperationKind::Move => match destination {
-            Some(destination) => Ok(move_route(has_move, has_uidplus, destination)),
+            Some(destination) => move_route(has_move, has_uidplus, destination),
             None => Err("移动操作没有记录目标文件夹"),
         },
         // 标记操作不归这里管。
@@ -115,18 +147,19 @@ pub(crate) fn route_for(
 }
 
 /// 「搬到 `destination`」在不同能力下的两种走法。
-fn move_route(has_move: bool, has_uidplus: bool, destination: &str) -> Route {
+fn move_route(has_move: bool, has_uidplus: bool, destination: &str) -> Result<Route, &'static str> {
     if has_move {
-        Route::Move {
+        Ok(Route::Move {
             destination: destination.to_string(),
-        }
+        })
+    } else if has_uidplus {
+        Ok(Route::CopyDelete {
+            destination: destination.to_string(),
+        })
     } else {
-        Route::CopyDelete {
-            destination: destination.to_string(),
-            // 没有 `UIDPLUS` 时**不能** expunge：裸 `EXPUNGE` 会连带删掉
-            // 别人标了 `\Deleted` 还没提交的邮件。停在这一步更安全。
-            expunge: has_uidplus,
-        }
+        // 没有 `UIDPLUS` 的 `COPY`+标删只能把信**复制**过去再把源里的标成
+        // `\Deleted`：目标文件夹多一份、源文件夹还在，两边都对不上。
+        Err(NO_UIDPLUS)
     }
 }
 
@@ -137,9 +170,9 @@ fn move_route(has_move: bool, has_uidplus: bool, destination: &str) -> Route {
 ///
 /// 认领这一步的意义见 [`crate::push_flags`] 的同名说明：
 /// 它是唯一的提交权闸门，没认领到的方什么都不做且**不算失败**。
-/// 把某个文件夹里待提交的移动/删除意图回写到服务器。
 ///
-/// 认领时用本进程的启动标识（[`crate::boot::boot_id`]）。
+/// 认领时用本进程的启动标识（[`crate::boot::boot_id`]），
+/// 命令超时用 [`crate::net::COMMAND_TIMEOUT`]。
 pub async fn push_transfers(
     pool: &sqlx::SqlitePool,
     session: &mut Session,
@@ -149,13 +182,37 @@ pub async fn push_transfers(
     push_transfers_as(pool, session, folder, now_ms, crate::boot::boot_id()).await
 }
 
-/// 同 [`push_transfers`]，但显式指定认领归属。
+/// 同 [`push_transfers`]，但显式指定认领归属（命令超时用默认值）。
 pub async fn push_transfers_as(
     pool: &sqlx::SqlitePool,
     session: &mut Session,
     folder: &Folder,
     now_ms: i64,
     boot_id: &str,
+) -> AppResult<TransferPushReport> {
+    push_transfers_as_with_options(
+        pool,
+        session,
+        folder,
+        now_ms,
+        boot_id,
+        SyncOptions::default(),
+    )
+    .await
+}
+
+/// 同 [`push_transfers_as`]，并显式给出命令超时。
+///
+/// **每一条命令都必须有上限**（R27）：服务器收了命令却不回话时，
+/// 没有超时的那一条会把整个账户的同步循环永久钉住——连「重连」都轮不到，
+/// 因为 actor 还卡在上一轮里。
+pub async fn push_transfers_as_with_options(
+    pool: &sqlx::SqlitePool,
+    session: &mut Session,
+    folder: &Folder,
+    now_ms: i64,
+    boot_id: &str,
+    options: SyncOptions,
 ) -> AppResult<TransferPushReport> {
     let mut report = TransferPushReport::default();
 
@@ -200,23 +257,37 @@ pub async fn push_transfers_as(
         return Ok(report);
     }
 
+    let timeout = options.command_timeout;
+
     // 3. 以**可写**方式打开源文件夹（拉取那一轮用的是 EXAMINE）。
-    session
-        .select(&folder.remote_name)
-        .await
-        .map_err(|error| AppError::Protocol(format!("以可写方式打开文件夹失败: {error}")))?;
+    //
+    // 打不开就**一条都不提交**，并且每一条都记下来：这一轮确实什么都没发，
+    // 但「没发」的状态要写进库里，否则界面上看不出这批操作卡住了
+    // （R33：认领失败也曾被静默 `continue` 吃掉）。
+    //
+    // 记成 `retryable` 而不是 `uncertain`：`SELECT` 是我们自己的命令，服务器
+    // 明着回 `NO`/断开就说明这条命令**没执行**，发送状态本身是确定的。
+    if let Err(error) = select_for_write(session, &folder.remote_name, timeout).await {
+        let message = submit_error_message(&error);
+        for op in &transfers {
+            operation::mark_operation_retryable(pool, &op.id, "select_failed", message, now_ms)
+                .await?;
+            report.retryable += 1;
+        }
+        return Ok(report);
+    }
 
     // 4. 能力与垃圾箱：每轮取一次，不逐条问。
-    let capabilities = session
-        .capabilities()
+    let capabilities = tokio::time::timeout(timeout, session.capabilities())
         .await
+        .map_err(|_| AppError::Network(format!("读服务器能力超时（{timeout:?}）")))?
         .map_err(|error| AppError::Protocol(format!("读服务器能力失败: {error}")))?;
-    let has_move = capabilities.has_str("MOVE");
-    let has_uidplus = capabilities.has_str("UIDPLUS");
+    let has_move = has_capability(&capabilities, "MOVE");
+    let has_uidplus = has_capability(&capabilities, "UIDPLUS");
     let trash = find_trash(pool, folder).await?;
 
     // 5. 逐条提交。
-    for op in &transfers {
+    for (index, op) in transfers.iter().enumerate() {
         // 认领：没抢到（或次数已到顶）就跳过。
         //
         // `MOVE` 不幂等（重发会多出一份），所以这道闸门在这里比在
@@ -290,7 +361,7 @@ pub async fn push_transfers_as(
         // 多打两条命令，不值得给每条新操作都付这个代价。
         let mut copy_already_done = false;
         if matches!(route, Route::CopyDelete { .. }) && op.attempts > 0 {
-            let Route::CopyDelete { destination, .. } = &route else {
+            let Route::CopyDelete { destination } = &route else {
                 unreachable!("上面刚判断过只有 CopyDelete 才进这段");
             };
 
@@ -316,20 +387,43 @@ pub async fn push_transfers_as(
                     "命令可能已经发出，但这封信没有 Message-ID，无法确认目标文件夹里是否已有副本，因此不重发"
                         .to_owned(),
                 ),
-                Some(id) => match destination_has_message_id(session, destination, id).await {
-                    Ok(found) => Ok(found),
-                    Err(error) => Err(format!(
-                        "重发前探测目标文件夹失败，因此不重发：{}",
-                        submit_error_message(&error)
-                    )),
-                },
+                Some(id) => {
+                    match destination_has_message_id(session, destination, id, timeout).await {
+                        Ok(found) => Ok(found),
+                        Err(error) => Err(format!(
+                            "重发前探测目标文件夹失败，因此不重发：{}",
+                            submit_error_message(&error)
+                        )),
+                    }
+                }
             };
 
             // 探测换了选中的文件夹，提交之前必须切回**可写**的源文件夹。
-            session
-                .select(&folder.remote_name)
-                .await
-                .map_err(|error| AppError::Protocol(format!("切回源文件夹失败: {error}")))?;
+            //
+            // 切不回去就别再动这个会话了：后面的每一条操作都建立在「选中了源文件夹」
+            // 这个前提上，在错的状态上继续发命令会是另一类「邮件没搬、队列却空了」。
+            // 剩下的操作（含这一条，除非探测本身已有结论）统一记成 `uncertain`，
+            // 等下一轮重连再处理。
+            if let Err(error) = select_for_write(session, &folder.remote_name, timeout).await {
+                let message = submit_error_message(&error);
+
+                // 这一条的探测结果本身就是「不确定」→ 报探测的原因，
+                // 否则报切回来的原因。
+                let reason = match &probe {
+                    Ok(_) => message,
+                    Err(probe_message) => probe_message.as_str(),
+                };
+                operation::mark_operation_uncertain(pool, &op.id, "unknown", reason, now_ms)
+                    .await?;
+                report.uncertain += 1;
+
+                for rest in &transfers[index + 1..] {
+                    operation::mark_operation_uncertain(pool, &rest.id, "unknown", message, now_ms)
+                        .await?;
+                    report.uncertain += 1;
+                }
+                return Ok(report);
+            }
 
             match probe {
                 // 已经在目标文件夹里了：`COPY` 那一半不必再发。
@@ -343,7 +437,7 @@ pub async fn push_transfers_as(
             }
         }
 
-        match submit(session, op.uid, &route, copy_already_done).await {
+        match submit(session, op.uid, &route, copy_already_done, timeout).await {
             Ok(result) => {
                 // 本地视图跟着服务器走：源文件夹里这封邮件已经不该显示了。
                 message_dao::delete_messages_by_uids(
@@ -365,12 +459,13 @@ pub async fn push_transfers_as(
                 )
                 .await?;
 
-                match op.kind {
-                    OperationKind::Delete => report.deleted += 1,
-                    _ => report.moved += 1,
-                }
-                if result == SubmitResult::AlreadyGone {
-                    report.noop += 1;
+                // 计数**互斥**（R36）：一封「服务器上本来就没有了」的信
+                // 一条命令都没发，只能算 `noop`，不能同时算 `moved`/`deleted`。
+                // 否则界面上的「N 封已移动」会把没发生的事也算进去。
+                match (result, op.kind) {
+                    (SubmitResult::AlreadyGone, _) => report.noop += 1,
+                    (SubmitResult::Submitted, OperationKind::Delete) => report.deleted += 1,
+                    (SubmitResult::Submitted, _) => report.moved += 1,
                 }
             }
             Err(SubmitError::Retryable { message }) => {
@@ -437,6 +532,7 @@ async fn submit(
     uid: i64,
     route: &Route,
     copy_already_done: bool,
+    timeout: Duration,
 ) -> Result<SubmitResult, SubmitError> {
     let uid32 = u32::try_from(uid).map_err(|_| SubmitError::Failed {
         message: format!("UID {uid} 超出 32 位范围，不能用 IMAP 命令表达"),
@@ -446,51 +542,41 @@ async fn submit(
     //
     // 不在 → 上一次尝试多半已经生效了（应答丢了）。**不能重发**：
     // `MOVE` 不是幂等的，`COPY` 重发会在目标文件夹里多出一份。
-    if !source_has_uid(session, uid32).await? {
+    if !source_has_uid(session, uid32, timeout).await? {
         return Ok(SubmitResult::AlreadyGone);
     }
 
     match route {
         Route::Move { destination } => {
-            move_messages(session, &[uid32], destination)
+            move_messages_with_timeout(session, &[uid32], destination, timeout)
                 .await
                 .map_err(classify_submit_error)?;
-            confirm(session, uid32, Expectation::Absent).await?;
+            confirm(session, uid32, timeout).await?;
         }
-        Route::CopyDelete {
-            destination,
-            expunge,
-        } => {
+        Route::CopyDelete { destination } => {
             // 探测已经确认目标文件夹里有这封，再发一次 `COPY` 就多一份。
             if !copy_already_done {
-                copy_messages(session, &[uid32], destination)
+                copy_messages_with_timeout(session, &[uid32], destination, timeout)
                     .await
                     .map_err(classify_submit_error)?;
             }
-            mark_deleted(session, &[uid32])
+            mark_deleted_with_timeout(session, &[uid32], timeout)
                 .await
                 .map_err(classify_submit_error)?;
-            if *expunge {
-                uid_expunge(session, &[uid32])
-                    .await
-                    .map_err(classify_submit_error)?;
-                confirm(session, uid32, Expectation::Absent).await?;
-            } else {
-                confirm(session, uid32, Expectation::FlaggedDeleted).await?;
-            }
+            // 能走到这里就一定宣过 `UIDPLUS`（见 [`route_for`]）。
+            uid_expunge_with_timeout(session, &[uid32], timeout)
+                .await
+                .map_err(classify_submit_error)?;
+            confirm(session, uid32, timeout).await?;
         }
-        Route::Expunge { expunge } => {
-            mark_deleted(session, &[uid32])
+        Route::Expunge => {
+            mark_deleted_with_timeout(session, &[uid32], timeout)
                 .await
                 .map_err(classify_submit_error)?;
-            if *expunge {
-                uid_expunge(session, &[uid32])
-                    .await
-                    .map_err(classify_submit_error)?;
-                confirm(session, uid32, Expectation::Absent).await?;
-            } else {
-                confirm(session, uid32, Expectation::FlaggedDeleted).await?;
-            }
+            uid_expunge_with_timeout(session, &[uid32], timeout)
+                .await
+                .map_err(classify_submit_error)?;
+            confirm(session, uid32, timeout).await?;
         }
     }
 
@@ -505,13 +591,9 @@ async fn destination_has_message_id(
     session: &mut Session,
     destination: &str,
     message_id: &str,
+    timeout: Duration,
 ) -> Result<bool, SubmitError> {
-    session
-        .examine(destination)
-        .await
-        .map_err(|error| SubmitError::Uncertain {
-            message: format!("打开目标文件夹 {destination} 失败: {error}"),
-        })?;
+    examine_for_probe(session, destination, timeout).await?;
 
     // `Message-ID` 理论上不含引号，但服务器给的东西不能信：
     // 去掉引号、空白与控制字符，避免拼出一条坏命令。
@@ -521,7 +603,7 @@ async fn destination_has_message_id(
         .collect();
 
     let command = format!("UID SEARCH HEADER Message-ID \"{sanitized}\"");
-    let outcome = run_checked_with_timeout(session, &command)
+    let outcome = run_checked_with_timeout_for(session, &command, timeout)
         .await
         .map_err(classify_submit_error)?;
 
@@ -533,69 +615,30 @@ async fn destination_has_message_id(
     }
 }
 
-/// 回读时要看到什么才算成功。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Expectation {
-    /// 源文件夹里应该**没有**这封邮件了。
-    Absent,
-    /// 还在，但应该带 `\Deleted`（没有 `UIDPLUS` 时的终点）。
-    FlaggedDeleted,
-}
-
-/// 回读确认。
+/// 回读确认：源文件夹里必须**没有**这封邮件了。
+///
+/// 只有这一种期望。曾经还有「还在但带 `\Deleted` 也算成功」——那是给没有
+/// `UIDPLUS` 的服务器准备的终点，但它意味着**信没走**（R35），
+/// 现在这种服务器直接走 [`NO_UIDPLUS`] 报失败，不再有这种终点。
 ///
 /// 服务器回 `OK` 不等于改动生效（见 [ARCHITECTURE §6](../../../docs/ARCHITECTURE.md)）。
-async fn confirm(
-    session: &mut Session,
-    uid: u32,
-    expectation: Expectation,
-) -> Result<(), SubmitError> {
-    match expectation {
-        Expectation::Absent => {
-            if source_has_uid(session, uid).await? {
-                return Err(SubmitError::Retryable {
-                    message: format!("回读确认失败：UID {uid} 仍在源文件夹里"),
-                });
-            }
-            Ok(())
-        }
-        Expectation::FlaggedDeleted => {
-            let flags = read_flags(session, uid).await?;
-            let Some(flags) = flags else {
-                // 已经不在了——比期望的更好（比如别的客户端把它 expunge 了）。
-                return Ok(());
-            };
-            if !flags.contains(MessageFlags::DELETED) {
-                return Err(SubmitError::Retryable {
-                    message: format!("回读确认失败：UID {uid} 没有带上 \\Deleted"),
-                });
-            }
-            Ok(())
-        }
+async fn confirm(session: &mut Session, uid: u32, timeout: Duration) -> Result<(), SubmitError> {
+    if source_has_uid(session, uid, timeout).await? {
+        return Err(SubmitError::Retryable {
+            message: format!("回读确认失败：UID {uid} 仍在源文件夹里"),
+        });
     }
-}
-
-/// 读一封邮件的标记；不在服务器上时返回 `None`。
-async fn read_flags(session: &mut Session, uid: u32) -> Result<Option<MessageFlags>, SubmitError> {
-    let command = format!("UID FETCH {uid} (UID FLAGS)");
-    let outcome = run_checked_with_timeout(session, &command)
-        .await
-        .map_err(classify_submit_error)?;
-
-    let messages = match outcome {
-        CommandOutcome::Fetches(messages) => messages,
-        _ => Vec::new(),
-    };
-
-    Ok(messages
-        .first()
-        .map(|message| MessageFlags::from_imap_names(&message.flags)))
+    Ok(())
 }
 
 /// 源文件夹里还有没有这个 UID。
-async fn source_has_uid(session: &mut Session, uid: u32) -> Result<bool, SubmitError> {
+async fn source_has_uid(
+    session: &mut Session,
+    uid: u32,
+    timeout: Duration,
+) -> Result<bool, SubmitError> {
     let command = format!("UID FETCH {uid} (UID)");
-    let outcome = run_checked_with_timeout(session, &command)
+    let outcome = run_checked_with_timeout_for(session, &command, timeout)
         .await
         .map_err(classify_submit_error)?;
 
@@ -603,6 +646,52 @@ async fn source_has_uid(session: &mut Session, uid: u32) -> Result<bool, SubmitE
         CommandOutcome::Fetches(messages) => !messages.is_empty(),
         _ => false,
     })
+}
+
+/// 以**可写**方式选中一个文件夹，并给这条命令加上限。
+///
+/// 不加超时的 `SELECT` 会在服务器收下命令却不回话时**永久**挂住，
+/// 而外层唯一的兜底是「重连」——可重连本身也在这一轮里（R27）。
+///
+/// 超时按 **`uncertain` 而不是普通失败**处理：`SELECT` 超时意味着会话里
+/// 已经有一条没等到应答的命令，连接不能再拿来发移动/删除——发出去就说不清
+/// 是哪条命令的结果。留成 `uncertain` 会让人工/下一轮的重连来处理（R27/R29）。
+async fn select_for_write(
+    session: &mut Session,
+    mailbox: &str,
+    timeout: Duration,
+) -> Result<(), SubmitError> {
+    let select = tokio::time::timeout(timeout, session.select(mailbox)).await;
+
+    match select {
+        Err(_elapsed) => Err(SubmitError::Uncertain {
+            message: format!(
+                "以可写方式打开 {mailbox} 超时（{timeout:?}），连接状态已不可信，本轮不再提交"
+            ),
+        }),
+        Ok(Err(error)) => Err(SubmitError::Uncertain {
+            message: format!("以可写方式打开 {mailbox} 失败: {error}"),
+        }),
+        Ok(Ok(_mailbox)) => Ok(()),
+    }
+}
+
+/// 探测用 `EXAMINE`（只读打开），同样加上限。
+async fn examine_for_probe(
+    session: &mut Session,
+    mailbox: &str,
+    timeout: Duration,
+) -> Result<(), SubmitError> {
+    let examine = session.examine(mailbox);
+    tokio::time::timeout(timeout, examine)
+        .await
+        .map_err(|_| SubmitError::Uncertain {
+            message: format!("打开目标文件夹 {mailbox} 超时（{timeout:?}）"),
+        })?
+        .map(|_| ())
+        .map_err(|error| SubmitError::Uncertain {
+            message: format!("打开目标文件夹 {mailbox} 失败: {error}"),
+        })
 }
 
 /// `Move` 操作的目标邮箱名（线路上的原名）。
@@ -654,23 +743,31 @@ mod tests {
         assert_eq!(
             route,
             Route::CopyDelete {
-                destination: DST.to_string(),
-                expunge: true
+                destination: DST.to_string()
             }
         );
     }
 
     #[test]
-    fn without_uidplus_copy_stops_at_deleted_flag() {
-        // 兜底那一档：没有 UIDPLUS，所以**绝不能** expunge。
-        let route = route_for(OperationKind::Move, false, false, Some(DST), None).unwrap();
-        assert_eq!(
-            route,
-            Route::CopyDelete {
-                destination: DST.to_string(),
-                expunge: false
-            }
-        );
+    fn without_uidplus_a_move_is_refused_instead_of_faked() {
+        // R35：没有 UIDPLUS 时 `COPY` + 标删**搬不走**信，目标多一份、源里还在。
+        // 那不能叫成功——必须报失败让人决定。
+        let route = route_for(OperationKind::Move, false, false, Some(DST), None);
+        assert_eq!(route, Err(NO_UIDPLUS));
+    }
+
+    #[test]
+    fn without_uidplus_a_move_into_trash_is_refused_too() {
+        // 删除走「挪进垃圾箱」那条路，同样离不开 UIDPLUS。
+        let route = route_for(OperationKind::Delete, false, false, None, Some("Trash"));
+        assert_eq!(route, Err(NO_UIDPLUS));
+    }
+
+    #[test]
+    fn without_move_but_with_uidplus_a_single_move_command_is_not_needed() {
+        // 163 那一档：没有 MOVE 但有 UIDPLUS → 三步走。
+        let route = route_for(OperationKind::Move, false, true, Some(DST), None).unwrap();
+        assert!(matches!(route, Route::CopyDelete { .. }));
     }
 
     #[test]
@@ -687,13 +784,36 @@ mod tests {
     #[test]
     fn delete_without_trash_expunges_in_place() {
         let route = route_for(OperationKind::Delete, true, true, None, None).unwrap();
-        assert_eq!(route, Route::Expunge { expunge: true });
+        assert_eq!(route, Route::Expunge);
     }
 
     #[test]
-    fn delete_without_trash_or_uidplus_only_marks_deleted() {
-        let route = route_for(OperationKind::Delete, false, false, None, None).unwrap();
-        assert_eq!(route, Route::Expunge { expunge: false });
+    fn delete_without_trash_or_uidplus_is_refused() {
+        // R35：没有 UIDPLUS 就只能标删，那封信还在原地。不许记成「已删除」。
+        let route = route_for(OperationKind::Delete, true, false, None, None);
+        assert_eq!(route, Err(NO_UIDPLUS));
+    }
+
+    #[test]
+    fn a_report_is_only_noop_when_every_counter_is_zero() {
+        // R36：`uncertain` / `quarantined` / `noop` 也是「这一轮有东西要报告」。
+        assert!(TransferPushReport::default().is_noop());
+        for report in [
+            TransferPushReport {
+                uncertain: 1,
+                ..Default::default()
+            },
+            TransferPushReport {
+                quarantined: 1,
+                ..Default::default()
+            },
+            TransferPushReport {
+                noop: 1,
+                ..Default::default()
+            },
+        ] {
+            assert!(!report.is_noop(), "{report:?} 不该被当成空转");
+        }
     }
 
     #[test]

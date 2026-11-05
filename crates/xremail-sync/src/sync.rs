@@ -214,7 +214,11 @@ async fn flush_pending(
         ),
     }
 
-    match crate::transfer_push::push_transfers_as(pool, session, &fresh, now_ms, boot_id).await {
+    match crate::transfer_push::push_transfers_as_with_options(
+        pool, session, &fresh, now_ms, boot_id, options,
+    )
+    .await
+    {
         Ok(report) if !report.is_noop() => tracing::debug!(
             folder = %fresh.remote_name,
             moved = report.moved,

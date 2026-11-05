@@ -9,10 +9,11 @@
 use std::time::Duration;
 
 use xremail_protocol_imap::{
-    ImapConfig, Session, TlsTrust, connect_and_login_with, copy_messages, mark_deleted,
-    move_messages, run_checked, uid_expunge,
+    ImapConfig, ProtocolError, Session, TlsTrust, connect_and_login_with, copy_messages,
+    mark_deleted, mark_deleted_with_timeout, move_messages, move_messages_with_timeout,
+    run_checked, uid_expunge,
 };
-use xremail_testkit::{FakeImapServer, MailboxFixture, MessageFixture, ServerConfig};
+use xremail_testkit::{FakeImapServer, Fault, MailboxFixture, MessageFixture, ServerConfig};
 
 /// 起一个假服务器并返回可直接用的客户端配置。
 async fn start(config: ServerConfig) -> (FakeImapServer, ImapConfig, TlsTrust) {
@@ -31,8 +32,11 @@ async fn start(config: ServerConfig) -> (FakeImapServer, ImapConfig, TlsTrust) {
 }
 
 /// INBOX 有 3 封（UID 1/2/3），「归档」是空文件夹。
+///
+/// 默认带上 `MOVE`：假服务器现在会**按宣告的能力执行门控**（R40），
+/// 没宣告 `MOVE` 就回 `BAD`——这正是真服务器的行为。
 fn config_with_archive() -> ServerConfig {
-    ServerConfig {
+    let mut config = ServerConfig {
         mailboxes: vec![
             MailboxFixture::new("INBOX")
                 .with_message(MessageFixture::new(1).with_subject("一"))
@@ -41,7 +45,18 @@ fn config_with_archive() -> ServerConfig {
             MailboxFixture::new("归档").with_attribute("\\Archive"),
         ],
         ..ServerConfig::default()
-    }
+    };
+    config.capabilities.push("MOVE".to_string());
+    config
+}
+
+/// 起一个**不宣告任何移动能力**的服务器：无 `MOVE`、无 `UIDPLUS`。
+fn config_without_move_or_uidplus() -> ServerConfig {
+    let mut config = config_with_archive();
+    config
+        .capabilities
+        .retain(|cap| cap != "MOVE" && cap != "UIDPLUS");
+    config
 }
 
 async fn login(imap: &ImapConfig, trust: &TlsTrust) -> Session {
@@ -303,4 +318,149 @@ async fn expunge_without_uidplus_deletes_everything_marked() {
         .expect("EXPUNGE 应当成功");
 
     assert_eq!(uids_in(&server, "INBOX"), vec![2]);
+}
+
+// ---------------------------------------------------------------------------
+// R40：假服务器必须**按宣告的能力**执行门控，否则「客户端从不发用不了的命令」
+// 这件事就没有任何东西能证明——测试会对着一个比真服务器宽容的对手跑绿。
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_server_without_move_rejects_the_move_command() {
+    let (server, imap, trust) = start(config_without_move_or_uidplus()).await;
+    let mut session = login(&imap, &trust).await;
+    let archive = raw_name_of(&mut session, "archive").await;
+    select(&mut session, "INBOX").await;
+
+    let result = move_messages(&mut session, &[1], &archive).await;
+
+    assert!(
+        result.is_err(),
+        "没宣告 MOVE 的服务器必须回 BAD，而不是替客户端把活干了：{result:?}"
+    );
+    // 失败也不能有副作用。
+    assert_eq!(uids_in(&server, "INBOX"), vec![1, 2, 3]);
+    assert!(uids_in(&server, "归档").is_empty());
+}
+
+#[tokio::test]
+async fn a_server_without_uidplus_rejects_uid_expunge() {
+    let (server, imap, trust) = start(config_without_move_or_uidplus()).await;
+    let mut session = login(&imap, &trust).await;
+    select(&mut session, "INBOX").await;
+
+    mark_deleted(&mut session, &[1])
+        .await
+        .expect("STORE 应当成功");
+
+    let result = uid_expunge(&mut session, &[1]).await;
+
+    assert!(
+        result.is_err(),
+        "没宣告 UIDPLUS 时 UID EXPUNGE 必须回 BAD（RFC 4315 能力门控）：{result:?}"
+    );
+    // 标了删但没 expunge：信还在。
+    assert_eq!(uids_in(&server, "INBOX"), vec![1, 2, 3]);
+}
+
+#[tokio::test]
+async fn copy_uid_names_the_destination_folders_uid_validity() {
+    let mut config = config_with_archive();
+    // 造一个全局值与「实际选中的文件夹」不同的情形：把值改成非默认值，
+    // 客户端拿到的 COPYUID 里那个数必须与它**当前选中的文件夹**报告的一致，
+    // 而不是某个写死的量（R40：以前这里直接引用服务器全局配置）。
+    config.uid_validity = 777;
+    let (server, imap, trust) = start(config).await;
+    let mut session = login(&imap, &trust).await;
+    let archive = raw_name_of(&mut session, "archive").await;
+    select(&mut session, "INBOX").await;
+
+    let outcome = copy_messages(&mut session, &[1, 3], &archive)
+        .await
+        .expect("COPY 应当成功");
+
+    assert_eq!(
+        outcome.source_uid_validity,
+        Some(server.uid_validity()),
+        "COPYUID 的第一个数是**目标文件夹**的 UIDVALIDITY（RFC 4315 §3）"
+    );
+    assert_eq!(outcome.source_uids, vec![1, 3]);
+    assert_eq!(outcome.destination_uids, vec![1, 2]);
+}
+
+#[tokio::test]
+async fn move_reports_the_expunged_sequences() {
+    // RFC 6851 §3.3：`MOVE` 之后服务器要推 untagged `EXPUNGE`。
+    // 假服务器以前不推，于是「客户端在 MOVE 期间正确忽略 untagged EXPUNGE」
+    // 这条路径就从来没被跑到过（R40）。
+    let (server, imap, trust) = start(config_with_archive()).await;
+    let mut session = login(&imap, &trust).await;
+    let archive = raw_name_of(&mut session, "archive").await;
+    select(&mut session, "INBOX").await;
+
+    move_messages(&mut session, &[1], &archive)
+        .await
+        .expect("MOVE 应当成功");
+
+    // 连接还能继续用：untagged `EXPUNGE` 没有把同一条命令的 tagged 响应搞乱。
+    let outcome = run_checked(&mut session, "UID SEARCH ALL")
+        .await
+        .expect("MOVE 之后会话应当仍然可用");
+    assert_eq!(outcome.search(), &[2, 3]);
+    assert_eq!(uids_in(&server, "归档"), vec![1]);
+}
+
+// ---------------------------------------------------------------------------
+// R38：服务器收了命令却**不回话**时，命令必须有上限——否则一条 `MOVE`
+// 就能把整个账户的同步循环永久钉死在这里。
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_move_that_never_gets_an_answer_times_out() {
+    let mut config = config_with_archive();
+    config.faults.push(Fault::HangOn("MOVE".to_string()));
+    let (server, imap, trust) = start(config).await;
+    let mut session = login(&imap, &trust).await;
+    let archive = raw_name_of(&mut session, "archive").await;
+    select(&mut session, "INBOX").await;
+
+    let started = std::time::Instant::now();
+    let result =
+        move_messages_with_timeout(&mut session, &[1], &archive, Duration::from_millis(300)).await;
+    let elapsed = started.elapsed();
+
+    match result {
+        Err(ProtocolError::Timeout(detail)) => {
+            assert!(
+                detail.contains("MOVE"),
+                "超时信息里要带上命令本身，否则日志里看不出卡在哪：{detail}"
+            );
+        }
+        other => panic!("应当是 Timeout，实际: {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "必须在给定的超时量级返回（而不是挂到默认的 30 秒），实际 {elapsed:?}"
+    );
+
+    // 命令没被执行：源文件夹没变。
+    assert_eq!(uids_in(&server, "INBOX"), vec![1, 2, 3]);
+    assert!(uids_in(&server, "归档").is_empty());
+}
+
+#[tokio::test]
+async fn a_store_that_never_gets_an_answer_times_out() {
+    let mut config = config_with_archive();
+    config.faults.push(Fault::HangOn("STORE".to_string()));
+    let (server, imap, trust) = start(config).await;
+    let mut session = login(&imap, &trust).await;
+    select(&mut session, "INBOX").await;
+
+    let result = mark_deleted_with_timeout(&mut session, &[1], Duration::from_millis(300)).await;
+
+    assert!(
+        matches!(result, Err(ProtocolError::Timeout(_))),
+        "标删也要有上限，实际: {result:?}"
+    );
+    assert_eq!(uids_in(&server, "INBOX"), vec![1, 2, 3]);
 }

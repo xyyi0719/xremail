@@ -261,6 +261,17 @@ async fn enqueue_transfer(
     operation
 }
 
+/// 库里唯一一条操作的状态与错误说明。
+async fn operation_state(pool: &SqlitePool) -> (String, Option<String>) {
+    use sqlx::Row;
+
+    let row = sqlx::query("SELECT state, error_message FROM mail_operation LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .expect("应当有一条操作");
+    (row.get("state"), row.get("error_message"))
+}
+
 /// 入队一条**已经试过 `attempts` 次**的移动意图（目标是 `folder-archive`）。
 ///
 /// 重发路径靠 `attempts` 判断两件事：`> 0` 才去探测目标文件夹里有没有副本；
@@ -500,8 +511,10 @@ async fn missing_source_is_treated_as_already_moved() {
         .await
         .expect("回写本身不该报错");
 
-    assert_eq!(report.moved, 1, "应当按已搬走处理");
-    assert_eq!(report.noop, 1, "而且是一条命令都没发的那种");
+    assert_eq!(report.noop, 1, "一条命令都没发就该只算 noop");
+    assert_eq!(report.moved, 0, "没搬走的信不能算作「已移动」（R36）");
+    assert_eq!(report.deleted, 0);
+    assert_eq!(report.total(), 1, "七个计数互斥，合计等于处理条数");
     assert_eq!(
         server_count(&fixture, "Archive").await,
         0,
@@ -557,9 +570,11 @@ async fn delete_goes_into_trash_when_there_is_one() {
 }
 
 #[tokio::test]
-async fn delete_without_trash_or_uidplus_only_marks_deleted() {
-    // 兜底那一档：没有垃圾箱，也没有 UIDPLUS（三家实测都有 UIDPLUS，这里人为关掉）。
-    // 裸 `EXPUNGE` 会连带删掉别的客户端标了 `\Deleted` 的邮件，所以停在这一步。
+async fn delete_without_trash_or_uidplus_is_failed_instead_of_faked() {
+    // R35：没有垃圾箱、也没有 UIDPLUS 时，能做的最多是「标删」——那封信
+    // **还在原地**。裸 `EXPUNGE` 会连带删掉别的客户端标了 `\Deleted` 的邮件，
+    // 所以不能用它收尾；把「标了个标记」报成「已删除」是假话。
+    // 现在这条路由直接拒绝，操作记 `Failed`，由人决定。
     let mut config = config_with_mail();
     config.capabilities.retain(|cap| cap != "UIDPLUS");
     let fixture = start(config).await;
@@ -581,15 +596,23 @@ async fn delete_without_trash_or_uidplus_only_marks_deleted() {
         .await
         .expect("回写本身不该报错");
 
-    assert_eq!(report.deleted, 1);
+    assert_eq!(report.deleted, 0, "信没走，不能算删掉了");
+    assert_eq!(report.failed, 1, "应当明确报失败");
     assert!(
         server_has_uid(&fixture, "INBOX", INBOX_UID as u32).await,
         "没有 UIDPLUS 时不该真删掉"
     );
     let flags = server_flags(&fixture, "INBOX", INBOX_UID as u32).await;
     assert!(
-        flags.contains(xremail_core::model::MessageFlags::DELETED),
-        "应当带上 \\Deleted"
+        !flags.contains(xremail_core::model::MessageFlags::DELETED),
+        "既然不算成功，就一条命令都不该发（不该留下去不掉的 \\Deleted）"
+    );
+
+    let (state, message) = operation_state(&pool).await;
+    assert_eq!(state, "failed");
+    assert!(
+        message.unwrap_or_default().contains("UIDPLUS"),
+        "失败原因要说清是服务器缺能力，否则用户看不懂为什么删不掉"
     );
 
     fixture.server.shutdown().await;

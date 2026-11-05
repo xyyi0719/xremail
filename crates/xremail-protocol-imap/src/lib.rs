@@ -43,9 +43,30 @@ pub use probe::{
 };
 pub use transfer::{
     TransferOutcome, build_copy_command, build_move_command, build_store_deleted_command,
-    build_uid_expunge_command, copy_messages, mark_deleted, move_messages, uid_expunge,
+    build_uid_expunge_command, copy_messages, copy_messages_with_timeout, mark_deleted,
+    mark_deleted_with_timeout, move_messages, move_messages_with_timeout, uid_expunge,
+    uid_expunge_with_timeout,
 };
 pub use utf7::{Utf7Error, decode as decode_utf7, encode as encode_utf7};
 
 /// 重新导出 async-imap 的能力类型，供调用方判断扩展支持度。
 pub use async_imap::types::Capabilities;
+
+/// 能力集里有没有 `name`，**大小写不敏感**。
+///
+/// `Capabilities::has_str` 对普通 atom 是区分大小写的精确比较
+/// （只有 `IMAP4rev1` 与 `AUTH=` 例外）。RFC 3501 的能力名是 atom，
+/// 服务器大小写写花并不罕见——按精确比较会把「有」认成「没有」，
+/// 然后走上错误的路由（例如把有 `MOVE` 的服务器当成没有）。
+#[must_use]
+pub fn has_capability(caps: &Capabilities, name: &str) -> bool {
+    caps.iter().any(|cap| match cap {
+        async_imap::types::Capability::Atom(atom) => atom.eq_ignore_ascii_case(name),
+        async_imap::types::Capability::Imap4rev1 => name.eq_ignore_ascii_case("IMAP4rev1"),
+        async_imap::types::Capability::Auth(mechanism) => {
+            name.split_once('=').is_some_and(|(key, value)| {
+                key.eq_ignore_ascii_case("AUTH") && mechanism.eq_ignore_ascii_case(value)
+            })
+        }
+    })
+}

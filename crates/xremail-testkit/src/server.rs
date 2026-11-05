@@ -989,6 +989,12 @@ where
         }
 
         "MOVE" => {
+            // RFC 6851：没宣告 `MOVE` 的服务器必须回 `BAD`——真服务器就是这么做的，
+            // 假服务器要是照做，客户端「不发 MOVE」这件事就没什么能证明的了（R40）。
+            if !config.has_capability("MOVE") {
+                reply!(writer, "{} BAD Unsupported command: MOVE", command.tag);
+                return Ok(Continue::Continue);
+            }
             handle_copy_or_move(
                 &mut writer,
                 ctx,
@@ -1035,19 +1041,40 @@ where
                         .await?;
                 }
                 "MOVE" => {
-                    handle_copy_or_move(&mut writer, ctx, state, &command.tag, rest, true, true)
+                    if !config.has_capability("MOVE") {
+                        reply!(writer, "{} BAD Unsupported UID command: MOVE", command.tag);
+                    } else {
+                        handle_copy_or_move(
+                            &mut writer,
+                            ctx,
+                            state,
+                            &command.tag,
+                            rest,
+                            true,
+                            true,
+                        )
                         .await?;
+                    }
                 }
                 "EXPUNGE" => {
-                    handle_expunge(
-                        &mut writer,
-                        ctx,
-                        state,
-                        &command.tag,
-                        Some(rest),
-                        "UID EXPUNGE",
-                    )
-                    .await?;
+                    // RFC 4315：`UID EXPUNGE` 是 `UIDPLUS` 的一部分，没宣告就回 `BAD`。
+                    if !config.has_capability("UIDPLUS") {
+                        reply!(
+                            writer,
+                            "{} BAD Unsupported UID command: EXPUNGE",
+                            command.tag
+                        );
+                    } else {
+                        handle_expunge(
+                            &mut writer,
+                            ctx,
+                            state,
+                            &command.tag,
+                            Some(rest),
+                            "UID EXPUNGE",
+                        )
+                        .await?;
+                    }
                 }
                 other => {
                     reply!(
@@ -1236,6 +1263,12 @@ where
     }
 }
 
+/// `COPY` / `MOVE` 记下的结果：(目标文件夹 UIDVALIDITY, 源 UID, 目标 UID, 被 expunge 的 seq)。
+///
+/// 字段多、又只在锁内算一次，起个名字免得签名里挂一长串元组（`clippy::type_complexity`）。
+/// 第四个字段只有 `MOVE` 会有（RFC 6851 要求服务端下发 untagged `EXPUNGE`）。
+type CopyMoveOutcome = (u32, Vec<u32>, Vec<u32>, Vec<u32>);
+
 /// `COPY` / `MOVE` 的实现（RFC 3501 §6.4.7、RFC 6851）。
 ///
 /// `args` 形如 `<set> <mailbox>`。
@@ -1294,9 +1327,11 @@ where
     };
 
     // 锁内只改数据，不 await（锁不能跨 await）。
-    let outcome: Option<(Vec<u32>, Vec<u32>)> = 'calc: {
+    //
+    // 顺手记下**目标文件夹**的 UIDVALIDITY：`COPYUID` 里的那个数说的是目标文件夹
+    // （RFC 4315 §3），不是服务器全局值（R40）。
+    let outcome: Option<CopyMoveOutcome> = 'calc: {
         let mut guard = lock_mailboxes(mailboxes);
-
         // 先把源消息**快照**出来：源和目标可能是同一个文件夹，
         // 那样没法同时持有不可变借用和可变借用。
         let snapshot: Vec<(u32, MessageFixture)> = {
@@ -1338,20 +1373,48 @@ where
         // `MOVE`：拷完再把源里那几封真的删掉。
         // RFC 6851 要求只删**被移动的那些**，不是「所有带 `\Deleted` 的」
         // ——后者是 `EXPUNGE` 的语义，会把用户手动标删的信也一并干掉。
+        //
+        // 删完要按 RFC 6851 §3.3 **推 untagged `EXPUNGE`**：真服务器就是这样告诉
+        // 客户端「序号变了」的，客户端也据此更新本地视图。以前这里不推，
+        // 客户端在 MOVE 期间漏掉 `EXPUNGE` 的毛病就测不出来（R40）。
+        let mut expunged_sequences: Vec<u32> = Vec::new();
         if is_move && !source_uids.is_empty() {
             let source = &mut guard[index];
-            source
+            let doomed: Vec<usize> = source
                 .messages
-                .retain(|message| !source_uids.contains(&message.uid));
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| source_uids.contains(&message.uid))
+                .map(|(position, _)| position)
+                .collect();
+            // 从后往前删，免得下标错位。
+            for &position in doomed.iter().rev() {
+                source.messages.remove(position);
+            }
+            // 从大到小报：这样每个序号在**报出时**都还是有效的。
+            expunged_sequences = doomed
+                .iter()
+                .rev()
+                .map(|&position| position as u32 + 1)
+                .collect();
         }
 
-        Some((source_uids, destination_uids))
+        Some((
+            config.uid_validity,
+            source_uids,
+            destination_uids,
+            expunged_sequences,
+        ))
     };
 
-    let Some((source_uids, destination_uids)) = outcome else {
+    let Some((destination_validity, source_uids, destination_uids, expunged)) = outcome else {
         reply!(writer, "{tag} NO Mailbox does not exist");
         return Ok(());
     };
+
+    for sequence in &expunged {
+        reply!(writer, "* {} EXPUNGE", sequence);
+    }
 
     if source_uids.is_empty() {
         // 集合没命中任何信：空操作也是成功（RFC 3501 不要求报错）。
@@ -1362,7 +1425,7 @@ where
     reply!(
         writer,
         "{tag} OK [COPYUID {} {} {}] {label} completed",
-        config.uid_validity,
+        destination_validity,
         render_uid_set(&source_uids),
         render_uid_set(&destination_uids)
     );
