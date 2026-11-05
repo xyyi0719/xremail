@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        UPDATE mail_operation\n        SET state = 'running', started_at = ?, owner_boot = ?, updated_at = ?\n        WHERE id = ?\n          AND state IN ('queued', 'retryable', 'uncertain')\n          AND attempts < ?\n          AND (\n                    kind = 'flags'\n                 OR NOT EXISTS (\n                        SELECT 1 FROM mail_operation o2\n                        WHERE o2.account_id = mail_operation.account_id\n                          AND o2.folder_id = mail_operation.folder_id\n                          AND o2.uid = mail_operation.uid\n                          AND o2.uidvalidity = mail_operation.uidvalidity\n                          AND o2.id <> mail_operation.id\n                          AND o2.state = 'running'\n                          AND o2.kind IN ('move', 'delete')\n                    )\n          )\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "5dc270b2d7fed3e9f05e22d9b4d6ed781eb7b2ddc2e2885c33c54ad62854b968"
+}

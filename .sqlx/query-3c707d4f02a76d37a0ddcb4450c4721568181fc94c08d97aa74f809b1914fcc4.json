@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        UPDATE mail_operation\n        SET updated_at = updated_at\n        WHERE id = ?\n          AND 0\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "3c707d4f02a76d37a0ddcb4450c4721568181fc94c08d97aa74f809b1914fcc4"
+}

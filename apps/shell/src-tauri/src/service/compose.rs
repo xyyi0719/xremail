@@ -397,9 +397,7 @@ impl ComposeService {
         //
         // 认领时记下本进程的启动标识："下次启动对账"只回收**别人**的行，
         // 不会把本进程还在发的信翻成「结果未知」。
-        let claimed =
-            send_queue_dao::claim_for_sending(&self.pool, &id, xremail_sync::boot_id(), now)
-                .await?;
+        let claimed = self.claim_or_explain(&id, now).await?;
         if !claimed {
             return Err(AppError::Invalid(
                 "这封信正在被另一个发送器处理，请稍后再试".to_string(),
@@ -417,6 +415,50 @@ impl ComposeService {
             &built.message_id,
         )
         .await
+    }
+
+    /// 取发送权；取不到时**分清是哪一种取不到**再决定说什么。
+    ///
+    /// `claim_for_sending` 返回 `false` 有两种完全不同的意思：
+    ///
+    /// 1. **别人正在发**——真正的并发，让用户等一会儿。
+    /// 2. **重试次数用完了**（`send_queue::MAX_SEND_ATTEMPTS`）——这封信
+    ///    再点也不会自动重试。若也对用户说「稍后再试」，他会一直点、
+    ///    一直被拒，而信永远发不出去、也没人告诉他为什么（R31）。
+    ///
+    /// 所以取不到时立刻查一次「是不是次数用完」，是就给一句**能行动**的话：
+    /// 信没发出去、改内容或确认账号设置后再发。这里同时把那条收成
+    /// `failed / retry_exhausted`，界面才会从「排队中」变成「失败 + 原因」。
+    async fn claim_or_explain(&self, id: &str, now_ms: i64) -> AppResult<bool> {
+        let claimed = send_queue_dao::claim_for_sending(
+            &self.pool,
+            id,
+            xremail_sync::boot_id(),
+            now_ms,
+            send_queue_dao::MAX_SEND_ATTEMPTS,
+        )
+        .await?;
+        if claimed {
+            return Ok(true);
+        }
+
+        let exhausted = send_queue_dao::fail_if_exhausted(
+            &self.pool,
+            id,
+            send_queue_dao::MAX_SEND_ATTEMPTS,
+            now_ms,
+        )
+        .await?;
+        if exhausted {
+            return Err(AppError::Invalid(format!(
+                "这封信已经自动重试了 {} 次都没成功，暂时不再自动重试。\
+                 信没有发出去——改一下内容再点「发送」会重新开始计数，\
+                 也可以先检查一下账号的服务器设置和密码。",
+                send_queue_dao::MAX_SEND_ATTEMPTS
+            )));
+        }
+
+        Ok(false)
     }
 
     /// 用户确认「服务器上确实没有这封信」之后，重新提交**同一封**。
@@ -447,8 +489,7 @@ impl ComposeService {
         if !requeued {
             return Err(AppError::Invalid("重新提交失败：状态已经变了".to_string()));
         }
-        let claimed =
-            send_queue_dao::claim_for_sending(&self.pool, id, xremail_sync::boot_id(), now).await?;
+        let claimed = self.claim_or_explain(id, now).await?;
         if !claimed {
             return Err(AppError::Invalid(
                 "这封信正在被另一个发送器处理，请稍后再试".to_string(),

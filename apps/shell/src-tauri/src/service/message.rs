@@ -545,9 +545,21 @@ impl MessageService {
 
             operation_dao::enqueue_operation(&self.pool, &operation).await?;
 
-            let stored = operation_dao::get_operation(&self.pool, &operation.id)
-                .await?
-                .ok_or_else(|| xremail_core::AppError::Storage("操作已落库，但读不回来".into()))?;
+            // 入队是**幂等**的（R34）：这封邮件上已经有一条未完结的移动 / 删除
+            // 时，上面那句什么都没插。所以这里**不能**拿自己构造的 id 去读回
+            // （那种情况下它在库里根本不存在），而要按「这封邮件」查——
+            // 查到的可能是刚插的那条，也可能是已有的那条。
+            //
+            // 对界面来说是好事：用户点了两次「移动」，看到的是**同一条**操作，
+            // 而不是两条各发一次 `MOVE`、目标文件夹里出两份。
+            let stored =
+                operation_dao::find_pending_transfer(&self.pool, account_id, folder_id, uid, epoch)
+                    .await?
+                    .ok_or_else(|| {
+                        xremail_core::AppError::Storage(format!(
+                            "UID {uid} 的操作入队后既查不到新插入的那条、也查不到已有的在途操作"
+                        ))
+                    })?;
             enqueued.push(stored);
         }
 

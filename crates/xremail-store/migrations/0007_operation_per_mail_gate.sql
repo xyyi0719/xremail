@@ -1,0 +1,44 @@
+-- 移动 / 删除意图的闸门从「每条操作」抬到「每封邮件」(R34)。
+--
+-- ## 问题
+--
+-- `claim_for_push` 是按行认领的（`WHERE id = ?`），而同一封邮件
+-- `(account_id, folder_id, uid, uidvalidity)` 可以躺着多条未完结的
+-- `Move` / `Delete`（`enqueue_operation` 原本是裸 `INSERT`，没有去重）。
+-- 两条 flush 并发时（actor 的 `sync_account → flush_pending` 与用户点击后的
+-- 独立会话）各自认领一条，各自都看到源文件夹里还有这封 → **各发一次 `MOVE`**，
+-- 目标文件夹里出两份。
+--
+-- 去重与互斥本身写在 DAO 里（`enqueue_operation` 幂等入队、
+-- `claim_for_push` 的 `NOT EXISTS` 条件）——它们要**在同一条语句/同一笔事务**
+-- 里做，才不受「先查后改」之间那段窗口的影响。本迁移只负责让它们跑得快：
+-- 没有索引时两条语句各扫一遍 `mail_operation`。
+--
+-- 部分索引只覆盖**未完结**的行：`succeeded` / `failed` 是终态，永远不会命中
+-- 这两条判定，不必为它们付索引成本。
+CREATE INDEX idx_mail_operation_mail_pending
+    ON mail_operation (account_id, folder_id, uid, uidvalidity)
+    WHERE state IN ('queued', 'running', 'retryable', 'uncertain');
+
+--
+-- ## 关于 0006 里「`started_at` 只是诊断字段」的契约
+--
+-- **本迁移沿用 0006 的契约，没有推翻它。**
+--
+-- 看起来这里很像是要拿时间判超时（同一封邮件的另一条 `running` 会不会是死行？），
+-- 但本迁移与 DAO 的改动**一次都没有把 `started_at` 读出来做判断**：
+-- 认领互斥只看 `state = 'running'`，死行由 `reclaim_running`（按 `owner_boot`）
+-- 收成 `uncertain` 之后再放行——那是**状态**驱动，不是**时间**驱动。
+--
+-- 所以 `started_at` 依旧只是诊断字段。另一条正在并行进行的修复（R32：同进程
+-- `running` 无租约、要靠时间兜底）会**推翻** 0006 那句话；等它落地时，
+-- 它应当在自己的迁移里重新写清契约，而不是借这里顺带改掉——
+-- 否则两处对同一个字段的说法会各写一套，下一个人不知道该信哪个。
+--
+-- 那时候本迁移也不需要改：
+--   * 「跳过死行」只是让 `claim_for_push` 多一个可认领的时间条件，
+--     互斥条件本身（「有别的 running」）依然成立；
+--   * 入队去重面对一条**僵死的** `running` 行时仍会挡下新意图——
+--     那是**对的**：死行的结局（到底搬没搬）还没定，再排一条只会更乱。
+--     死行被收成 `uncertain` 之后，`uncertain` 仍在「未完结」集合里，
+--     照样会挡住重复入队，等它自己有了结论。

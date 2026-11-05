@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        UPDATE send_queue\n        SET state = 'failed',\n            error_kind = 'retry_exhausted',\n            error_message = ?,\n            updated_at = ?\n        WHERE id = ?\n          AND state IN ('queued', 'retryable')\n          AND attempts >= ?\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "3079c57f69aedbc40cfcd878f7926019f18e1815e0ace1ccd3ac1e2982af382e"
+}

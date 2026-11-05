@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT o2.id FROM mail_operation o2\n        WHERE o2.account_id = ?\n          AND o2.folder_id = ?\n          AND o2.uid = ?\n          AND o2.uidvalidity = ?\n          AND o2.id <> ?\n          AND o2.state IN ('queued', 'running', 'retryable', 'uncertain')\n          AND (o2.kind = 'flags') = (? = 'flags')\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mail_operation",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f0e8db66a82e7c258347b7163dfb81d17d7ad582e168edaf8a66d15f0505791a"
+}

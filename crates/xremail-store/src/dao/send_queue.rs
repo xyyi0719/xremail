@@ -26,6 +26,21 @@
 //! 两个发送器同时取同一条邮件，只有一个能把 `queued` 改成 `running`，
 //! 另一个拿到 `false` 就知道「别人在处理」。
 //!
+//! ## 重试次数是**真的**有上限（R31）
+//!
+//! 成功的路径认领时 `attempts` 加一（见 [`claim_for_sending`]），
+//! 所以 `attempts` 之后就是「这封信被真的提交了几次」。
+//! 认领条件里有 `AND attempts < ?`，调用方给的就是上限。
+//!
+//! 到顶之后这条**不会再被认领**，调用方把它收成 `failed / retry_exhausted`
+//! 并要求人工改内容（见 [`fail_if_exhausted`]）。
+//!
+//! > 改动前的 `attempts` 是个只增不查的死计数器：认领条件里没有上界，
+//! > 全仓也没有别处检查——「重试 N 次」是一句空头承诺。
+//! > 另有一个**真的**不用这条路径的出口：`uncertain` 经用户确认后走
+//! > [`retry_uncertain`]，那是「人替服务器做判断」，不是自动重试，
+//! > 所以它**不**重置 `attempts`，也不受上限约束（一事一议）。
+//!
 //! ## envelope 与 headers 分离
 //!
 //! `send_queue.envelope` 存的是**实际投递地址**（from + 全部收件人 + bcc），
@@ -42,6 +57,20 @@ use xremail_core::model::{SendAttachment, SendQueueEntry, SendState};
 
 use crate::codec::{enum_from_text, enum_to_text};
 use crate::error::map_sqlx;
+
+/// 一条发信最多真的提交几次。
+///
+/// **放在存储层**：因为这个数字是 `claim_for_sending` 的**条件**——
+/// 写进文档、却不在认领时检查，就是一句空头承诺（R31）。
+/// 上层只需要照着它传，不需要自己再记一个「应该取几」。
+///
+/// 取 5，与同步引擎的 `MAX_OPERATION_ATTEMPTS`
+/// （`crates/xremail-sync/src/reconcile.rs`）同一个理由：足以扛过网络抖动、
+/// 服务器临时 4xx 与维护窗口，又不会让一个永远发不出去的信无限重试。
+///
+/// 到顶之后不自动再发：`failed / retry_exhausted` **要求人工介入**——
+/// 见 [`fail_if_exhausted`] 里对出路的说明。
+pub const MAX_SEND_ATTEMPTS: i64 = 5;
 
 /// `send_queue` 表的一行（不含附件字节）。
 #[derive(Debug, Clone, FromRow)]
@@ -429,14 +458,26 @@ pub async fn queue_for_sending(
 /// `owner_boot` 的作用见迁移 `0006_operation_owner.sql`：
 /// 进程死在 `running` 上之后，重启时要能区分「这条是残骸」与
 /// 「这条是另一个还活着的进程正在发的」，否则会把活件翻成「结果未知」。
-/// 同 [`claim_for_sending`]，但显式指定认领归属。
 ///
-/// 需要模拟「上一次进程留下的行」的测试用它。
+/// ## `max_attempts` 是**真的**上界（R31）
+///
+/// 条件里的 `AND attempts < ?` 意味着：这条已经提交过 `max_attempts` 次时，
+/// 认领**失败**，返回 `false`——和「别人正在发」返回同一个值。
+/// 调用方**必须先看清楚这条到底是哪种情况再给用户看文案**：
+/// 把「重试次数用完」说成「正在被另一个发送器处理」，用户就会一直重试、
+/// 一直收到同一句「稍后再试」，而这封**永远不会**发出去。
+///
+/// 区分办法见 [`fail_if_exhausted`]，`apps/shell` 的两个调用点都是先查它。
+///
+/// 返回 `false` 时**状态不变**（还是 `queued` / `retryable`）：
+/// 本函数不替调用方做处置，因为「超时用完就转 failed」这句话属于
+/// 用户可见的语义，应该由它自己说清（带一句人话的原因）。
 pub async fn claim_for_sending(
     pool: &SqlitePool,
     id: &str,
     boot_id: &str,
     now_ms: i64,
+    max_attempts: i64,
 ) -> AppResult<bool> {
     let result = sqlx::query!(
         r#"
@@ -448,15 +489,82 @@ pub async fn claim_for_sending(
             updated_at = ?
         WHERE id = ?
           AND state IN ('queued', 'retryable')
+          AND attempts < ?
         "#,
         now_ms,
         boot_id,
         now_ms,
-        id
+        id,
+        max_attempts
     )
     .execute(pool)
     .await
     .map_err(|e| map_sqlx(e, "claim_for_sending"))?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// 已经没得再试了，就把这条收成 `failed / retry_exhausted`。
+///
+/// **用法**：只在 `claim_for_sending` 返回 `false` 之后调一次。
+/// 返回 `true` 表示「这条确实是用完次数了，我把它收掉了」——
+/// 调用方据此给用户一句**能行动**的话；返回 `false` 则是真正的「别人正在发」。
+///
+/// ## 为什么要有这个条目，而不是让行停在 `retryable`
+///
+/// 停在 `retryable` 的话，用户点「发送」只会得到 `claim_for_sending` 的
+/// `false`；调用方若把它当成「正在被另一个发送器处理」，用户就会一直重试、
+/// 一直被拒绝，而这封信**永远发不出去**，界面上却没有任何一处说清为什么。
+///
+/// 所以：到顶 = `failed`。`failed` 在界面上是可编辑的状态
+/// （用户改内容就回到草稿，见 [`save_draft`]），
+/// 也允许直接重新发送（[`queue_for_sending`] 接受 `failed` 并清空错误）。
+///
+/// 这**不是**判决，而是把选择权交回人：调用方读到 `should_fail`/`failed` 时，
+/// 必须给出一句能行动的话，而不是「稍后再试」——后者会让人以为是暂时的事。
+///
+/// ## 为什么 `error_kind` 是 `retry_exhausted`
+///
+/// 它与 `interrupted`（进程死在发信中）、`rejected_5xx`、`rejected_4xx`
+/// 并列，回答的是同一个问题：「这封信最后为什么没发出去」。
+/// 也正因为值不同，界面上才有机会说清「不是服务器拒绝，是我们自己停下来了」。
+///
+/// ## 为什么一条 SQL 能做完
+///
+/// `WHERE` 里三段全都要：`state` 卡在 `queued` / `retryable`（
+/// 有人正在发的不动、已经发出去的不动、`uncertain` 更不动——
+/// 那是等人工裁决的）；`attempts >= ?` 卡在到顶。
+/// 认领与收尾是两条语句，中间可能有人抢先认领——但那时 `state` 已是
+/// `running`，这条 `UPDATE` 就改不到行，返回 `false`，正是我们要的。
+pub async fn fail_if_exhausted(
+    pool: &SqlitePool,
+    id: &str,
+    max_attempts: i64,
+    now_ms: i64,
+) -> AppResult<bool> {
+    let result = sqlx::query!(
+        r#"
+        UPDATE send_queue
+        SET state = 'failed',
+            error_kind = 'retry_exhausted',
+            error_message = ?,
+            updated_at = ?
+        WHERE id = ?
+          AND state IN ('queued', 'retryable')
+          AND attempts >= ?
+        "#,
+        format!(
+            "这封信已经提交过 {max_attempts} 次都没成功，已停止自动重试。\n\
+             信没有发出去。改一下内容再点「发送」会重新开始计数；\
+             也可以先确认账号设置（服务器地址、密码）再试。"
+        ),
+        now_ms,
+        id,
+        max_attempts
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| map_sqlx(e, "fail_if_exhausted"))?;
 
     Ok(result.rows_affected() > 0)
 }

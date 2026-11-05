@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO mail_operation (\n                id, account_id, folder_id, uid, uidvalidity,\n                kind, intent, destination_folder_id, state, seq, base_version,\n                attempts, error_kind, error_message, created_at, updated_at\n            ) VALUES (?, 'a1', 'inbox', 7, ?, 'move', '{\"add\":0,\"remove\":0}', 'archive', 'queued', ?, NULL, 0, NULL, NULL, 1, 1)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "5016b96d448376a2becc97dd3e0353bbdb810d39678c4902e964c0f390ff7665"
+}

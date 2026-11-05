@@ -1,0 +1,206 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        SELECT id, account_id, folder_id, uid, uidvalidity,\n               kind, intent, destination_folder_id, state, seq, base_version,\n               attempts, error_kind, error_message, created_at, updated_at\n        FROM mail_operation\n        WHERE account_id = ? AND folder_id = ? AND uid = ? AND uidvalidity = ?\n          AND state IN ('queued', 'running', 'retryable', 'uncertain')\n          AND kind IN ('move', 'delete')\n        ORDER BY seq ASC\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mail_operation",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "account_id",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mail_operation",
+            "name": "account_id"
+          }
+        }
+      },
+      {
+        "name": "folder_id",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mail_operation",
+            "name": "folder_id"
+          }
+        }
+      },
+      {
+        "name": "uid",
+        "ordinal": 3,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "mail_operation",
+            "name": "uid"
+          }
+        }
+      },
+      {
+        "name": "uidvalidity",
+        "ordinal": 4,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "mail_operation",
+            "name": "uidvalidity"
+          }
+        }
+      },
+      {
+        "name": "kind",
+        "ordinal": 5,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mail_operation",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "name": "intent",
+        "ordinal": 6,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mail_operation",
+            "name": "intent"
+          }
+        }
+      },
+      {
+        "name": "destination_folder_id",
+        "ordinal": 7,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mail_operation",
+            "name": "destination_folder_id"
+          }
+        }
+      },
+      {
+        "name": "state",
+        "ordinal": 8,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mail_operation",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "name": "seq",
+        "ordinal": 9,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "mail_operation",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "name": "base_version",
+        "ordinal": 10,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "mail_operation",
+            "name": "base_version"
+          }
+        }
+      },
+      {
+        "name": "attempts",
+        "ordinal": 11,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "mail_operation",
+            "name": "attempts"
+          }
+        }
+      },
+      {
+        "name": "error_kind",
+        "ordinal": 12,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mail_operation",
+            "name": "error_kind"
+          }
+        }
+      },
+      {
+        "name": "error_message",
+        "ordinal": 13,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "mail_operation",
+            "name": "error_message"
+          }
+        }
+      },
+      {
+        "name": "created_at",
+        "ordinal": 14,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "mail_operation",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "name": "updated_at",
+        "ordinal": 15,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "mail_operation",
+            "name": "updated_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "84261a2c5512d4124f983f2d2f22715d4b15d295ac8b26fc1b8d209904ae676a"
+}

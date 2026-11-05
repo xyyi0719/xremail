@@ -398,7 +398,7 @@ async fn an_operation_left_running_in_the_send_queue_becomes_uncertain() {
     send_queue_dao::queue_for_sending(&pool, "s1", b"bytes", "<m1@x>", 1)
         .await
         .unwrap();
-    send_queue_dao::claim_for_sending(&pool, "s1", "boot-a", 2)
+    send_queue_dao::claim_for_sending(&pool, "s1", "boot-a", 2, send_queue_dao::MAX_SEND_ATTEMPTS)
         .await
         .unwrap();
 

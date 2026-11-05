@@ -45,8 +45,8 @@
 
 use sqlx::FromRow;
 use sqlx::SqlitePool;
-use xremail_core::{AppError, AppResult};
 use xremail_core::model::{FlagIntentPayload, MailOperation, OperationKind, OperationState};
+use xremail_core::{AppError, AppResult};
 
 use crate::codec::{addresses_from_json, addresses_to_json, enum_from_text, enum_to_text};
 use crate::error::map_sqlx;
@@ -58,16 +58,6 @@ use crate::error::map_sqlx;
 /// 两种都不是**数据**错误，是「再来一次就好」，所以重试；
 /// 用尽仍失败时按 `Storage`（可重试）报错，不 panic、不静默丢意图。
 const ENQUEUE_SEQ_RETRIES: u32 = 8;
-
-/// 移动 / 删除通道的 `kind` 取值：**每封邮件同时只能有一条在途**的判定依据。
-///
-/// 两个 `kind` 都是「把这封信从源文件夹搬走」的意图——不管目标是另一个文件夹
-/// 还是垃圾箱。同一封邮件上排两条，并发 flush 时就会各发一次 `MOVE`
-/// （没有 `MOVE` 的服务器上是 `COPY` + `STORE \Deleted`），目标里多出两份。
-///
-/// flag 通道**刻意不在**这里：它的载荷可以安全地叠在一起（按 `seq` 定序、
-/// 以服务器快照重算净变化），强行合并反而会丢掉用户的意图。
-const TRANSFER_KIND_VALUES: &str = "'move', 'delete'";
 
 /// `mail_operation` 表的一行。
 #[derive(Debug, Clone, FromRow)]
@@ -98,9 +88,38 @@ struct OperationRow {
 ///
 /// 意图自相矛盾（同一 bit 既置位又清除）时**直接拒绝**：
 /// 这种意图说明调用方有 bug，静默挑一个语义会掩盖它。
+///
+/// ## 幂等：同一封邮件只留一条在途的移动 / 删除意图（R34）
+///
+/// 移动 / 删除类操作插入前先在同一事务里查：这封邮件（同账户 + 文件夹 + UID +
+/// epoch）是不是已经有**未完结**（`queued` / `running` / `retryable` / `uncertain`）
+/// 的同通道操作。有就**不再插入**，直接返回 `Ok(())`——库里那条的 `seq`、
+/// 状态、重试次数一概不动。
+///
+/// 为什么必须这样：`claim_for_push` 是**按行**认领的。两条 flush 并发
+/// （actor 的 `sync_account → flush_pending` 与用户点击后的独立会话）各认领一条，
+/// 各自都看到源文件夹里还有这封 → 各发一次 `MOVE` → 目标文件夹里出两份。
+///
+/// 幂等只在「同一通道」内成立：
+/// * `Move` 与 `Delete` 算同一通道（都是「把这封信搬走」）；
+/// * `Flags` 不参与（它有自己的合并逻辑，见模块文档）；
+/// * `failed` 是终态：它之后可以再入队（用户重试时不能永远被一条放弃的旧意图挡住）。
+///
+/// ## 调用方怎么知道「这条没进去」
+///
+/// 返回值刻意保持 `AppResult<()>`：去重是**正常结果**，不是错误——
+/// 用户点了两次「移动」不该看到一条报错。需要知道「最终是哪一条」的调用方
+/// 用 [`find_pending_transfer`] 按邮件查（`apps/shell` 的入队路径就是这么做的）。
+///
+/// ## `seq` 冲突
+///
+/// 并发取 `MAX(seq) + 1` 可能撞上 `idx_mail_operation_seq`（或升级写锁时拿到
+/// `SQLITE_BUSY_SNAPSHOT`）。两种都是「再来一次就好」，所以整笔事务重试
+/// [`ENQUEUE_SEQ_RETRIES`] 次；用尽仍失败时按 `Storage`（可重试）报错。
+/// **不** panic，也**不**把唯一的用户意图静默丢掉。
 pub async fn enqueue_operation(pool: &SqlitePool, operation: &MailOperation) -> AppResult<()> {
     if operation.intent.is_contradictory() {
-        return Err(xremail_core::AppError::Invalid(format!(
+        return Err(AppError::Invalid(format!(
             "操作 {} 的意图自相矛盾：同一 bit 既要置位又要清除",
             operation.id
         )));
@@ -110,10 +129,109 @@ pub async fn enqueue_operation(pool: &SqlitePool, operation: &MailOperation) -> 
     let intent = addresses_to_json(&operation.intent, "operation.intent")?;
     let state = enum_to_text(&operation.state, "operation.state")?;
 
+    let mut attempt = 0u32;
+    loop {
+        match enqueue_once(pool, operation, &kind, &intent, &state).await {
+            Ok(()) => return Ok(()),
+            Err(err) if attempt + 1 < ENQUEUE_SEQ_RETRIES && should_retry_enqueue(&err) => {
+                attempt += 1;
+                // 退避几毫秒，让先提交的那个事务把锁放掉；毫秒级抖动足够，
+                // 再长就轮到调用方的 `busy_timeout` 兜底了。
+                tokio::time::sleep(std::time::Duration::from_millis(2 * u64::from(attempt))).await;
+            }
+            Err(err) if should_retry_enqueue(&err) => {
+                // 重试用尽：说清这是并发而不是数据坏了，且**可重试**。
+                return Err(AppError::Storage(format!(
+                    "操作 {} 入队时序号一直与并发的入队者相撞（已重试 {ENQUEUE_SEQ_RETRIES} 次）：{err}",
+                    operation.id
+                )));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// 入队事务的**一次**尝试：去重 + 分配序号 + 插入。
+///
+/// 拆出来是为了让 [`enqueue_operation`] 能在整笔事务失败时干净地重来
+/// （事务被丢弃 = 回滚，不会留下半条数据）。
+///
+/// ## 为什么先 `UPDATE` 一条「什么都没改到位」的行
+///
+/// SQLite 的默认事务是 `DEFERRED`：`SELECT` 只拿读锁，写锁到 `INSERT` 时才拿。
+/// 并发时那一步升级写锁会以 `SQLITE_BUSY_SNAPSHOT` 失败——而且 **`busy_timeout`
+/// 等不到它**，因为另一个事务已经提交、本事务的快照过期了。
+///
+/// 所以第一步先做一次定位到本行的 `UPDATE`（SQLite 对「值不变」的 `UPDATE`
+/// 也会真的写一次行），**开事务即拿写锁**。之后「查重」与「取序号 + 插入」
+/// 中间不会被别人插进来——否则 A 查完发现没有、B 也查完发现没有，两边都插入，
+/// 去重就形同虚设。这把锁是 SQLite 唯一的原子手段（没有 `SELECT ... FOR UPDATE`）。
+///
+/// `WHERE AND 0` 是刻意的：这一笔只为拿锁，不该改到任何行的任何一个值；
+/// 若哪天它真的改到了什么，那 bug 会立刻显形，而不是悄悄动了一条操作。
+async fn enqueue_once(
+    pool: &SqlitePool,
+    operation: &MailOperation,
+    kind: &str,
+    intent: &str,
+    state: &str,
+) -> AppResult<()> {
     let mut tx = pool
         .begin()
         .await
         .map_err(|e| map_sqlx(e, "enqueue_operation: begin"))?;
+
+    sqlx::query!(
+        r#"
+        UPDATE mail_operation
+        SET updated_at = updated_at
+        WHERE id = ?
+          AND 0
+        "#,
+        operation.id
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| map_sqlx(e, "enqueue_operation: lock"))?;
+
+    // 幂等：同一封邮件已有未完结的移动 / 删除意图 → 不再插入。
+    //
+    // 判定用的是**通道**（`kind IN ('move','delete')`），不是「kind 相同」：
+    // 「移动」与「删除」互相覆盖，两条都在途就会各发一次搬移命令。
+    // flag 只和 flag 撞（自己的合并逻辑）、移动/删除只和移动/删除撞，
+    // 所以写成 `(o2.kind = 'flags') = (? = 'flags')`：
+    // 传入的是 `'flags'` 时只匹配 flag 行，传入 `'move'` / `'delete'` 时只匹配搬移行。
+    let existing = sqlx::query_scalar!(
+        r#"
+        SELECT o2.id FROM mail_operation o2
+        WHERE o2.account_id = ?
+          AND o2.folder_id = ?
+          AND o2.uid = ?
+          AND o2.uidvalidity = ?
+          AND o2.id <> ?
+          AND o2.state IN ('queued', 'running', 'retryable', 'uncertain')
+          AND (o2.kind = 'flags') = (? = 'flags')
+        LIMIT 1
+        "#,
+        operation.account_id,
+        operation.folder_id,
+        operation.uid,
+        operation.uidvalidity,
+        operation.id,
+        kind,
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(|e| map_sqlx(e, "enqueue_operation: dedupe"))?;
+
+    if existing.is_some() {
+        // 已有同通道的在途意图：什么都不改（那条的 seq / 状态 / 次数原样保留），
+        // 直接结束本次事务。
+        tx.rollback()
+            .await
+            .map_err(|e| map_sqlx(e, "enqueue_operation: rollback"))?;
+        return Ok(());
+    }
 
     // 分配序号：同一账户 + 文件夹内的最大值 + 1。
     let next_seq: i64 = sqlx::query_scalar!(
@@ -162,6 +280,62 @@ pub async fn enqueue_operation(pool: &SqlitePool, operation: &MailOperation) -> 
         .map_err(|e| map_sqlx(e, "enqueue_operation: commit"))?;
 
     Ok(())
+}
+
+/// 入队失败是否值得整笔重来。
+///
+/// 只认两种：`idx_mail_operation_seq` 的唯一冲突、SQLite 的瞬时忙
+/// （`SQLITE_BUSY` / `SQLITE_BUSY_SNAPSHOT` / `SQLITE_BUSY_TIMEOUT`）。
+/// 其余一律原样上抛——把真正的数据错误重试八次只会让人等更久。
+fn should_retry_enqueue(err: &AppError) -> bool {
+    let (AppError::Invalid(text) | AppError::Storage(text)) = err else {
+        return false;
+    };
+    text.contains("idx_mail_operation_seq")
+        || text.contains("database is locked")
+        || text.contains("(code 5)")
+        || text.contains("(code 262)")
+        || text.contains("(code 517)")
+}
+
+/// 查一封邮件当前那条**未完结的移动 / 删除**操作（没有则 `None`）。
+///
+/// 入队是幂等的（见 [`enqueue_operation`]）：调用方插入后再用这个读回
+/// **真正生效的那一条**——可能正是它刚插的，也可能是已有的那条并被去重挡掉了。
+/// 不要用自己构造的 id 去 [`get_operation`]：去重命中时那个 id 根本不在库里。
+///
+/// 条件与 [`enqueue_operation`] 的去重判定**逐字一致**（同通道、同未完结集合），
+/// 否则「入队说成功、回读说没有」就会互相打架。
+pub async fn find_pending_transfer(
+    pool: &SqlitePool,
+    account_id: &str,
+    folder_id: &str,
+    uid: i64,
+    uidvalidity: i64,
+) -> AppResult<Option<MailOperation>> {
+    let rows = sqlx::query_as!(
+        OperationRow,
+        r#"
+        SELECT id, account_id, folder_id, uid, uidvalidity,
+               kind, intent, destination_folder_id, state, seq, base_version,
+               attempts, error_kind, error_message, created_at, updated_at
+        FROM mail_operation
+        WHERE account_id = ? AND folder_id = ? AND uid = ? AND uidvalidity = ?
+          AND state IN ('queued', 'running', 'retryable', 'uncertain')
+          AND kind IN ('move', 'delete')
+        ORDER BY seq ASC
+        LIMIT 1
+        "#,
+        account_id,
+        folder_id,
+        uid,
+        uidvalidity
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| map_sqlx(e, "find_pending_transfer"))?;
+
+    rows.as_ref().map(row_to_operation).transpose()
 }
 
 /// 列出某个文件夹里**还没完结**的操作。
@@ -278,6 +452,20 @@ pub async fn list_all_pending_operations(
 ///
 /// 配额由 `AND attempts < ?` 卡住：到顶的行认领失败，由对账统一收成
 /// `failed / retry_exhausted`（见 `xremail_sync::reconcile`）。
+///
+/// ## 移动 / 删除：同一封邮件同时只能有一条在途（R34）
+///
+/// 只认领到「这一行」还不够：同一封邮件可能躺着两条移动 / 删除操作
+/// （历史遗留数据）。两条并发 flush 各认领一行、各自都看到源文件夹里还有这封
+/// → 各发一次 `MOVE` → 目标文件夹里出两份。
+///
+/// 所以认领的 `WHERE` 里多一个「本邮件没有任何别的 `running`」的条件。
+/// 它必须在**同一条 `UPDATE`** 里（而不是先 `SELECT` 再 `UPDATE`）：
+/// 两条 `UPDATE` 由 SQLite 串行化，第二条看到的是第一条提交后的世界，
+/// 于是只有一条能改到行；分开查再改则两次查之间对方已经跑完，闸门形同虚设。
+///
+/// 返回 `false` 在这时表示「同一封邮件的另一条正在跑」，**不是失败**：
+/// 调用方什么都不做，等那条有了结局下一轮再说。
 pub async fn claim_for_push(
     pool: &SqlitePool,
     id: &str,
@@ -292,6 +480,19 @@ pub async fn claim_for_push(
         WHERE id = ?
           AND state IN ('queued', 'retryable', 'uncertain')
           AND attempts < ?
+          AND (
+                    kind = 'flags'
+                 OR NOT EXISTS (
+                        SELECT 1 FROM mail_operation o2
+                        WHERE o2.account_id = mail_operation.account_id
+                          AND o2.folder_id = mail_operation.folder_id
+                          AND o2.uid = mail_operation.uid
+                          AND o2.uidvalidity = mail_operation.uidvalidity
+                          AND o2.id <> mail_operation.id
+                          AND o2.state = 'running'
+                          AND o2.kind IN ('move', 'delete')
+                    )
+          )
         "#,
         now_ms,
         boot_id,
