@@ -240,6 +240,57 @@ async fn falls_back_to_select_when_examine_is_rejected() {
     assert_eq!(outcome.event, IdleEvent::Timeout);
 }
 
+/// `IDLE` 能力名大小写写花，也认得出（R41）。
+///
+/// RFC 3501 的能力名是 atom，不区分大小写；`Capabilities::has_str` 对普通
+/// atom 做的是精确比较。错误实现（用 `has_str`）：这里会返回 `Unsupported`，
+/// 一台**支持**推送的服务器被永远降级成轮询，而且用户完全无从得知。
+#[tokio::test]
+async fn idle_capability_is_matched_case_insensitively() {
+    let mut config = config_with_inbox();
+    for capability in &mut config.capabilities {
+        if capability == "IDLE" {
+            *capability = "idle".to_string();
+        }
+    }
+
+    let (_server, imap, trust) = start(config).await;
+    let session = login(&imap, &trust).await;
+
+    let outcome = idle_once(session, &idle_config(Duration::from_millis(200)))
+        .await
+        .expect("IDLE 不该失败");
+
+    assert_eq!(
+        outcome.event,
+        IdleEvent::Timeout,
+        "服务器宣告了小写的 idle，应当照样发起 IDLE 并等到超时"
+    );
+}
+
+/// 短于 1 秒的 `idle_timeout` 不被放大（R42）。
+///
+/// 错误实现：`IdleConfig::new` 把下限设成 1 秒。调度器把「本轮该等多久」
+/// 直接当 `idle_timeout`，于是「等 300ms 就轮询」变成「IDLE 至少等 1 秒」——
+/// **比不用 IDLE 还晚**，恰好违反了本模块宣称的「只可能更早」。
+#[tokio::test]
+async fn sub_second_idle_timeout_is_not_stretched() {
+    let (_server, imap, trust) = start(config_with_inbox()).await;
+    let session = login(&imap, &trust).await;
+
+    let started = std::time::Instant::now();
+    let outcome = idle_once(session, &idle_config(Duration::from_millis(300)))
+        .await
+        .expect("IDLE 不该失败");
+    let elapsed = started.elapsed();
+
+    assert_eq!(outcome.event, IdleEvent::Timeout);
+    assert!(
+        elapsed < Duration::from_millis(950),
+        "300ms 的超时不该被拉长到 1 秒，实际用了 {elapsed:?}"
+    );
+}
+
 /// 配置里的 `idle_timeout` 再离谱，也不会超过 RFC 2177 的 29 分钟。
 ///
 /// 这是防回归：真有人把 `idle_timeout` 配成两小时，服务器会先按不活跃踢掉连接，

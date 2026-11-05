@@ -86,10 +86,33 @@ pub struct IdleOutcome {
 }
 
 impl IdleConfig {
-    /// RFC 2177 §3 建议的重发上限：29 分钟。
-    pub const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(29 * 60);
+    /// 一次 `IDLE` 最长保持多久——**远在** RFC 2177 的 29 分钟以内。
+    ///
+    /// RFC 2177 §3 只要求「至少每 29 分钟重发一次」，但 29 分钟太贴边：
+    /// 真实服务器（以及中间的负载均衡、NAT 网关）通常按 **30 分钟**判不活跃，
+    /// 刚好卡在边上就意味着「客户端打算重发的那一刻，服务器已经打算踢你」，
+    /// 表现为偶发的、很难归因的「IDLE 期间被断开」。留 4 分钟余量，
+    /// 让重发永远发生在服务器下判定之前（R41）。
+    pub const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(25 * 60);
 
-    /// 造一份配置，`idle_timeout` 会被夹到 1 秒..=[`Self::MAX_IDLE_TIMEOUT`]。
+    /// RFC 2177 §3 的硬上限：**不得**超过 29 分钟。
+    ///
+    /// [`Self::MAX_IDLE_TIMEOUT`] 必须 ≤ 它，否则就是违反 RFC。
+    pub const RFC_IDLE_LIMIT: Duration = Duration::from_secs(29 * 60);
+
+    /// 一次 `IDLE` 最短保持多久。
+    ///
+    /// 不设「1 秒下限」了（R42）：下限会把调用方**明确给的**短超时静默改成
+    /// 1 秒，测试里传 300ms 实际等 1 秒，看起来绿、其实没测到东西；
+    /// 更糟的是调度器把「本轮该等多久」直接当 `idle_timeout` 用，
+    /// 于是「等 300ms 再轮询」变成「IDLE 等 1 秒」，**比纯轮询还晚**。
+    ///
+    /// 下限只剩一个理由：零会让 `IDLE` 变成忙循环，所以夹到 1 毫秒。
+    /// 真正的忙循环由调用方负责（调度器有自己的最小间隔）。
+    pub const MIN_IDLE_TIMEOUT: Duration = Duration::from_millis(1);
+
+    /// 造一份配置，`idle_timeout` 会被夹到
+    /// [`Self::MIN_IDLE_TIMEOUT`]..=[`Self::MAX_IDLE_TIMEOUT`]。
     ///
     /// 夹紧而不是报错：`idle_timeout` 来自账户配置，用户填个 0 或填个
     /// 两小时都属于「意图合理但数值不对」，静默修正比让同步彻底不可用更好。
@@ -101,7 +124,7 @@ impl IdleConfig {
         let mailbox = mailbox.into();
         Self {
             command_timeout,
-            idle_timeout: idle_timeout.clamp(Duration::from_secs(1), Self::MAX_IDLE_TIMEOUT),
+            idle_timeout: idle_timeout.clamp(Self::MIN_IDLE_TIMEOUT, Self::MAX_IDLE_TIMEOUT),
             mailbox: if mailbox.trim().is_empty() {
                 "INBOX".to_string()
             } else {
@@ -137,7 +160,7 @@ pub async fn idle_once(
         .map_err(|_| ProtocolError::Timeout("读取能力集超时（IDLE 前）".into()))?
         .map_err(|e| ProtocolError::Imap(format!("读取能力集失败（IDLE 前）: {e}")))?;
 
-    if !capabilities.has_str("IDLE") {
+    if !crate::has_capability(&capabilities, "IDLE") {
         debug!(mailbox = %config.mailbox, "服务器未宣告 IDLE，跳过");
         return Ok(IdleOutcome {
             event: IdleEvent::Unsupported,
@@ -153,11 +176,26 @@ pub async fn idle_once(
     // 先试只读的 `EXAMINE`：观察者不该有副作用（`SELECT` 会清掉 `\Recent`）。
     // 但有的服务器/代理会拒 `EXAMINE`，那就退回 `SELECT`——
     // **拿不到推送比丢个 `\Recent` 标记严重得多**。
+    //
+    // 退回**只在服务器明确回了 `NO`** 时发生（R41）：`NO` 说明 `EXAMINE`
+    // 确实没执行，换 `SELECT` 读同一个文件夹是安全的。超时、断连、
+    // 解析失败则说明连接状态已经不可信，此时再发 `SELECT` 只是把
+    // 一个明确的「连接坏了」拖成第二次超时，还会把真正的原因埋掉。
     let examined = tokio::time::timeout(config.command_timeout, session.examine(&config.mailbox))
         .await
-        .map_err(|_| ProtocolError::Timeout(format!("EXAMINE {} 超时", config.mailbox)))?;
+        .map_err(|_| ProtocolError::Timeout(format!("EXAMINE {} 超时", config.mailbox)))?
+        .map_err(|e| {
+            if is_server_rejection(&e) {
+                ProtocolError::Rejected(format!("EXAMINE {}: {e}", config.mailbox))
+            } else {
+                ProtocolError::Imap(format!("EXAMINE {} 失败: {e}", config.mailbox))
+            }
+        });
 
-    if examined.is_err() {
+    if let Err(rejection) = examined {
+        if !matches!(rejection, ProtocolError::Rejected(_)) {
+            return Err(rejection);
+        }
         debug!(
             mailbox = %config.mailbox,
             "EXAMINE 被拒，退回 SELECT（放弃只读，但拿到 IDLE 更重要）"
@@ -212,6 +250,17 @@ pub async fn idle_once(
     Ok(IdleOutcome { event, session })
 }
 
+/// 这个错误是不是「服务器明确回了 `NO`」。
+///
+/// `Session::examine` 是 `async-imap` 的原生接口，`NO` 会被翻成
+/// `async_imap::error::Error::No`，而 [`crate::connection`] 的映射表把
+/// `NO` 与 `BAD`、解析失败一起折成 [`ProtocolError::Imap`]。这里要区分它们：
+/// 只有 `NO` 才能安全地换一条读命令重试（R41）。
+#[must_use]
+fn is_server_rejection(error: &async_imap::error::Error) -> bool {
+    matches!(error, async_imap::error::Error::No(_))
+}
+
 /// 把一次 `IDLE` 期间收到的响应归类。
 ///
 /// ## 为什么默认是 `MailboxChanged` 而不是「忽略」
@@ -254,17 +303,30 @@ mod tests {
 
     #[test]
     fn config_clamps_idle_timeout() {
-        // 用户填 0：夹到 1 秒，而不是「立刻超时」的忙循环。
+        // 用户填 0：夹到最小非零值，而不是「立刻超时」的忙循环。
         let config = IdleConfig::new(Duration::from_secs(10), Duration::ZERO, "INBOX");
-        assert_eq!(config.idle_timeout, Duration::from_secs(1));
+        assert_eq!(config.idle_timeout, IdleConfig::MIN_IDLE_TIMEOUT);
 
-        // 用户填两小时：夹到 RFC 2177 的 29 分钟。
+        // 用户填两小时：夹到 [`IdleConfig::MAX_IDLE_TIMEOUT`]。
         let config = IdleConfig::new(
             Duration::from_secs(10),
             Duration::from_secs(2 * 60 * 60),
             "INBOX",
         );
         assert_eq!(config.idle_timeout, IdleConfig::MAX_IDLE_TIMEOUT);
+    }
+
+    #[test]
+    fn config_keeps_sub_second_idle_timeout() {
+        // R42：下限不能把调用方给的 300ms 静默改成 1 秒。
+        // 调度器把「本轮该等多久」直接当 `idle_timeout`，
+        // 一旦被放大，IDLE 就比纯轮询**还晚**醒来。
+        let config = IdleConfig::new(
+            Duration::from_secs(10),
+            Duration::from_millis(300),
+            "INBOX",
+        );
+        assert_eq!(config.idle_timeout, Duration::from_millis(300));
     }
 
     #[test]
@@ -276,8 +338,16 @@ mod tests {
     }
 
     #[test]
-    fn max_idle_timeout_is_under_29_minutes() {
+    fn max_idle_timeout_leaves_room_under_29_minutes() {
         // RFC 2177 §3：至少每 29 分钟重发一次。这是防回归的硬约束。
-        assert!(IdleConfig::MAX_IDLE_TIMEOUT <= Duration::from_secs(29 * 60));
+        assert!(IdleConfig::MAX_IDLE_TIMEOUT <= IdleConfig::RFC_IDLE_LIMIT);
+
+        // 而且**不是贴边**：常见的不活跃判定是 30 分钟，
+        // 卡在 29 分钟意味着「重发」和「被踢」挤在同一时刻（R41）。
+        let margin = IdleConfig::RFC_IDLE_LIMIT - IdleConfig::MAX_IDLE_TIMEOUT;
+        assert!(
+            margin >= Duration::from_secs(4 * 60),
+            "29 分钟上限下要留足余量，现在只剩 {margin:?}"
+        );
     }
 }
