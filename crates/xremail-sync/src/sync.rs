@@ -99,11 +99,29 @@ pub async fn sync_account_as_with(
     }
 
     // 1. 服务器上的文件夹。
+    //
+    // **别拍平成 `AppError::Protocol`**：`list_folders` 的失败里既有「命令本身
+    // 不成立」（`NO`、解析失败），也有「连接在看它之前就没了」（`Io` / 超时 / `BYE`）。
+    // 前者重连一万次也一样失败，后者一重连就好——后者必须能被
+    // [`crate::net::is_session_recoverable`] 认出来（走的是短重连退避），
+    // 否则一次抖动就要等满整个 `poll_interval`。
     let remote = list_folders_with_timeout(session, options.command_timeout)
         .await
-        .map_err(|e| AppError::Protocol(format!("列文件夹失败: {e}")))?;
+        .map_err(crate::pull::map_protocol_error)?;
 
     let mut summary = SyncSummary::default();
+    // 这一轮里「**会话死了**」的第一个证据。
+    //
+    // 为什么会出现在这里：本函数对单个文件夹的失败是**宽容**的（只 warn 后继续，
+    // 见下面的 `Err(error)` 分支），因为邮箱里常有一个文件夹是坏的（权限不足之类）。
+    // 但「宽容」被套用在**连接断了**上就变了味：断线之后剩下的每个文件夹都会
+    // 各自失败一次，而函数最后仍然返回 `Ok(summary)`——actor 把它当成功，
+    // 于是要等满 `poll_interval` 才重新连上。B1「断线重连」的缺口正在于此。
+    //
+    // 处置：连接类失败**照旧不中断本轮**（已拉回来的数据不丢、其余文件夹照走），
+    // 但记下来，收尾时按「会话可恢复」上报。判据只看**错误本身**，
+    // 有疑义时按会话已死处理——代价只是更早重连一次，而漏判的代价是掉线数分钟。
+    let mut session_failure: Option<AppError> = None;
 
     for item in remote {
         // 2. 本地文件夹记录。
@@ -165,8 +183,20 @@ pub async fn sync_account_as_with(
                     %error,
                     "文件夹同步失败，继续下一个"
                 );
+                if session_failure.is_none() && crate::net::is_session_recoverable(&error) {
+                    session_failure = Some(error);
+                }
             }
         }
+    }
+
+    // 连接断了：本轮的容错到此为止，交给 actor 走短重连退避。
+    //
+    // 放在**收尾**而不是中途 `return`：同一轮里已经拉回来的文件夹不该被丢掉，
+    // 而且断线时剩下的文件夹每个都会立刻失败（毫秒级，不会等超时），
+    // 走完再上报不多花多少时间。
+    if let Some(error) = session_failure {
+        return Err(error);
     }
 
     Ok(summary)

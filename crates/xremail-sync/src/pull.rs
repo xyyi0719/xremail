@@ -34,6 +34,7 @@ use xremail_protocol_imap::{CommandOutcome, ProtocolError, Session, examine_chec
 
 use crate::diff::{UidSet, diff_uids};
 use crate::epoch::{EpochTransition, StoredEpoch, plan_epoch_transition};
+use crate::error::classify_session_error;
 use crate::net::{SyncOptions, run_checked_with_timeout_for};
 use xremail_store::dao::message as message_dao;
 use xremail_store::dao::sync::{FolderSyncWrite, commit_folder_sync};
@@ -83,6 +84,13 @@ impl FolderSyncReport {
 /// **公开**是有意的：外壳层的「连接并登录」也要走这里。那里曾把登录错误
 /// 一律拍平成 `AppError::Protocol`，结果「授权码错了」被当成了可重试的协议错，
 /// 永久重连。见 `docs/ISSUES_AND_RISKS.md` 的 R25。
+/// 命令上的 `NO` / `BAD`、`BYE`、超时、解析失败都会走到 `other` 这一支。
+///
+/// 其中「超时」「`BYE`」「解析失败」其实是**连接已经不可信**的证据，与
+/// [`ProtocolError::Io`] 同族，只是当年被拍平成了 `Protocol`。所以这一支
+/// **逐个判**，不一律当语义错误：`with_context` 保留类别，只有会话类的那几支
+/// 被标成会话错误（见 [`crate::error`]），这样 [`crate::net::is_session_recoverable`]
+/// 才分得清「文件夹不存在」和「连接断了」。
 pub fn map_protocol_error(error: ProtocolError) -> AppError {
     match error {
         ProtocolError::Auth(detail) => AppError::Auth(detail),
@@ -90,6 +98,18 @@ pub fn map_protocol_error(error: ProtocolError) -> AppError {
         ProtocolError::Timeout(detail) => AppError::Network(detail),
         ProtocolError::Connect(detail) => AppError::Network(detail),
         ProtocolError::Unsupported(detail) => AppError::Unsupported(detail),
+        ProtocolError::Rejected(detail) => AppError::Protocol(detail),
+        // `Imap` 只有一个类别，装了两件**性质相反**的事：
+        //   * 读帧/解析失败、`BYE`、IDLE 被中断 → 连接已经不可信；
+        //   * `NO` / `BAD` → 协议层**明确**说过命令没执行，连接可能好得很。
+        // 只能靠文本分：认得出的断线信号打上标记，其余按语义错误处理。
+        ProtocolError::Imap(detail) => {
+            if crate::net::is_dead_session_text(&detail) {
+                classify_session_error(AppError::Protocol(detail))
+            } else {
+                AppError::Protocol(detail)
+            }
+        }
         other => AppError::Protocol(other.to_string()),
     }
 }
@@ -395,12 +415,16 @@ mod tests {
 
     /// 但命令上的 `NO`（`ProtocolError::Imap`）只能是 `AppError::Protocol`，
     /// 不能是 `Auth`——否则删个文件夹就把账户判死。
+    ///
+    /// 它同时也不该被当成「会话已死」的去重信号：`NO` 是协议层**明确**说过
+    /// 这条命令不成立，连接本身可能好得很。误判只是多连一次，不是安全问题，
+    /// 但会让「文件夹不存在」这类语义错误也走短重连。
     #[test]
     fn map_protocol_error_keeps_command_no_as_protocol() {
-        assert!(matches!(
-            map_protocol_error(ProtocolError::Imap("文件夹不存在".into())),
-            AppError::Protocol(_)
-        ));
+        let mapped = map_protocol_error(ProtocolError::Imap("文件夹不存在".into()));
+        assert!(matches!(mapped, AppError::Protocol(_)));
+        // 这条走的是兜底文本判据：`NO` 的原文里没有断线证据，所以不会被误判。
+        assert!(!crate::net::is_session_recoverable(&mapped));
     }
 
     /// 传输层故障与超时都是可重试的网络错。

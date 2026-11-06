@@ -151,6 +151,7 @@ pub enum AccountEvent {
     Failed {
         account_id: String,
         reason: WakeReason,
+        /// **展示用**的错误文本（会话类错误的内部标记已剥掉）。
         error: String,
         /// 下一轮在多久之后。
         retry_in: Duration,
@@ -241,6 +242,46 @@ pub struct RetryPolicy {
     /// 后者是「两轮同步之间隔多久」。把两者混用会导致轮询间隔很长时
     /// 一条卡住的命令要等上几分钟才报错。
     pub command_timeout: Duration,
+    /// 「**会话已经死了**」的那类失败（`BYE`、`Io`、超时、IDLE 期间断开）
+    /// 之后的首次重连间隔。
+    ///
+    /// ## 为什么要和 `min_backoff` 分开
+    ///
+    /// 两者回答的是不同的问题：
+    ///
+    /// * `min_backoff` 是「**这一轮失败了**，服务器现在可不可用」——服务器在维护、
+    ///   我们在被限流、库被锁……这时候慢一点是**善意**的（别去砸人家）；
+    /// * 这里是「**连接断了**，服务器本身好好的」——`BYE` 是部署、NAT 超时、
+    ///   手机切网、笔记本合盖，服务器下一秒就能接受新连接。
+    ///
+    /// 用 `min_backoff`（默认 5s，且退避马上翻倍，一轮失败就是 5/10/20/40…）
+    /// 去等一个 `BYE`，用户体验就是「合上盖子再打开，邮件十几秒才回来」，
+    /// 而且 `poll_interval`（默认 300s）根本救不了它。所以这里给会话类失败
+    /// 一条**更短**的序列：1s → 2s → 4s → 8s → 16s → 32s →（之后由
+    /// [`Self::max_backoff`] 封顶，默认 300s）。
+    ///
+    /// ## 为什么不叠加成两套节奏
+    ///
+    /// 用的**不是**两套计数器：会话类失败只是**换了一个起点**，序列本身
+    /// 还是同一条（同一条 [`Self::grow`]，同一个 [`Self::max_backoff`] 封顶）：
+    ///
+    /// ```text
+    /// 会话类失败第 1 次： min_reconnect_backoff                （默认 1s）
+    /// 会话类失败第 2 次： grow(min_reconnect_backoff)          （2s）
+    /// 会话类失败第 n 次： 连续 grow n-1 次                     （4s、8s……封顶 max_backoff）
+    /// 其它失败：          grow(上一个 backoff)，与 B1 之前完全一致（5s、10s……）
+    /// 成功：              两个计数都清零
+    /// ```
+    ///
+    /// 「连续掉了几次」由 `run` 里的 `reconnect_count` 记着，落在
+    /// [`Self::reconnect_wait`] 里算，成功一轮清零。这样**任何时刻只有一个
+    /// 退避值**，谁也不会把另一个的节奏带偏；连着掉时会翻倍、会封顶，
+    /// 不会变成热循环。
+    ///
+    /// 特别是**没有**给短序列单独设一个更小的上限：两个上限叠在一起会让
+    /// 长故障里的「断线重连」反而不比普通失败快，甚至更慢（短上限先封顶），
+    /// 那就真是两套互相打架的节奏了。
+    pub min_reconnect_backoff: Duration,
 }
 
 impl Default for RetryPolicy {
@@ -252,15 +293,58 @@ impl Default for RetryPolicy {
             max_backoff: Duration::from_secs(300),
             max_consecutive_panics: 3,
             command_timeout: Duration::from_secs(30),
+            min_reconnect_backoff: Duration::from_secs(1),
         }
     }
 }
 
 impl RetryPolicy {
     /// 退避翻倍，封顶 [`Self::max_backoff`]。
+    ///
+    /// **没有**下限：下限是「起点」的事（主循环从 [`Self::min_backoff`] 起步，
+    /// [`Self::reconnect_wait`] 从 `min_reconnect_backoff` 出发），
+    /// `grow` 只管「这次比上次长一倍」。
+    /// 这里曾经夹了一个 `.max(min_backoff)`，B1 之后它会把短序列的第二次、
+    /// 第三次直接抬到 `min_backoff` 以上，等于短序列只短了一次。
     pub fn grow(&self, current: Duration) -> Duration {
         let doubled = current.saturating_mul(2);
-        doubled.min(self.max_backoff).max(self.min_backoff)
+        doubled.min(self.max_backoff)
+    }
+
+    /// 会话类失败之后，下一轮等多久。
+    ///
+    /// **只有下限**，没有独立的上限：短序列的封顶就是普通退避的封顶
+    /// （[`Self::max_backoff`]）。不另设一个小得多的上限是有意的——
+    /// 两套上限叠在一起会让「会话类失败」在长故障里**比**普通失败还慢
+    /// （短上限早就封顶了，而那时普通退避还在往上长），
+    /// 那就成了两套互相打架的节奏。所以这里只做一件事：把「起点」压短。
+    ///
+    /// 下限就是 [`Self::min_reconnect_backoff`]（默认 1s），**不**再夹一个
+    /// `min_backoff`：后者是普通失败的起点，夹进来会让短序列一上来就是 5s，
+    /// 「短起点」就白设了。末尾的 `1ms` 是给「两个下限都被配成 0」的手滑兜底：
+    /// 0 秒的重连就是忙循环。
+    ///
+    /// **不看当前退避值**（所以没有入参）：这正是「起点」的含义——不管上一轮
+    /// 已经长到 12s 还是 40s，掉线之后的这一次都从 1s 重新算。连续失败时的
+    /// 翻倍由 [`Self::grow`] 负责，这里再掺一脚就会变成「一次失败翻两倍」。
+    pub fn reconnect_delay(&self) -> Duration {
+        self.min_reconnect_backoff.max(Duration::from_millis(1))
+    }
+
+    /// 连续掉了第 `dropped` 次（0 起）会话之后，下一次重连等多久。
+    ///
+    /// 就是「从短起点出发，连续 [`Self::grow`] 几脚」：
+    /// `dropped = 0` → 1s，`1` → 2s，`2` → 4s……照样封顶 [`Self::max_backoff`]。
+    ///
+    /// 这样短序列**只有一条**，而且和普通退避共用同一个翻倍与封顶：
+    /// 不是两套计数器、两套上限。`dropped` 由主循环记，成功一轮清零，
+    /// 所以「掉一次就回来」是常态，「反复掉」才会真的退避。
+    ///
+    /// 用循环而不是 `1 << n` 之类的移位：`Duration` 的 `saturating_mul` 已经
+    /// 管住了溢出，而这里的 `n` 在封顶之后就只等于 `max_backoff` 的 log2，
+    /// 迭代次数很小，可读性比位运算重要。
+    pub fn reconnect_wait(&self, dropped: u32) -> Duration {
+        (0..dropped).fold(self.reconnect_delay(), |wait, _| self.grow(wait))
     }
 
     /// 某个账户的正常轮询间隔。
@@ -309,6 +393,21 @@ enum Command {
 enum Change {
     /// 到了该同步的时刻（或服务器推来了一封信）。
     Wake(WakeReason),
+    /// 等待期里**连接断了**（不是到点，也不是有人推）。
+    ///
+    /// B1「断线重连」：只可能由 `IDLE` 那条连接在等待期间断掉产生。
+    /// 主循环看到它就按短重连退避**立刻**来一轮，而不是把它当「没被叫醒」
+    /// 等满整个 `poll_interval`——那等于「开着就不掉线」这个目标的正面失败。
+    ///
+    /// 为什么不像以前那样顺手把 `idle_supported` 关掉（R37）：那次关掉的
+    /// 理由是「`IDLE` 失败几乎是服务器侧的确定性拒绝」。`BYE` / 读帧失败 / 超时
+    /// 完全不是那回事——服务器上一秒还好好的，下一秒就断开了，`IDLE` 本身没毛病。
+    /// 真把它关了，那么在 `poll_interval` 设成 10 分钟时，用户要**等 10 分钟**
+    /// 才可能收到推送；开着则下一次握手就恢复了。
+    ///
+    /// 防忙循环：这里只**触发一次**短退避重连，退避照样翻倍、封顶 30s，
+    /// 服务器连续掐断时节奏会自己慢下来（见 [`RetryPolicy::min_reconnect_backoff`]）。
+    Disconnected(WakeReason),
     /// 等的时候来了一条命令。
     Command(Option<Command>),
 }
@@ -474,11 +573,15 @@ impl AccountActor {
     /// 只可能让它变早。这一点比「新加一条唤醒通道」好管得多：
     /// 推送丢了也仅仅退化成原来的延迟。
     ///
-    /// ## 失败一律退回纯等待
+    /// ## 失败怎么办：按「会话死没死」分两种
     ///
-    /// 连接不上、`IDLE` 被拒、连接半死……全都等到 `deadline` 之后按
-    /// `on_timeout` 走。**绝不提前返回**：提前返回会让「连不上服务器」变成
-    /// 「每一轮都多跑一次同步」，反而把错误放大成忙循环。
+    /// * **连不上**（`connect` 失败）——服务器现在可能是真不可用，重复握手只会
+    ///   更糟。所以**不提前返回**，等到 `deadline` 之后按 `on_timeout` 走
+    ///   （老行为，未改动）；
+    /// * **连上了又断**（`idle_once` 期间 `BYE` / 读帧失败 / 超时）——这不是
+    ///   「连不上」，是「掉线了」。B1：立刻返回 [`Change::Disconnected`]，
+    ///   由主循环按短重连退避（1s 起、翻倍、封顶 30s）重连，**不等满 `wait`**。
+    ///   忙循环的风险由那条退避兜住，不需要靠「空等满一个轮询周期」来兜。
     ///
     /// 两种情况都要让主循环看得见（R28）：
     /// * 正常：本轮该报的 [`WakeReason`]；
@@ -557,6 +660,10 @@ impl AccountActor {
         let session = match self.connector.connect(&self.account).await {
             Ok(session) => session,
             Err(error) => {
+                // **连不上**（不是「连上了又断」）：服务器现在可能真的不可用，
+                // 每轮多握手一次只会更糟。所以仍然等满本轮、按 `on_timeout` 走，
+                // 由 `tick` 那一轮去报 `Failed` 并走普通退避（B1 只改了
+                // 「连上了又断」这一种，见 [`Change::Disconnected`]）。
                 tracing::debug!(
                     account = %self.account.email,
                     %error,
@@ -601,19 +708,35 @@ impl AccountActor {
                 }
             },
             Err(error) => {
-                // 连接在 IDLE 期间坏了。**不**提前返回：把它当「没被叫醒」，
-                // 等到点正常同步，否则坏连接会变成忙循环。
+                // 连接在 IDLE 期间坏了。B1（断线重连）：这**不是**「没被叫醒」，
+                // 这是「会话已经死了」——立刻交给主循环走短重连退避，而不是等满
+                // 这一轮的 `wait`（`poll_interval` 可能是 5 分钟）。
                 //
-                // 也不再把 `IDLE` 当「可能支持」一直试下去（R37）：`IDLE`
-                // 失败几乎总是服务器侧的确定性拒绝（`init` 拿到带标签的 `NO`）。
-                // 每轮都先建一条连接、握手、`EXAMINE`、再被拒——付 30 秒超时的
-                // 代价换一个必然的失败，还和正常同步抢连接数。既然这一轮已经
-                // 证明了「用不了」，就降回纯轮询；下次 `start`（用户手动同步、
-                // 重启应用）会重新探测。
+                // 这里判断的是「这次失败说明会话死了吗」，而不是「IDLE 这个功能
+                // 还能不能信」：
+                // * 会话类（`BYE` / 读帧失败 / 超时 / 半死连接）→
+                //   [`Change::Disconnected`]，主循环按 1s→2s→4s… 重连，
+                //   **保留** `idle_supported`（服务器下一轮照样能推）；
+                // * 语义类（`IDLE` 初始化被 `NO` 拒了）→ 仍是 R37 的处置：
+                //   降回纯轮询，本轮等到点，下次 `start` 再探测。
+                //
+                // 为什么「不提前返回」这条老理由在这里不成立：老注释担心的是
+                // 「坏连接会变成忙循环」。忙循环的成因是**零等待**重试，而这里
+                // 主循环拿到 `Disconnected` 之后要等 `min_reconnect_backoff`
+                // （1s 起、翻倍、封顶 30s）才重连——与失败退避同一条曲线。
+                let error = crate::pull::map_protocol_error(error);
+                if crate::net::is_session_recoverable(&error) {
+                    tracing::debug!(
+                        account = %self.account.email,
+                        %error,
+                        "IDLE 期间连接断了，立刻走短退避重连"
+                    );
+                    return Change::Disconnected(on_timeout);
+                }
                 tracing::debug!(
                     account = %self.account.email,
                     %error,
-                    "IDLE 失败，以后只用轮询，本轮仍然等到点"
+                    "IDLE 失败（不是断线），以后只用轮询，本轮仍然等到点"
                 );
                 self.idle_supported = Some(false);
                 wait_until(deadline).await;
@@ -631,7 +754,12 @@ impl AccountActor {
         let mut reason = WakeReason::Startup;
         // 定时器到点时该报什么原因：正常轮询是 `Poll`，失败后的退避是 `Retry`。
         let mut timeout_reason = WakeReason::Poll;
+        // **唯一**的退避基数。会话类失败会把它压回短序列
+        // （见 [`RetryPolicy::min_reconnect_backoff`]），成功时一律重置。
         let mut backoff = self.policy.min_backoff;
+        // 连续掉了几次会话。会话类失败用它决定短序列走了几脚
+        // （1s → 2s → 4s ……），成功一轮或换了别的失败就清零。
+        let mut reconnect_count: u32 = 0;
         let mut panics: u32 = 0;
         // 因为「要人重新授权」退出时，不要再报 `Stopped`——
         // 那会把 UI 上的「需要重新授权」盖成「空闲」，等于把要人管的状态藏起来。
@@ -657,6 +785,23 @@ impl AccountActor {
                             Some(Command::Sync(next)) => reason = next,
                         },
                         Ok(Change::Wake(next)) => reason = next,
+                        // 等待期连接断了（B1）：**立刻**来一轮，不等满这一轮的 `wait`。
+                        Ok(Change::Disconnected(next)) => {
+                            // 等待期断线（B1）：**立刻**来一轮，不等满这一轮的
+                            // `wait`；等待时间用短序列（1s → 2s → 4s …），因为
+                            // 「刚同步完、服务器好好的，只是 IDLE 那条连接被掐了」
+                            // 完全可以下一秒就回来。
+                            //
+                            // 与 `tick` 失败共用同一个 `reconnect_count`：
+                            // 反复掉线才退避，掉一次就回来。
+                            backoff = self.policy.reconnect_wait(reconnect_count);
+                            reconnect_count = reconnect_count.saturating_add(1);
+                            let retry_in = backoff;
+                            reason = next;
+                            timeout_reason = WakeReason::Retry;
+                            delay = Some(retry_in);
+                            continue;
+                        }
                         // 等待期 panic（R28）：和 `tick` 里的 panic 走**同一套**
                         // 计数与退避。否则「每轮都 panic 的等待」会让账户
                         // 表面正常、实际一轮都同步不了，还永远不会被放弃。
@@ -712,6 +857,7 @@ impl AccountActor {
                 Ok(summary) => {
                     panics = 0;
                     backoff = self.policy.min_backoff;
+                    reconnect_count = 0;
                     timeout_reason = WakeReason::Poll;
                     delay = Some(self.policy.interval_for(&self.account));
                     // R33：先把该有结论的意图收掉，再报「这一轮已完成」，
@@ -746,8 +892,24 @@ impl AccountActor {
                         break;
                     }
 
+                    let session_recoverable = crate::net::is_session_recoverable(&error);
+                    // 结算：**只有**会话类失败走短序列
+                    // （[`RetryPolicy::reconnect_wait`]：1s → 2s → 4s …）；
+                    // 其它失败（连不上、语义错误）接着当前的 `backoff` 翻倍，
+                    // 与 B1 之前一模一样。
+                    //
+                    // 两条路都只调一次 [`RetryPolicy::grow`]-等价的翻倍，
+                    // 而且共用主循环里**同一个** `backoff` 变量：
+                    // 任何时刻只有一个退避值，不是两套互相打架的节奏。
+                    // 理由见 [`RetryPolicy::min_reconnect_backoff`]。
+                    if session_recoverable {
+                        backoff = self.policy.reconnect_wait(reconnect_count);
+                        reconnect_count = reconnect_count.saturating_add(1);
+                    } else {
+                        backoff = self.policy.grow(backoff);
+                        reconnect_count = 0;
+                    }
                     let retry_in = backoff;
-                    backoff = self.policy.grow(backoff);
                     timeout_reason = WakeReason::Retry;
                     delay = Some(retry_in);
                     emit(
@@ -755,7 +917,9 @@ impl AccountActor {
                         AccountEvent::Failed {
                             account_id: account_id.clone(),
                             reason,
-                            error: error.to_string(),
+                            // 会话类错误带的内部标记在**这里**剥掉：
+                            // 用户看到的文案与打标记之前一字不差。
+                            error: crate::error::user_facing(error).to_string(),
                             retry_in,
                         },
                     );
@@ -1005,6 +1169,9 @@ mod tests {
             max_backoff: Duration::from_secs(40),
             max_consecutive_panics: 3,
             command_timeout: Duration::from_secs(5),
+            // 短重连序列：100ms → 200ms → 400ms → 800ms，之后按 `max_backoff`
+            // （40s）封顶——短序列**没有**独立的上限，理由见字段文档。
+            min_reconnect_backoff: Duration::from_millis(100),
         }
     }
 
@@ -1048,8 +1215,20 @@ mod tests {
     #[test]
     fn backoff_never_goes_below_the_floor() {
         let p = policy();
-        // 手改过的库可能给出 0；退避不能变成热循环。
-        assert_eq!(p.grow(Duration::ZERO), Duration::from_secs(5));
+        // 手改过的库 / 手滑的配置可能给出 0；退避不能变成热循环。
+        // 下限在**起点**：普通失败从 `min_backoff` 起步……
+        assert_eq!(p.grow(p.min_backoff), Duration::from_secs(10));
+        // ……会话类失败从短起点起步，同样不会降到 0。
+        assert_eq!(p.reconnect_wait(0), Duration::from_millis(100));
+        let zero = RetryPolicy {
+            min_backoff: Duration::ZERO,
+            min_reconnect_backoff: Duration::ZERO,
+            ..policy()
+        };
+        // 两个下限都被配成 0 的手滑兜底：`reconnect_delay` 仍然给 1ms，
+        // 不会退化成 0 秒重连（忙循环）。
+        assert_eq!(zero.reconnect_delay(), Duration::from_millis(1));
+        assert_eq!(zero.grow(zero.reconnect_delay()), Duration::from_millis(2));
     }
 
     #[test]
@@ -1117,5 +1296,117 @@ mod tests {
         assert_eq!(WakeReason::Manual.as_str(), "manual");
         assert_eq!(WakeReason::Poll.as_str(), "poll");
         assert_eq!(WakeReason::Retry.as_str(), "retry");
+    }
+
+    /// B1 的正文（一）：会话类失败走**短**序列，而不是 5s 起的普通退避。
+    ///
+    /// 钉住整条短序列：1s → 2s → 4s……（测试 policy 是 100ms 的同一形状），
+    /// 而且**掉一次就回来**：第 0 次掉线等的是 `min_reconnect_backoff` 本身，
+    /// 不是它的两倍。
+    #[test]
+    fn a_dead_session_reconnects_on_the_short_sequence() {
+        let p = policy();
+        assert_eq!(p.min_reconnect_backoff, Duration::from_millis(100));
+
+        // 短序列：100 → 200 → 400 → 800ms（测试 policy 的 max_backoff 是 40s）。
+        assert_eq!(p.reconnect_wait(0), Duration::from_millis(100));
+        assert_eq!(p.reconnect_wait(1), Duration::from_millis(200));
+        assert_eq!(p.reconnect_wait(2), Duration::from_millis(400));
+        assert_eq!(p.reconnect_wait(3), Duration::from_millis(800));
+        assert_eq!(p.reconnect_delay(), Duration::from_millis(100));
+
+        // 而普通失败从当前位置继续长，封顶 max_backoff（主循环自己接着 `backoff`）。
+        assert_eq!(p.grow(Duration::from_secs(12)), Duration::from_secs(24));
+        assert_eq!(p.grow(Duration::from_secs(40)), Duration::from_secs(40));
+
+        // 默认 policy（生产）：会话类第一次 1s，普通失败第一次 10s——
+        // 短一档且**只有一档**，不会热循环。见 `RetryPolicy::min_reconnect_backoff`。
+        let d = RetryPolicy::default();
+        assert_eq!(d.min_reconnect_backoff, Duration::from_secs(1));
+        assert_eq!(d.reconnect_wait(0), Duration::from_secs(1));
+        assert_eq!(d.reconnect_wait(1), Duration::from_secs(2));
+        assert_eq!(d.reconnect_wait(2), Duration::from_secs(4));
+        assert_eq!(d.reconnect_wait(5), Duration::from_secs(32));
+        assert_eq!(d.grow(d.min_backoff), Duration::from_secs(10));
+    }
+
+    /// B1 的正文（二）：非会话类失败**不**被短序列带快。
+    ///
+    /// 否则「服务器在维护」会被 1 秒一次的握手砸得更惨。
+    #[test]
+    fn a_server_side_failure_keeps_the_ordinary_backoff() {
+        let p = policy();
+        // 普通失败：主循环接着当前的 `backoff` 翻倍，5s → 10s → 20s……
+        assert_eq!(p.grow(p.min_backoff), Duration::from_secs(10));
+        assert_eq!(p.grow(Duration::from_secs(20)), Duration::from_secs(40));
+        // 会话类是短的：同一时刻它从 100ms 起，按 200ms / 400ms 翻倍。
+        assert_eq!(p.reconnect_wait(0), Duration::from_millis(100));
+        assert_eq!(p.reconnect_wait(1), Duration::from_millis(200));
+    }
+
+    /// 配置手滑的兜底：短序列不会排进一个 0 秒的重试，也踩不出 `max_backoff`。
+    #[test]
+    fn the_reconnect_sequence_is_clamped_inside_the_ordinary_backoff() {
+        let p = RetryPolicy {
+            min_backoff: Duration::from_secs(5),
+            max_backoff: Duration::from_secs(40),
+            // 手滑：短序列的起点比普通的下限还大。
+            min_reconnect_backoff: Duration::from_secs(10),
+            ..policy()
+        };
+        // 用户显式配了 10s，就按 10s——不因为「短序列」这个名义被悄悄改掉；
+        // 但也没法越过 `max_backoff`（10s 翻两次就碰到 40s 的天花板）。
+        assert_eq!(p.reconnect_delay(), Duration::from_secs(10));
+        assert_eq!(p.reconnect_wait(0), Duration::from_secs(10));
+        assert_eq!(p.reconnect_wait(2), Duration::from_secs(40));
+        // 第 3 次、第 30 次掉线都封在 `max_backoff`，不会越翻越界。
+        assert_eq!(p.reconnect_wait(3), Duration::from_secs(40));
+        assert_eq!(p.reconnect_wait(30), Duration::from_secs(40));
+
+        let zero = RetryPolicy {
+            min_reconnect_backoff: Duration::ZERO,
+            ..policy()
+        };
+        // 0 秒的短起点不能变成「0 秒重连」——那正是热循环。
+        assert_eq!(zero.reconnect_delay(), Duration::from_millis(1));
+        assert_eq!(zero.reconnect_wait(0), Duration::from_millis(1));
+    }
+
+    /// 判据本身接进了重试计时：`BYE`（带标记）走短序列，`Auth` 根本不进循环。
+    #[test]
+    fn the_classifier_decides_which_sequence_is_used() {
+        let p = policy();
+        let bye = crate::error::classify_session_error(AppError::Protocol(
+            "IDLE 期间服务器主动断开（BYE）".into(),
+        ));
+        let decided = crate::net::is_session_recoverable(&bye);
+        assert!(decided);
+        // 断线之后的这一次按短序列算，不管之前长到哪儿。
+        assert_eq!(p.reconnect_wait(0), Duration::from_millis(100));
+        assert_eq!(p.reconnect_wait(1), Duration::from_millis(200));
+        // 反证：普通失败走的是「当前位置接着长」那条路。
+        assert_eq!(p.grow(p.min_backoff), Duration::from_secs(10));
+
+        // 语义类 `NO`（不是断线）不该被当成会话死亡。
+        let no = crate::pull::map_protocol_error(xremail_protocol_imap::ProtocolError::Rejected(
+            "[INUSE] mailbox locked".into(),
+        ));
+        assert!(!crate::net::is_session_recoverable(&no));
+
+        let auth = AppError::Auth("NO [AUTHENTICATIONFAILED]".into());
+        assert!(!crate::net::is_session_recoverable(&auth));
+
+        // 传输层：`Network` 直接算会话可恢复。
+        let io = AppError::Network("连接被断开".into());
+        assert!(crate::net::is_session_recoverable(&io));
+    }
+
+    /// `Failed` 事件里的文案不能带内部标记（那是给判据用的，不是给人看的）。
+    #[test]
+    fn a_failed_event_carries_display_text() {
+        let error = crate::error::classify_session_error(AppError::Protocol("BYE".into()));
+        let shown = crate::error::user_facing(error).to_string();
+        assert!(!shown.contains(crate::error::SESSION_CLASS_MARKER));
+        assert!(shown.contains("BYE"));
     }
 }

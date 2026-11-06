@@ -39,6 +39,7 @@ pub mod body;
 pub mod boot;
 pub mod diff;
 pub mod epoch;
+pub mod error;
 pub mod intent;
 pub mod net;
 pub mod pull;
@@ -55,10 +56,12 @@ pub use body::{fetch_body, read_body};
 pub use boot::boot_id;
 pub use diff::{UidDiff, UidSet, diff_uids};
 pub use epoch::{EpochTransition, PendingOperationBinding, StoredEpoch, plan_epoch_transition};
+pub use error::{SESSION_CLASS_MARKER, classify_session_error, user_facing as user_facing_error};
 pub use intent::{
     FlagDelta, FlagIntent, FlagPlan, MAX_REPLAN_ATTEMPTS, apply_intents, plan_flag_update,
     stale_intents,
 };
+pub use net::is_session_recoverable;
 pub use pull::{FolderSyncReport, flags_from_imap, map_protocol_error, pull_folder};
 pub use push::{FlagPushReport, push_flags, push_flags_as};
 pub use reconcile::{

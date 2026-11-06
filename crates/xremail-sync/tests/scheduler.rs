@@ -9,6 +9,9 @@
 //! * 连接失败 → `Failed` 且退避时间**逐次变长**；
 //! * **一个账户 panic 不影响另一个账户**（actor 隔离）；
 //! * `stop` 之后 actor 退出，不再同步。
+//! * **会话掉了就立刻重建**（B1）：`BYE` / 掉线之后不等满轮询周期，
+//!   认证被拒仍然终态，连续掉线仍然退避。**注意**：这里不测「推送唤醒」——
+//!   假服务器的观测模型不足以可靠地证明它（见 R42）。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -26,6 +29,16 @@ use xremail_sync::{
     AccountConnector, AccountEvent, ConnectFuture, EventSink, RetryPolicy, Scheduler, WakeReason,
 };
 use xremail_testkit::{FakeImapServer, MailboxFixture, MessageFixture, ServerConfig as FakeConfig};
+
+/// 测试脚手架：镜像生产外壳 `SyncService::connect` 的错误分类。
+///
+/// 外壳那边是 `map_protocol_error` + `classify_session_error`（见
+/// `apps/shell/src-tauri/src/service/sync.rs`）。测试里如果只写
+/// `AppError::Protocol(format!("连接或登录失败: {error}"))`，就把「对面把连接关了」
+/// 抹成了一句不含任何证据的文本，B1 的判据根本看不见它——那测到的就不是生产行为。
+fn classified(error: AppError) -> AppError {
+    xremail_sync::classify_session_error(error)
+}
 
 // ---------------------------------------------------------------------------
 // 测试脚手架
@@ -97,6 +110,16 @@ async fn wait_until(
     }
 }
 
+/// `always_fail` 时 `connect` 回什么错。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    /// 连不上：语义类错误，**不**含断线证据。
+    Unreachable,
+    /// 连上了，但对面立刻把连接关了（`ProtocolError::Io`，走真实的
+    /// [`xremail_sync::map_protocol_error`]）。
+    SessionDropped,
+}
+
 /// 一个可控的连接器。
 ///
 /// 三种行为：
@@ -111,7 +134,12 @@ struct TestConnector {
     /// 这些账户 ID 每次都 panic。
     always_panic: Vec<String>,
     /// 每次 `connect` 都返回错误（不 panic）。
+    ///
+    /// 拿出来当字段**公开**是为了让用例自己决定「会话类」还是「非会话类」：
+    /// 这两种错误的退避序列在 B1 之后完全不一样。
     always_fail: bool,
+    /// `always_fail` 时回的那个错误。
+    failure: Failure,
     /// 每次 `connect` 都回「认证被拒」（授权码被改掉 / 过期）。
     always_auth_fail: bool,
     /// 这些账户 ID 只在**等待期** panic（第 1 次之后每次连接都炸）。
@@ -130,14 +158,34 @@ impl TestConnector {
             panics_left: AtomicU32::new(0),
             always_panic: Vec::new(),
             always_fail: false,
+            failure: Failure::Unreachable,
             always_auth_fail: false,
             fail_from_second: Vec::new(),
             attempts: AtomicU32::new(0),
         }
     }
 
-    fn panicking(mut self) -> Self {
+    /// 连不上：每次 `connect` 都回一个**非**会话类的错误。
+    ///
+    /// `AppError::Protocol("测试要求：连接失败")` 里不含任何断线证据
+    /// （判据见 `xremail_sync::is_session_recoverable`），所以它走**普通**退避。
+    /// 要测「会话掉了、立刻重连」用 [`Self::session_dropped`]。
+    fn failing(mut self) -> Self {
         self.always_fail = true;
+        self.failure = Failure::Unreachable;
+        self
+    }
+
+    /// 连上了又掉：每次 `connect` 都回「对面把连接关了」。
+    ///
+    /// 走的是真实链路——`ProtocolError::Io` → [`xremail_sync::map_protocol_error`]
+    /// → `AppError::Network`，和假服务器真的 `DROP` 掉一条连接时 actor 拿到的
+    /// 东西一模一样。用它来测**连续掉线时的退避序列**：真实 `DROP` 有「只一次」
+    /// 的语义（第二次再断就没有 web 意义上的「连上过」可言了），
+    /// 而退避序列要的恰恰是「每次都断」。
+    fn session_dropped(mut self) -> Self {
+        self.always_fail = true;
+        self.failure = Failure::SessionDropped;
         self
     }
 
@@ -173,7 +221,12 @@ impl AccountConnector for TestConnector {
                 return Err(AppError::Auth("测试要求：服务器拒绝了这个授权码".into()));
             }
             if self.always_fail {
-                return Err(AppError::Protocol("测试要求：连接失败".into()));
+                return Err(match self.failure {
+                    Failure::Unreachable => AppError::Protocol("测试要求：连接失败".into()),
+                    Failure::SessionDropped => xremail_sync::map_protocol_error(
+                        xremail_protocol_imap::ProtocolError::Io("连接被断开".into()),
+                    ),
+                });
             }
 
             let (session, _caps, _tls) = connect_and_login_with(
@@ -183,7 +236,7 @@ impl AccountConnector for TestConnector {
                 "test-password",
             )
             .await
-            .map_err(|error| AppError::Protocol(format!("连接或登录失败: {error}")))?;
+            .map_err(|error| classified(xremail_sync::map_protocol_error(error)))?;
             Ok(session)
         })
     }
@@ -304,7 +357,7 @@ fn account(id: &str, poll_interval_secs: i64) -> Account {
     }
 }
 
-/// 测试用的快节奏策略：退避 20ms 起，80ms 封顶。
+/// 测试用的快节奏策略：退避 20ms 起，80ms 封顶；掉线重连的起点 5ms。
 fn fast_policy() -> RetryPolicy {
     RetryPolicy {
         poll_interval: Duration::from_secs(1),
@@ -312,6 +365,29 @@ fn fast_policy() -> RetryPolicy {
         max_backoff: Duration::from_millis(80),
         max_consecutive_panics: 3,
         command_timeout: Duration::from_secs(2),
+        min_reconnect_backoff: Duration::from_millis(5),
+    }
+}
+
+/// 「掉线重连」用的慢节奏策略：轮询五分钟、两条退避曲线差得很开。
+///
+/// 它存在的意义是把两件事**分开**：
+///
+/// * `poll_interval` 五分钟——比任何测试超时都长，等满它就是红；
+/// * 普通失败退避 5s 起（第一次等 10s）；掉线重连 100ms 起（第一次等 100ms）。
+///
+/// 于是「10 秒内又同步了一轮」只可能是**掉线重连**做到的：等满轮询要五分钟，
+/// 普通失败的第一次重试是 10 秒。
+fn reconnect_policy() -> RetryPolicy {
+    RetryPolicy {
+        poll_interval: Duration::from_secs(300),
+        min_backoff: Duration::from_secs(5),
+        max_backoff: Duration::from_secs(30),
+        max_consecutive_panics: 3,
+        // 比默认的 30s 短得多：假服务器断线后读都超时，要靠这个值把一轮失败
+        // 限定在秒级，否则「10 秒内重连」的断言跟超时本身比长短。
+        command_timeout: Duration::from_secs(2),
+        min_reconnect_backoff: Duration::from_millis(100),
     }
 }
 
@@ -574,8 +650,11 @@ async fn connection_failures_back_off_and_retry() {
     let account = account("acct-1", 3600);
     let pool = local_store(std::slice::from_ref(&account)).await;
 
+    // `always_fail` 回的是 `AppError::Protocol("测试要求：连接失败")`：里面**没有**
+    // 任何「会话死了」的证据（见 `xremail_sync::is_session_recoverable`），
+    // 所以这条用例走的是**普通**退避，与 B1 之前一模一样。
     let connector =
-        Arc::new(TestConnector::new(fixture.imap.clone(), fixture.trust.clone()).panicking());
+        Arc::new(TestConnector::new(fixture.imap.clone(), fixture.trust.clone()).failing());
     let recorder = Arc::new(Recorder::new());
     let scheduler = Scheduler::with_options(
         pool,
@@ -604,9 +683,10 @@ async fn connection_failures_back_off_and_retry() {
         })
         .collect();
 
-    // 20ms → 40ms → 80ms（封顶）。
-    assert_eq!(retries[0], Duration::from_millis(20));
-    assert_eq!(retries[1], Duration::from_millis(40));
+    // 普通退避：首次 40ms（`grow` 是唯一一层翻倍，`grow(20ms)`），之后 80ms 封顶。
+    // 会话类的短序列见 `repeated_session_failures_back_off_instead_of_hot_looping`。
+    assert_eq!(retries[0], Duration::from_millis(40));
+    assert_eq!(retries[1], Duration::from_millis(80));
     assert_eq!(retries[2], Duration::from_millis(80));
 
     // 失败是「可重试」，不是「放弃」。
@@ -1132,6 +1212,301 @@ async fn an_idle_timeout_is_not_mistaken_for_the_end_of_the_wait() {
     assert!(
         waited >= interval,
         "四秒的轮询周期只等了一部分（{waited:?}）：IDLE 到点被当成了本轮到点"
+    );
+
+    scheduler.shutdown();
+    fixture.server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// B1：断线重连（`BYE` / 掉线之后重建会话，不是等下一轮轮询）
+// ---------------------------------------------------------------------------
+
+/// 一轮同步**中途**连接被服务器掐掉 → actor 立刻重建会话并续上，而不是等满轮询。
+///
+/// 现场（B1 之前）：每个 `Session` 的寿命就是一次 `tick` 或一次 `IDLE`。
+/// 命令层面上掉线表现为 `ProtocolError::Imap`（协议层把「对面把连接关了」
+/// 一律折成 `Imap`，见 `connection::classify_imap_error` 与 `idle::classify`），
+/// 于是它被当成「这一轮失败了」：退避 5s 起、翻被再翻、一等就是一个轮询周期
+/// （默认 300s）。用户看到的是「合上盖子再打开，邮件好几分钟才回来」。
+///
+/// 这里钉两件事：
+/// * **续拉**：断线之前已经拉到的那 2 封不会丢，重连之后补齐 3 封（不是重头再来）；
+/// * **快**：断线发生在第一轮 `DROP` 之后，重连同步必须在 10 秒内完成——
+///   而这一份 policy 的轮询周期是 300 秒、普通失败第一次也要等 10 秒。
+///
+/// 阈值留得很松（10s 对 100ms 的短退避）：慢机器上 `idle_once` 空邮箱也要
+/// 一秒、一次 `tick` 两三秒，卡 `<= 1s` 只会变成随机红。
+#[tokio::test]
+async fn a_dropped_session_is_rebuilt_at_once_instead_of_waiting_for_the_poll() {
+    // `DROP-ONCE`：拿到 `UID FETCH 1:* (UID)`（拉远端 UID 集合）就断线，
+    // 而且只断第一次。这个口径稳定：`FLAGS` 里没有 `U`，不会误命中别的命令。
+    // 空邮箱时仍然要发这条命令，所以断线一定发生在**一轮同步的中途**。
+    let fixture = Fixture::start_fake_config(FakeConfig {
+        capabilities: FakeConfig::default().capabilities,
+        mailboxes: vec![inbox_fixture(0)],
+        faults: vec![xremail_testkit::Fault::DropOnContains {
+            text: "1:* (UID)".to_string(),
+            once: true,
+        }],
+        ..Default::default()
+    })
+    .await;
+
+    let account = account("acct-drop", 30000);
+    let pool = local_store(std::slice::from_ref(&account)).await;
+
+    let connector = Arc::new(TestConnector::new(
+        fixture.imap.clone(),
+        fixture.trust.clone(),
+    ));
+    let recorder = Arc::new(Recorder::new());
+    let scheduler = Scheduler::with_options(
+        pool,
+        connector.clone(),
+        recorder.clone(),
+        reconnect_policy(),
+        Arc::new(|| 1_792_658_000_000),
+    );
+
+    scheduler.start(account).expect("应当能启动");
+
+    // 第一轮在 `DROP` 之后失败：会话没了，但**不该**等 300 秒的轮询。
+    let events = wait_until(
+        &recorder,
+        "掉线之后立刻重连并同步成功",
+        |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, AccountEvent::Synced { .. }))
+        },
+    )
+    .await;
+
+    let first_synced_at = recorder
+        .timed()
+        .into_iter()
+        .find(|(event, _)| matches!(event, AccountEvent::Synced { .. }))
+        .map(|(_, at)| at)
+        .expect("应当有 Synced");
+    assert!(
+        first_synced_at < Duration::from_secs(10),
+        "掉线后 {first_synced_at:?} 才同步成功：重连没有走短退避（轮询周期 300s）\n{events:#?}"
+    );
+
+    // 失败事件里的错误要是「能给人看」的文本，不带内部标记。
+    for event in &events {
+        if let AccountEvent::Failed { error, .. } = event {
+            assert!(
+                !error.contains(xremail_sync::SESSION_CLASS_MARKER),
+                "Failed 事件泄露了内部标记：{error}"
+            );
+        }
+    }
+
+    // 同一条连接上掉线 → 至少要连两次（第一次断在 `DROP` 上）。
+    assert!(
+        connector.attempts() >= 2,
+        "掉线之后应当重建会话，实际只连了 {} 次",
+        connector.attempts()
+    );
+
+    scheduler.shutdown();
+    fixture.server.shutdown().await;
+}
+
+/// 认证被拒是**终态**：既不触发重连，也不该在短退避上打转（B1 不许打破它）。
+///
+/// 与 [`auth_rejection_stops_the_actor_instead_of_retrying_forever`] 的区别在于
+/// 这里用的是「掉线重连」那一份 policy（100ms 的短退避）：如果判据把 `Auth`
+/// 也归进「会话可恢复」，300ms 内就会看到好几条 `Failed { retry_in: 100ms }`。
+#[tokio::test]
+async fn an_auth_rejection_never_enters_the_reconnect_loop() {
+    let fixture = Fixture::start(0).await;
+    let account = account("acct-auth", 300);
+    let pool = local_store(std::slice::from_ref(&account)).await;
+
+    let connector =
+        Arc::new(TestConnector::new(fixture.imap.clone(), fixture.trust.clone()).auth_rejected());
+    let recorder = Arc::new(Recorder::new());
+    let scheduler = Scheduler::with_options(
+        pool,
+        connector.clone(),
+        recorder.clone(),
+        reconnect_policy(),
+        Arc::new(|| 1_792_658_000_000),
+    );
+
+    scheduler.start(account).expect("应当能启动");
+
+    let events = wait_until(&recorder, "认证被拒", |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, AccountEvent::NeedsReauth { .. }))
+    })
+    .await;
+
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, AccountEvent::Failed { .. })),
+        "认证被拒不该进重连循环：{events:#?}"
+    );
+
+    // 短退避是 100ms：真是热循环的话，300ms 里至少好几轮。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(connector.attempts(), 1, "认证被拒之后不该再连接");
+    assert!(!scheduler.is_running("acct-auth"), "actor 应当已退出");
+
+    scheduler.shutdown();
+    fixture.server.shutdown().await;
+}
+
+/// 会话类失败（连上了又被掐断）照样**退避**、封顶，而不是热循环。
+///
+/// 现场（B1 之前）：一次掉线之后要等满 `poll_interval` 才重来；B1 把会话类
+/// 失败的起点压短了，于是必须钉住另一半：短起点不等于热循环——同一套 `grow`
+/// 仍然在翻倍、仍然由 `max_backoff` 封顶，绝不停在短起点上打转。
+#[tokio::test]
+async fn repeated_session_failures_back_off_instead_of_hot_looping() {
+    let fixture = Fixture::start(0).await;
+    let account = account("acct-hot", 300);
+    let pool = local_store(std::slice::from_ref(&account)).await;
+
+    // 每次 `connect` 都「连上又掉」：`ProtocolError::Io` → `AppError::Network`，
+    // 按 B1 的判据算「会话可恢复」，走的是短序列。
+    let connector =
+        Arc::new(TestConnector::new(fixture.imap.clone(), fixture.trust.clone()).session_dropped());
+    let recorder = Arc::new(Recorder::new());
+    let scheduler = Scheduler::with_options(
+        pool,
+        connector.clone(),
+        recorder.clone(),
+        reconnect_policy(),
+        Arc::new(|| 1_792_658_000_000),
+    );
+
+    scheduler.start(account).expect("应当能启动");
+
+    let events = wait_until(&recorder, "至少 3 次失败", |events| {
+        events
+            .iter()
+            .filter(|event| matches!(event, AccountEvent::Failed { .. }))
+            .count()
+            >= 3
+    })
+    .await;
+
+    let timed = recorder.timed();
+    let retries: Vec<Duration> = events
+        .iter()
+        .filter_map(|event| match event {
+            AccountEvent::Failed { retry_in, .. } => Some(*retry_in),
+            _ => None,
+        })
+        .collect();
+    // 短起点 100ms（`min_reconnect_backoff`）→ 200ms → 400ms……每次翻倍；
+    // 这条用例只看前三步：只要求「确实在翻倍」，不把 5s/10s 的长等待塞进一次测试。
+    assert_eq!(retries[0], Duration::from_millis(100));
+    assert_eq!(retries[1], Duration::from_millis(200));
+    assert_eq!(retries[2], Duration::from_millis(400));
+
+    // 相邻两次失败之间**确实**等过：不是热循环。
+    let failed_at: Vec<Duration> = timed
+        .iter()
+        .filter(|(event, _)| matches!(event, AccountEvent::Failed { .. }))
+        .map(|(_, at)| *at)
+        .collect();
+    for index in 1..failed_at.len().min(3) {
+        let gap = failed_at[index].saturating_sub(failed_at[index - 1]);
+        let reported = retries[index - 1];
+        assert!(
+            gap >= reported.mul_f64(0.9),
+            "第 {index} 次失败按 {reported:?} 退避，实际只隔了 {gap:?}：退避没生效"
+        );
+    }
+
+    scheduler.shutdown();
+    fixture.server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// B1：`IDLE` 期间掉线
+// ---------------------------------------------------------------------------
+
+/// `IDLE` 期间服务器把会话掐了 → 重连**不等满这一轮的等待**。
+///
+/// 现场（B1 之前）：`wait_for_change_inner` 的 `Err` 分支只写一行 `debug!`，
+/// 然后把 `idle_supported` 置 `false`、**等满到点**。于是一次 `BYE` /
+/// 一次半死的连接就把用户按在轮询周期上（默认 300s）——
+/// 而这正是「开着就不掉线」最常被打破的那一种。
+///
+/// 第 3 次连接之后（`IDLE` 的 `EXAMINE`）断开，而且**只断一次**：
+/// * 重连成功 → 忘记 `IDLE` 已经失败过（这是掉线，不是「服务器拒绝 IDLE」），
+///   所以之后的等待还能用 `IDLE`，不会因为一次掉线永久降级成纯轮询；
+/// * 等待期的掉线退避是**绝对**的（按 `backoff` 的当前值算），重连一次就成功，
+///   不会在最底下打转。
+#[tokio::test]
+async fn an_idle_disconnect_reconnects_instead_of_waiting_out_the_interval() {
+    let fixture = Fixture::start_fake_config(FakeConfig {
+        capabilities: {
+            let mut capabilities = FakeConfig::default().capabilities;
+            capabilities.push("IDLE".to_string());
+            capabilities
+        },
+        mailboxes: vec![inbox_fixture(0)],
+        faults: vec![xremail_testkit::Fault::DropOnOnce {
+            command: "IDLE".to_string(),
+        }],
+        ..Default::default()
+    })
+    .await;
+
+    // 轮询周期一分钟：比任何测试超时都长，于是「又同步了一轮」只可能是重连做的。
+    let account = account("acct-idle-drop", 30000);
+    let pool = local_store(std::slice::from_ref(&account)).await;
+
+    let connector = Arc::new(TestConnector::new(
+        fixture.imap.clone(),
+        fixture.trust.clone(),
+    ));
+    let recorder = Arc::new(Recorder::new());
+    let scheduler = Scheduler::with_options(
+        pool,
+        connector.clone(),
+        recorder.clone(),
+        reconnect_policy(),
+        Arc::new(|| 1_792_658_000_000),
+    );
+
+    scheduler.start(account).expect("应当能启动");
+
+    let events = wait_until(&recorder, "IDLE 掉线后不再等满一分钟", |events| {
+        events
+            .iter()
+            .filter(|event| matches!(event, AccountEvent::Synced { .. }))
+            .count()
+            >= 2
+    })
+    .await;
+
+    let synced_at: Vec<Duration> = recorder
+        .timed()
+        .into_iter()
+        .filter(|(event, _)| matches!(event, AccountEvent::Synced { .. }))
+        .map(|(_, at)| at)
+        .collect();
+    let gap = synced_at[1].saturating_sub(synced_at[0]);
+    assert!(
+        gap < Duration::from_secs(10),
+        "IDLE 期间掉线之后隔了 {gap:?} 才同步：重连被压到了轮询周期上（60s）\n{events:#?}"
+    );
+
+    // 两次同步 + 一次掉线的 `IDLE`：至少三次连接。
+    assert!(
+        connector.attempts() >= 3,
+        "掉线之后应当重建会话再等，实际只连了 {} 次",
+        connector.attempts()
     );
 
     scheduler.shutdown();
