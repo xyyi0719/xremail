@@ -414,8 +414,25 @@ impl MessageService {
         operation_dao::enqueue_operation(&self.pool, &operation).await?;
 
         // 回读一次：把存储层分配的 `seq` 拿回来（提交时按它定序）。
-        let stored = operation_dao::get_operation(&self.pool, &operation.id)
-            .await?
+        //
+        // 不能按自己构造的 id 去读：入队是幂等的（R34），同一条通道已有未完结
+        // 意图时不会插入新行，于是这个 id 根本不在库里。也**不能**按「这封邮件
+        // 有没有在途的移动」去读（`find_pending_transfer`）：同一封邮件完全可以
+        // 同时挂着一条在途的移动，那会被误当成刚落库的旗标。
+        //
+        // 取**这一位**上 `seq` 最大的未完结意图——`apply_intents` 就是按 `seq`
+        // 定序、后发覆盖先发的。只取「最早那条」会把刚点的取消读成「还要置位」。
+        let pending =
+            operation_dao::list_pending_operations(&self.pool, account_id, folder_id).await?;
+        let stored = pending
+            .into_iter()
+            .filter(|candidate| {
+                candidate.uid == uid
+                    && candidate.uidvalidity == epoch
+                    && candidate.kind == xremail_core::model::OperationKind::Flags
+                    && (candidate.intent.add.contains(bit) || candidate.intent.remove.contains(bit))
+            })
+            .max_by_key(|candidate| candidate.seq)
             .ok_or_else(|| xremail_core::AppError::Storage("操作已落库，但读不回来".into()))?;
         Ok(stored)
     }

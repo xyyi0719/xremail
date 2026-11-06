@@ -194,35 +194,40 @@ async fn enqueue_once(
     .await
     .map_err(|e| map_sqlx(e, "enqueue_operation: lock"))?;
 
-    // 幂等：同一封邮件已有未完结的移动 / 删除意图 → 不再插入。
+    // 幂等：同一封邮件已有未完结的**移动 / 删除**意图 → 不再插入。
     //
     // 判定用的是**通道**（`kind IN ('move','delete')`），不是「kind 相同」：
     // 「移动」与「删除」互相覆盖，两条都在途就会各发一次搬移命令。
-    // flag 只和 flag 撞（自己的合并逻辑）、移动/删除只和移动/删除撞，
-    // 所以写成 `(o2.kind = 'flags') = (? = 'flags')`：
-    // 传入的是 `'flags'` 时只匹配 flag 行，传入 `'move'` / `'delete'` 时只匹配搬移行。
-    let existing = sqlx::query_scalar!(
-        r#"
-        SELECT o2.id FROM mail_operation o2
-        WHERE o2.account_id = ?
-          AND o2.folder_id = ?
-          AND o2.uid = ?
-          AND o2.uidvalidity = ?
-          AND o2.id <> ?
-          AND o2.state IN ('queued', 'running', 'retryable', 'uncertain')
-          AND (o2.kind = 'flags') = (? = 'flags')
-        LIMIT 1
-        "#,
-        operation.account_id,
-        operation.folder_id,
-        operation.uid,
-        operation.uidvalidity,
-        operation.id,
-        kind,
-    )
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|e| map_sqlx(e, "enqueue_operation: dedupe"))?;
+    //
+    // **flag 不参与**（2026-11-06 更正）：flag 意图按 `seq` 定序、后发覆盖先发
+    // （`apply_intents` / `overlay_pending_intents` 都这么读），所以同一封邮件
+    // 必须能有多条 flag 行——把「取消已读」并进「标记已读」那一条会让界面上的
+    // 状态回弹。这里只挡搬移通道。
+    let existing = if kind == "flags" {
+        None
+    } else {
+        sqlx::query_scalar!(
+            r#"
+            SELECT o2.id FROM mail_operation o2
+            WHERE o2.account_id = ?
+              AND o2.folder_id = ?
+              AND o2.uid = ?
+              AND o2.uidvalidity = ?
+              AND o2.id <> ?
+              AND o2.state IN ('queued', 'running', 'retryable', 'uncertain')
+              AND o2.kind IN ('move', 'delete')
+            LIMIT 1
+            "#,
+            operation.account_id,
+            operation.folder_id,
+            operation.uid,
+            operation.uidvalidity,
+            operation.id,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| map_sqlx(e, "enqueue_operation: dedupe"))?
+    };
 
     if existing.is_some() {
         // 已有同通道的在途意图：什么都不改（那条的 seq / 状态 / 次数原样保留），
@@ -233,7 +238,7 @@ async fn enqueue_once(
         return Ok(());
     }
 
-    // 分配序号：同一账户 + 文件夹内的最大值 + 1。
+    // 分配序号：同一账户 + 文件夹内的最大值 + 1（标旗顺序比的正是它）。
     let next_seq: i64 = sqlx::query_scalar!(
         r#"
         SELECT COALESCE(MAX(seq), 0) + 1 FROM mail_operation
@@ -334,6 +339,48 @@ pub async fn find_pending_transfer(
     .fetch_optional(pool)
     .await
     .map_err(|e| map_sqlx(e, "find_pending_transfer"))?;
+
+    rows.as_ref().map(row_to_operation).transpose()
+}
+
+/// 按「通道」查一封邮件当前那条**未完结**的操作（没有则 `None`）。
+///
+/// 通道与 [`enqueue_operation`] 的去重判定是同一个口径：`'flags'` 只看 flag 行，
+/// `'move'` / `'delete'` 只看搬移行（`kind IN ('move','delete')`）。
+///
+/// 用途与 [`find_pending_transfer`] 相同——入队后读回**真正生效**的那一条，
+/// 去重命中时自己构造的 id 根本不在库里。标旗冒充不了搬移：
+/// 同一封邮件可以同时有一条在途的 `Flags` 和一条在途的 `Move`。
+pub async fn find_pending_in_channel(
+    pool: &SqlitePool,
+    account_id: &str,
+    folder_id: &str,
+    uid: i64,
+    uidvalidity: i64,
+    kind: &str,
+) -> AppResult<Option<MailOperation>> {
+    let rows = sqlx::query_as!(
+        OperationRow,
+        r#"
+        SELECT id, account_id, folder_id, uid, uidvalidity,
+               kind, intent, destination_folder_id, state, seq, base_version,
+               attempts, error_kind, error_message, created_at, updated_at
+        FROM mail_operation
+        WHERE account_id = ? AND folder_id = ? AND uid = ? AND uidvalidity = ?
+          AND state IN ('queued', 'running', 'retryable', 'uncertain')
+          AND (kind = 'flags') = (? = 'flags')
+        ORDER BY seq ASC
+        LIMIT 1
+        "#,
+        account_id,
+        folder_id,
+        uid,
+        uidvalidity,
+        kind
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| map_sqlx(e, "find_pending_in_channel"))?;
 
     rows.as_ref().map(row_to_operation).transpose()
 }
