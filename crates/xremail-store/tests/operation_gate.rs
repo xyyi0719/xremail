@@ -473,3 +473,93 @@ async fn a_running_flag_operation_does_not_block_a_move() {
         "在途的 flag 不该挡住搬移"
     );
 }
+
+// ===========================================================================
+// 租约：本进程自己卡住的 running（R32）
+// ===========================================================================
+
+#[tokio::test]
+async fn a_running_operation_of_this_process_is_reclaimed_after_its_lease() {
+    // 现场：认领成功之后，写终态之前某个 `?` 早退或 panic 了。
+    // 那条行停在 `running` 且 `owner_boot` 是**自己**——`reclaim_running`
+    // 只收别人的，`expire_exhausted` 排除 `running`，于是它在本进程里永久卡死。
+    let pool = seeded_pool().await;
+    operation::enqueue_operation(
+        &pool,
+        &transfer("op-1", "inbox", 7, OperationKind::Move, Some("archive")),
+    )
+    .await
+    .expect("入队应当成功");
+
+    let claimed_at = 1_000_000;
+    assert!(
+        operation::claim_for_push(&pool, "op-1", "boot-self", 5, claimed_at)
+            .await
+            .expect("认领应当成功")
+    );
+
+    // 租约内：别动它。它可能只是还在跑。
+    let early = operation::reclaim_stale_running(
+        &pool,
+        "a1",
+        "boot-self",
+        operation::RUNNING_LEASE_MS,
+        claimed_at + 5,
+    )
+    .await
+    .expect("回收应当成功");
+    assert_eq!(early, 0, "租约没过期就不该动它");
+    assert_eq!(
+        load(&pool, "op-1").await.expect("应当还在").state,
+        OperationState::Running
+    );
+
+    // 过了租约：收成 `uncertain`，让下一轮回读去核对。
+    let reclaimed = operation::reclaim_stale_running(
+        &pool,
+        "a1",
+        "boot-self",
+        operation::RUNNING_LEASE_MS,
+        // 恰好到期就收：边界取「不早于」，与「租约内不动」合起来正好无缝。
+        claimed_at + operation::RUNNING_LEASE_MS,
+    )
+    .await
+    .expect("回收应当成功");
+    assert_eq!(reclaimed, 1);
+
+    let row = load(&pool, "op-1").await.expect("应当还在");
+    assert_eq!(
+        row.state,
+        OperationState::Uncertain,
+        "结果未知才是诚实的处置：命令可能已经到了服务器"
+    );
+    assert_eq!(row.error_kind.as_deref(), Some("lease_expired"));
+    assert_eq!(row.attempts, 0, "回收不该烧掉尝试次数");
+}
+
+#[tokio::test]
+async fn the_lease_only_covers_rows_this_process_claimed() {
+    // 别人的行归 `reclaim_running` 管（它会先收走），这里不能越权——
+    // 尤其是「别的进程还活着、正在提交」的时候。
+    let pool = seeded_pool().await;
+    operation::enqueue_operation(
+        &pool,
+        &transfer("op-1", "inbox", 7, OperationKind::Move, Some("archive")),
+    )
+    .await
+    .expect("入队应当成功");
+    assert!(
+        operation::claim_for_push(&pool, "op-1", "boot-other", 5, 10)
+            .await
+            .expect("认领应当成功")
+    );
+
+    let reclaimed = operation::reclaim_stale_running(&pool, "a1", "boot-self", 0, 10)
+        .await
+        .expect("回收应当成功");
+    assert_eq!(reclaimed, 0, "不是本进程认领的行，租约不该碰");
+    assert_eq!(
+        load(&pool, "op-1").await.expect("应当还在").state,
+        OperationState::Running
+    );
+}

@@ -343,48 +343,6 @@ pub async fn find_pending_transfer(
     rows.as_ref().map(row_to_operation).transpose()
 }
 
-/// 按「通道」查一封邮件当前那条**未完结**的操作（没有则 `None`）。
-///
-/// 通道与 [`enqueue_operation`] 的去重判定是同一个口径：`'flags'` 只看 flag 行，
-/// `'move'` / `'delete'` 只看搬移行（`kind IN ('move','delete')`）。
-///
-/// 用途与 [`find_pending_transfer`] 相同——入队后读回**真正生效**的那一条，
-/// 去重命中时自己构造的 id 根本不在库里。标旗冒充不了搬移：
-/// 同一封邮件可以同时有一条在途的 `Flags` 和一条在途的 `Move`。
-pub async fn find_pending_in_channel(
-    pool: &SqlitePool,
-    account_id: &str,
-    folder_id: &str,
-    uid: i64,
-    uidvalidity: i64,
-    kind: &str,
-) -> AppResult<Option<MailOperation>> {
-    let rows = sqlx::query_as!(
-        OperationRow,
-        r#"
-        SELECT id, account_id, folder_id, uid, uidvalidity,
-               kind, intent, destination_folder_id, state, seq, base_version,
-               attempts, error_kind, error_message, created_at, updated_at
-        FROM mail_operation
-        WHERE account_id = ? AND folder_id = ? AND uid = ? AND uidvalidity = ?
-          AND state IN ('queued', 'running', 'retryable', 'uncertain')
-          AND (kind = 'flags') = (? = 'flags')
-        ORDER BY seq ASC
-        LIMIT 1
-        "#,
-        account_id,
-        folder_id,
-        uid,
-        uidvalidity,
-        kind
-    )
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| map_sqlx(e, "find_pending_in_channel"))?;
-
-    rows.as_ref().map(row_to_operation).transpose()
-}
-
 /// 列出某个文件夹里**还没完结**的操作。
 ///
 /// 按 `seq` 升序——提交时按这个顺序重放意图。
@@ -595,6 +553,74 @@ pub async fn reclaim_running(
     .execute(pool)
     .await
     .map_err(|e| map_sqlx(e, "reclaim_running"))?;
+
+    Ok(result.rows_affected() as usize)
+}
+
+/// 租约：`running` 超过这个时长还没写完终态，就认为认领它的那次尝试已经死了。
+///
+/// 取 15 分钟 = 30 次 `command_timeout`（默认 30 秒）。这个数**不是**在估算
+/// 「一次提交要多久」，而是在估「多久没写终态就绝不可能是还活着」：
+/// 两条长命令（`MOVE` + 回读）撞上超时各 30 秒，加三次往返的握手与认证，
+/// 最坏也就几分钟，远不到 15 分钟。
+///
+/// 宁可长一点：误判成「死的」会把一条**正在执行**的操作翻成 `uncertain`，
+/// 下一轮它会再提交一次（`MOVE` 不幂等）。等久一点只是让「卡住的操作」
+/// 多等一会儿，而且用户看到的是一个**明确的**待确认状态，不是永远不动。
+pub const RUNNING_LEASE_MS: i64 = 15 * 60 * 1000;
+
+/// 回收**本进程**认领后卡住的 `running` 行（R32）。
+///
+/// 与 [`reclaim_running`] 的分工：那个管「上一个进程的残骸」（按 `owner_boot`
+/// 认），这个管「本进程自己：认领成功，却在写终态之前 `?` 早退或 panic 了」。
+/// 之前没有任何函数管这一种，于是那条行在**本次进程的整个生命周期里**
+/// 永久停在 `running`：`claim_for_push` 拒绝它、`expire_exhausted` 排除它、
+/// `flush_pending` 只 `continue`，用户看不到任何错误，只觉得「这封信搬不动」。
+///
+/// 判据是 `started_at`（认领时写入）**不晚于** `now_ms - lease_ms`，即恰好到点就收；
+/// 与「租约内不动」合起来正好无缝，不会留下任何一秒谁都不管。
+/// 这里比的是 `started_at <= now - lease` 而不是把边界算好再比 `started_at < ?`：
+/// `sqlx::query!` 会把这个 `INTEGER` 列的类型放宽成 `REAL`（存储类为整数时按整数比，
+/// 但为浮点时会出现 `1000000 < 1000000` 判真），必须在 SQL 里化简保证走整数比较。
+/// 注意这与 `migrations/0006_operation_owner.sql` 里「`started_at` 只是诊断
+/// 字段、不参与超时」那句注释**相反**——那条注释是当时的约定，R32 推翻它：
+/// 没有别的字段能表达「这次认领是什么时候开始的」，而「本进程的残骸要能被
+/// 自己收掉」这件事没有替代方案。租约是**单个时间点**，不是心跳：
+/// 不需要后台任务、不需要节流落库，也就不存在 0006 担心的那套成本。
+///
+/// 收成 `uncertain` 而不是直接重排：命令可能已经到了服务器，
+/// 让下一轮回读去核对（与 [`reclaim_running`] 同一口径）。
+pub async fn reclaim_stale_running(
+    pool: &SqlitePool,
+    account_id: &str,
+    boot_id: &str,
+    lease_ms: i64,
+    now_ms: i64,
+) -> AppResult<usize> {
+    let result = sqlx::query!(
+        r#"
+        UPDATE mail_operation
+        SET state = 'uncertain',
+            error_kind = 'lease_expired',
+            error_message = ?,
+            owner_boot = NULL,
+            started_at = NULL,
+            updated_at = ?
+        WHERE account_id = ?
+          AND state = 'running'
+          AND owner_boot = ?
+          AND started_at IS NOT NULL
+          AND started_at <= ?
+        "#,
+        "提交开始后长时间没有结果，按结果未知处理（可能进程中断在写终态之前）",
+        now_ms,
+        account_id,
+        boot_id,
+        now_ms - lease_ms
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| map_sqlx(e, "reclaim_stale_running"))?;
 
     Ok(result.rows_affected() as usize)
 }

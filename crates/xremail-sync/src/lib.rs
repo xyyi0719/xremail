@@ -63,7 +63,7 @@ pub use pull::{FolderSyncReport, flags_from_imap, map_protocol_error, pull_folde
 pub use push::{FlagPushReport, push_flags, push_flags_as};
 pub use reconcile::{
     MAX_OPERATION_ATTEMPTS, OperationObservation, ReconcileDecision, ReconcileReport,
-    plan_reconcile, reconcile_account, reconcile_account_as,
+    UNCERTAIN_STALE_MS, plan_reconcile, reconcile_account, reconcile_account_as,
 };
 pub use sync::{SyncSummary, sync_account, sync_account_as};
 pub use transfer_push::{TransferPushReport, push_transfers, push_transfers_as};

@@ -106,9 +106,22 @@ impl<R: Runtime> EventSink for TauriSink<R> {
             AccountEvent::Started { account_id, .. } => {
                 self.state(&account_id, SyncState::Connecting);
             }
-            AccountEvent::Synced { account_id, .. } => {
+            AccountEvent::Synced {
+                account_id,
+                reconcile,
+                ..
+            } => {
                 // 同步完就是「连上了且在等下一轮」（`IDLE` 或轮询）。
                 self.state(&account_id, SyncState::Online);
+                // 对账可能刚把某条操作收成 `failed`（R29 的「三天没结论」等），
+                // 队列面板得知道，否则它要等下一次轮询才变。
+                if let Some(report) = reconcile
+                    && !report.is_noop()
+                {
+                    self.send(AppEvent::OperationsChanged {
+                        account_id: account_id.clone(),
+                    });
+                }
             }
             AccountEvent::Failed {
                 account_id,

@@ -134,11 +134,18 @@ pub enum AccountEvent {
         account_id: String,
         reason: WakeReason,
     },
-    /// 一轮同步成功。
+    /// 一轮同步成功，**并且对账也跑完了**。
     Synced {
         account_id: String,
         reason: WakeReason,
         summary: SyncSummary,
+        /// 这一轮同步之后的对账结果。
+        ///
+        /// 放在 `Synced` 里而不是另发一个事件：两者是同一轮的状态，
+        /// 拆成两个事件会让 UI 出现「已同步」但队列里的东西还没被收掉的
+        /// 中间态。`None` 表示对账本身失败了（同步照旧成功），
+        /// 详细原因在日志里。
+        reconcile: Option<crate::reconcile::ReconcileReport>,
     },
     /// 一轮同步失败（可重试）。
     Failed {
@@ -411,6 +418,47 @@ impl AccountActor {
         }
     }
 
+    /// 一轮同步收尾之后对一次账（R33）。
+    ///
+    /// 以前对账只在**应用启动**时跑一次，于是常驻运行期间：
+    ///
+    /// * `attempts` 涨到 [`crate::reconcile::MAX_OPERATION_ATTEMPTS`] 的操作
+    ///   会被 `claim_for_push` 一直拒绝、`transfer_push` 那边只是 `continue`，
+    ///   而把它收成 `failed` 的 `expire_exhausted` 只在对账里调——
+    ///   要等到**下次重启**才真的标失败，期间 UI 既不移动也不提示；
+    /// * 本进程自己卡在 `running` 的行更是没人管（R32）。
+    ///
+    /// 放在「同步成功之后」而不是「每轮都跑」：对账要读若干张表，
+    /// 一轮失败重试的间隔里（5 秒、10 秒…）再跑一遍只是白花 IO。
+    /// 同步成功说明库与服务器此刻对得上，正是判断「哪些意图该收掉」的好时机。
+    ///
+    /// **尽力而为**：对账失败不影响本轮同步的成功，只让那几行多等一轮
+    /// （对账是幂等的）。
+    async fn reconcile_after_tick(&self) -> Option<crate::reconcile::ReconcileReport> {
+        let now_ms = (self.clock)();
+        match crate::reconcile::reconcile_account(&self.pool, &self.account.id, now_ms).await {
+            Ok(report) => {
+                if !report.is_noop() {
+                    tracing::info!(
+                        account = %self.account.email,
+                        reclaimed_operations = report.reclaimed_operations,
+                        reclaimed_sends = report.reclaimed_sends,
+                        expired = report.expired,
+                        quarantined = report.quarantined,
+                        failed_orphans = report.failed_orphans,
+                        stale_uncertain = report.stale_uncertain,
+                        "同步后对账：收掉了一批该有结论的意图"
+                    );
+                }
+                Some(report)
+            }
+            Err(error) => {
+                tracing::warn!(account = %self.account.email, %error, "同步后对账失败");
+                None
+            }
+        }
+    }
+
     /// 等「下一轮该跑了」，**顺便让服务器有机会提前叫醒我们**。
     ///
     /// 返回值与 panic 的处置见 [`Self::wait_for_change`]。
@@ -666,12 +714,16 @@ impl AccountActor {
                     backoff = self.policy.min_backoff;
                     timeout_reason = WakeReason::Poll;
                     delay = Some(self.policy.interval_for(&self.account));
+                    // R33：先把该有结论的意图收掉，再报「这一轮已完成」，
+                    // 免得 UI 上出现「已同步」但队列里的东西还挂着的中间态。
+                    let reconcile = self.reconcile_after_tick().await;
                     emit(
                         &self.sink,
                         AccountEvent::Synced {
                             account_id: account_id.clone(),
                             reason,
                             summary,
+                            reconcile,
                         },
                     );
                 }

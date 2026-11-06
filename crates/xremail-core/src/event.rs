@@ -91,6 +91,15 @@ pub enum AppEvent {
         /// 人类可读的错误描述。
         message: String,
     },
+
+    /// 操作队列被系统改动过，界面应重查（目前只有「同步后对账」会发）。
+    ///
+    /// 不带明细：对账的产物是「哪几行换了状态」，而界面本来就要按账户重拉
+    /// 一次队列——多传一份可能过期的快照只会多一处对不上的来源。
+    OperationsChanged {
+        /// 所属账户 ID。
+        account_id: String,
+    },
 }
 
 impl AppEvent {
@@ -107,6 +116,7 @@ impl AppEvent {
             AppEvent::SyncStateChanged { .. } => "sync://state-changed",
             AppEvent::Notification { .. } => "notify://new-mail",
             AppEvent::SyncError { .. } => "sync://error",
+            AppEvent::OperationsChanged { .. } => "operations://changed",
         }
     }
 }

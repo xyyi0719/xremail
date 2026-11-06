@@ -209,6 +209,7 @@ fn init_storage(app: &tauri::AppHandle) -> Result<AppState, Box<dyn std::error::
                         expired = report.expired,
                         quarantined = report.quarantined,
                         failed_orphans = report.failed_orphans,
+                        stale_uncertain = report.stale_uncertain,
                         "启动对账：收掉上次进程留下的残骸"
                     );
                 }

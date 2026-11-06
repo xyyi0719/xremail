@@ -44,6 +44,18 @@ use xremail_store::dao::{folder as folder_dao, operation, send_queue};
 /// 又不会让一条永远做不成的意图在队列里无限重放。
 pub const MAX_OPERATION_ATTEMPTS: i64 = 5;
 
+/// `uncertain` 晾了多久还没结论，就转成「等人处理」（R29）。
+///
+/// 取 72 小时：这是在赌「服务商多久之内会把信放进目标文件夹」。
+/// 主流 IMAP 服务的内部投递/复制延迟是秒到分钟级；`MOVE` 的可见性
+/// 偶尔要等下一次 `EXAMINE`，也就是一轮轮询（默认 5 分钟）。
+/// 连等三天都没有这个 UID，基本可以确定这封信不会自己出现了——
+/// 再等下去的意义只剩「永远显示一个悬而未决的状态」。
+///
+/// 阈值借的是**时间**，不是次数：次数在「每轮都观测一次」时才有意义，
+/// 而轮询周期是每个账户各自配的。
+pub const UNCERTAIN_STALE_MS: i64 = 72 * 60 * 60 * 1000;
+
 /// 一条待提交操作在**对账视角**下的观测。
 ///
 /// 刻意只放对账需要的事实：它是纯数据，测试可以直接构造，
@@ -64,6 +76,16 @@ pub struct OperationObservation {
     pub folder_exists: bool,
     /// 移动操作的目标文件夹是否还在（非移动操作恒为 `true`）。
     pub destination_exists: bool,
+    /// 这一行上一次被写过的时间（epoch 毫秒）。
+    ///
+    /// 对 `uncertain` 来说就是「变成结果未知的那一刻」——
+    /// 判断「晾了多久」只能靠它，光看 `state` 永远得不出结论（R29）。
+    pub updated_at: i64,
+    /// 正在做对账的时间（epoch 毫秒）。
+    ///
+    /// 和 `updated_at` 分开放，而不是在函数里读 `SystemTime::now()`：
+    /// 这样 [`plan_reconcile`] 仍是纯函数，测试能把「三天后」直接写出来。
+    pub now: i64,
 }
 
 /// 对账对**一条**操作的处置。
@@ -77,6 +99,22 @@ pub enum ReconcileDecision {
     Keep,
     /// 这条意图再也做不成了，标成终态失败。
     MarkFailed {
+        error_kind: &'static str,
+        message: String,
+    },
+    /// 结果未知，而且已经晾过了 [`UNCERTAIN_STALE_MS`]：转成**待人工处理**。
+    ///
+    /// 刻意不是 `MarkFailed`：我们没有证据说它「没做成」，也没有证据说
+    /// 「做成了」。默默判成 `Unsent`（下轮重发，`MOVE` 不幂等）或默默判成
+    /// `Succeeded`（邮件其实没搬走却显示搬走了）都是替用户撒谎。
+    /// 唯一诚实的处置是把它摆到人面前：服务器上到底有没有那封邮件，
+    /// 只有用户能确认。
+    ///
+    /// 它落到库里仍是 `state = 'failed'`（存储层只有这一个「需要人管」的
+    /// 终态），但 `error_kind` 是 `stale_unresolved`，与「重试用完」
+    /// (`retry_exhausted`) 区分开：提示语说「请确认服务器上是否已完成」，
+    /// 而不是「操作放弃」。
+    MarkStale {
         error_kind: &'static str,
         message: String,
     },
@@ -95,6 +133,8 @@ pub struct ReconcileReport {
     pub quarantined: usize,
     /// 因为文件夹消失而放弃的操作数。
     pub failed_orphans: usize,
+    /// 因为「结果未知」晾过阈值、转成待人工确认的操作数（R29）。
+    pub stale_uncertain: usize,
 }
 
 impl ReconcileReport {
@@ -148,6 +188,28 @@ pub fn plan_reconcile(observations: &[OperationObservation]) -> Vec<ReconcileDec
                 };
             }
 
+            // 4. 结果未知、而且晾过了阈值：转成待人工确认（R29）。
+            //
+            // 放在最后：上面三条都是**确定**的结论（文件夹没了、epoch 变了、
+            // 目标没了），比「太久没消息」更根本。一条既被判成孤儿的
+            // `uncertain` 该说「文件夹不存在」，而不是「请确认服务器上有没有」。
+            //
+            // 只对 `uncertain` 判：`queued` / `retryable` 还没发出去或明确失败过，
+            // 它们的下一步是重试，`updated_at` 变老不说明任何事。
+            // 时间倒流（`now < updated_at`，系统时钟被改、或测试里注入的时钟
+            // 跳变）一律当作「没过期」，绝不能让时钟错误把在途操作判死。
+            if observation.state == OperationState::Uncertain
+                && observation.now.saturating_sub(observation.updated_at) >= UNCERTAIN_STALE_MS
+            {
+                let waited = observation.now.saturating_sub(observation.updated_at) / 3_600_000;
+                return ReconcileDecision::MarkStale {
+                    error_kind: "stale_unresolved",
+                    message: format!(
+                        "这条操作的结果未知，已经 {waited} 小时没有结论；请到服务器上确认它是否已经完成，再做决定"
+                    ),
+                };
+            }
+
             ReconcileDecision::Keep
         })
         .collect()
@@ -155,13 +217,21 @@ pub fn plan_reconcile(observations: &[OperationObservation]) -> Vec<ReconcileDec
 
 /// 对账一个账户。幂等：连跑两次，第二次的报告应当是空的。
 ///
-/// 触发点是应用启动时（`apps/shell/src-tauri/src/lib.rs` 的 `setup`）——
-/// **必须**在这里做，而不是只靠调度器：调度器只对「已交给它调度」的账户跑，
-/// 而崩溃恢复必须对**每个**账户都发生，否则没被调度的账户共残骸会
-/// 永久停在 `running`，谁也推不动它。
+/// 有两类触发点：
 ///
-/// 幂等是为了容忍重复调用（未来在 actor 的 `Startup` 轮再补一次也不会出错），
-/// **不是**因为现在已经有两处触发点——目前只有启动一处。
+/// * 应用启动时（`apps/shell/src-tauri/src/lib.rs` 的 `setup`）——**必须**，
+///   而且要对**每个**账户跑，而不是只靠调度器：调度器只对「已交给它调度」的
+///   账户跑，而崩溃恢复必须对每个账户都发生，否则没被调度的账户其残骸会
+///   永久停在 `running`，谁也推不动它。
+/// * 每个账户**每跑完一轮同步**（`actor.rs` 的 `run` 里 `tick` 成功之后）——
+///   R33：常驻运行期间 `attempts` 涨到 [`MAX_OPERATION_ATTEMPTS`] 的操作
+///   原先要等到下次重启才会被收成 `failed`，期间 UI 既不动也不提示。
+///
+/// 后者也因此救了 R32：本进程自己卡在 `running` 的行会被
+/// [`operation::reclaim_stale_running`] 在租约到期后收掉。
+///
+/// 幂等是为了容忍这种重复调用，**不是**为了「多调几次也没事」——
+/// 仍然只有这两处触发点，新增之前先想清楚会不会把一轮同步拖慢。
 pub async fn reconcile_account(
     pool: &SqlitePool,
     account_id: &str,
@@ -190,13 +260,25 @@ pub async fn reconcile_account_as(
     let reclaimed_operations =
         operation::reclaim_running(pool, account_id, boot_id, now_ms).await?;
 
+    // 第 1b 步（R32）：本进程自己认领后卡住的 `running`。
+    // 必须紧跟在上一步之后、判过期之前：它收成 `uncertain` 之后，
+    // 下面 `expire_exhausted` 才有机会把次数到顶的那些一起收掉。
+    let reclaimed_stale = operation::reclaim_stale_running(
+        pool,
+        account_id,
+        boot_id,
+        operation::RUNNING_LEASE_MS,
+        now_ms,
+    )
+    .await?;
+
     // 第 2 步：次数到顶的未完结操作收成终态。
     let expired =
         operation::expire_exhausted(pool, account_id, MAX_OPERATION_ATTEMPTS, now_ms).await?;
 
     let mut report = ReconcileReport {
         reclaimed_sends,
-        reclaimed_operations,
+        reclaimed_operations: reclaimed_operations + reclaimed_stale,
         expired,
         ..Default::default()
     };
@@ -207,30 +289,38 @@ pub async fn reconcile_account_as(
         return Ok(report);
     }
 
-    let observations = build_observations(pool, &pending).await?;
+    let observations = build_observations(pool, &pending, now_ms).await?;
     let decisions = plan_reconcile(&observations);
 
     for (observation, decision) in observations.iter().zip(decisions) {
-        if let ReconcileDecision::MarkFailed {
-            error_kind,
-            message,
-        } = decision
-        {
-            operation::update_operation_state(
-                pool,
-                &observation.id,
-                OperationState::Failed,
-                Some(error_kind),
-                Some(&message),
-                now_ms,
-            )
-            .await?;
+        let (error_kind, message, is_stale) = match decision {
+            ReconcileDecision::MarkFailed {
+                error_kind,
+                message,
+            } => (error_kind, message, false),
+            ReconcileDecision::MarkStale {
+                error_kind,
+                message,
+            } => (error_kind, message, true),
+            ReconcileDecision::Keep => continue,
+        };
 
-            if error_kind == "epoch_changed" {
-                report.quarantined += 1;
-            } else {
-                report.failed_orphans += 1;
-            }
+        operation::update_operation_state(
+            pool,
+            &observation.id,
+            OperationState::Failed,
+            Some(error_kind),
+            Some(&message),
+            now_ms,
+        )
+        .await?;
+
+        if is_stale {
+            report.stale_uncertain += 1;
+        } else if error_kind == "epoch_changed" {
+            report.quarantined += 1;
+        } else {
+            report.failed_orphans += 1;
         }
     }
 
@@ -243,6 +333,7 @@ pub async fn reconcile_account_as(
 async fn build_observations(
     pool: &SqlitePool,
     pending: &[MailOperation],
+    now_ms: i64,
 ) -> AppResult<Vec<OperationObservation>> {
     // folder_id -> (是否存在, 当前 epoch)
     let mut folders: HashMap<&str, (bool, Option<i64>)> = HashMap::new();
@@ -294,6 +385,8 @@ async fn build_observations(
                 folder_uidvalidity,
                 folder_exists,
                 destination_exists,
+                updated_at: operation.updated_at,
+                now: now_ms,
             }
         })
         .collect())
@@ -312,6 +405,84 @@ mod tests {
             folder_uidvalidity: Some(100),
             folder_exists: true,
             destination_exists: true,
+            updated_at: 1_000,
+            now: 1_000,
+        }
+    }
+
+    #[test]
+    fn an_uncertain_operation_past_the_threshold_needs_a_human() {
+        let mut op = observation(OperationKind::Move);
+        op.state = OperationState::Uncertain;
+        op.updated_at = 1_000;
+        op.now = 1_000 + UNCERTAIN_STALE_MS;
+
+        match &plan_reconcile(&[op])[0] {
+            ReconcileDecision::MarkStale { error_kind, .. } => {
+                assert_eq!(*error_kind, "stale_unresolved");
+            }
+            other => panic!("应当转成待人工确认，实际是 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_uncertain_operation_within_the_threshold_is_kept() {
+        let mut op = observation(OperationKind::Move);
+        op.state = OperationState::Uncertain;
+        op.updated_at = 1_000;
+        // 差 1 毫秒才算过期：边界上宁可多等，也别把在途的判死。
+        op.now = 1_000 + UNCERTAIN_STALE_MS - 1;
+
+        assert_eq!(
+            plan_reconcile(&[op]),
+            vec![ReconcileDecision::Keep],
+            "还没到阈值就不该有结论"
+        );
+    }
+
+    #[test]
+    fn a_freshly_queued_operation_never_goes_stale() {
+        // `queued` / `retryable` 的下一步是重试，`updated_at` 变老不说明任何事。
+        for state in [OperationState::Queued, OperationState::Retryable] {
+            let mut op = observation(OperationKind::Move);
+            op.state = state;
+            op.updated_at = 0;
+            op.now = UNCERTAIN_STALE_MS * 10;
+
+            assert_eq!(
+                plan_reconcile(&[op]),
+                vec![ReconcileDecision::Keep],
+                "{state:?} 不该被判成待人工"
+            );
+        }
+    }
+
+    #[test]
+    fn a_backwards_clock_does_not_expire_anything() {
+        // 系统时钟被改到过去（或测试注入的时钟跳变）：绝不能因此判死。
+        let mut op = observation(OperationKind::Move);
+        op.state = OperationState::Uncertain;
+        op.updated_at = 10_000;
+        op.now = 1_000;
+
+        assert_eq!(plan_reconcile(&[op]), vec![ReconcileDecision::Keep]);
+    }
+
+    #[test]
+    fn a_missing_folder_wins_over_a_stale_uncertain() {
+        // 两条都命中时说「文件夹不存在」更像人话，而不是「请确认服务器上有没有」。
+        let mut op = observation(OperationKind::Move);
+        op.state = OperationState::Uncertain;
+        op.folder_exists = false;
+        op.folder_uidvalidity = None;
+        op.updated_at = 0;
+        op.now = UNCERTAIN_STALE_MS * 2;
+
+        match &plan_reconcile(&[op])[0] {
+            ReconcileDecision::MarkFailed { error_kind, .. } => {
+                assert_eq!(*error_kind, "folder_missing")
+            }
+            other => panic!("应当判成孤儿，实际是 {other:?}"),
         }
     }
 

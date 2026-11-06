@@ -32,6 +32,15 @@
   - 假服务器按宣告能力 gate `MOVE` / `UID EXPUNGE`，并在 `MOVE` 后补发
     untagged `EXPUNGE`——「能力探测漏判」与「untagged 穿插」这两类 bug
     以后在 CI 里会红（R40）
+- **对账从「只在启动」变成「每轮同步之后」**（2026-11-06，R29 / R32 / R33）
+  - 常驻运行期间 `attempts` 用完的操作不会再「既不移动也不提示」地等到下次
+    重启：每轮同步成功后都会对一次账（`AccountEvent::Synced` 带着对账报告，
+    界面收到就重查队列）
+  - 本进程自己认领后卡在 `running` 的行有了**租约**（15 分钟）：超时收成
+    `uncertain / lease_expired`，由下一轮回读去核对，不再永久卡死
+  - `uncertain` 有了**时间出口**：72 小时仍无结论就转成 `failed /
+    stale_unresolved`，并明确提示「请到服务器上确认它是否已经完成」——不再
+    无限期挂着，也**不会**替用户猜成成功或失败
 - **认证失败成为终态，不再无限重试**（2026-11-03）
   - `SyncState::ReauthRequired` 从 2026-10-26 就声明好了（`crates/xremail-core/src/model.rs:566`，
     注释写「a human has to act」），但**全仓没有任何地方发它**——实际行为是
