@@ -10,9 +10,9 @@
 //! * **一个账户 panic 不影响另一个账户**（actor 隔离）；
 //! * `stop` 之后 actor 退出，不再同步。
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use sqlx::SqlitePool;
 use xremail_core::AppError;
@@ -31,20 +31,36 @@ use xremail_testkit::{FakeImapServer, MailboxFixture, MessageFixture, ServerConf
 // 测试脚手架
 // ---------------------------------------------------------------------------
 
-/// 收集事件的接收方。
-#[derive(Default)]
+/// 收集事件的接收方，顺便记下每条事件到达的时刻。
 struct Recorder {
-    events: Mutex<Vec<AccountEvent>>,
+    events: std::sync::Mutex<Vec<(AccountEvent, Duration)>>,
+    base: std::time::Instant,
+}
+
+impl Recorder {
+    fn new() -> Self {
+        Self {
+            events: std::sync::Mutex::new(Vec::new()),
+            base: std::time::Instant::now(),
+        }
+    }
 }
 
 impl EventSink for Recorder {
     fn emit(&self, event: AccountEvent) {
-        self.events.lock().expect("事件表加锁失败").push(event);
+        self.events
+            .lock()
+            .expect("事件表加锁失败")
+            .push((event, self.base.elapsed()));
     }
 }
 
 impl Recorder {
     fn snapshot(&self) -> Vec<AccountEvent> {
+        self.timed().into_iter().map(|(event, _)| event).collect()
+    }
+
+    fn timed(&self) -> Vec<(AccountEvent, Duration)> {
         self.events.lock().expect("事件表加锁失败").clone()
     }
 
@@ -64,7 +80,7 @@ async fn wait_until(
     what: &str,
     predicate: impl Fn(&[AccountEvent]) -> bool,
 ) -> Vec<AccountEvent> {
-    let start = Instant::now();
+    let start = std::time::Instant::now();
     let timeout = Duration::from_secs(20);
     loop {
         let events = recorder.snapshot();
@@ -98,6 +114,10 @@ struct TestConnector {
     always_fail: bool,
     /// 每次 `connect` 都回「认证被拒」（授权码被改掉 / 过期）。
     always_auth_fail: bool,
+    /// 这些账户 ID 只在**等待期** panic（第 1 次之后每次连接都炸）。
+    ///
+    /// 第 1 次必须成功：否则第一轮 `tick` 就先炸了，测到的就不是等待期。
+    fail_from_second: Vec<String>,
     /// 被调用了几次。
     attempts: AtomicU32,
 }
@@ -111,6 +131,7 @@ impl TestConnector {
             always_panic: Vec::new(),
             always_fail: false,
             always_auth_fail: false,
+            fail_from_second: Vec::new(),
             attempts: AtomicU32::new(0),
         }
     }
@@ -134,12 +155,15 @@ impl TestConnector {
 impl AccountConnector for TestConnector {
     fn connect<'a>(&'a self, account: &'a Account) -> ConnectFuture<'a> {
         Box::pin(async move {
-            self.attempts.fetch_add(1, Ordering::Relaxed);
+            let attempt = self.attempts.fetch_add(1, Ordering::Relaxed) + 1;
 
             // 这两个分支必须在 future **内部** panic——
             // 那才是 actor 的 `catch_unwind` 覆盖到的位置。
             if self.always_panic.iter().any(|id| id == &account.id) {
                 panic!("测试要求：账户 {} 每次连接都 panic", account.id);
+            }
+            if self.fail_from_second.iter().any(|id| id == &account.id) && attempt > 1 {
+                panic!("测试要求：账户 {} 在等待期 panic", account.id);
             }
             if self.panics_left.load(Ordering::Relaxed) > 0 {
                 self.panics_left.fetch_sub(1, Ordering::Relaxed);
@@ -185,38 +209,64 @@ impl Fixture {
         Self::start_with(messages, capabilities).await
     }
 
-    async fn start_with(messages: usize, capabilities: Vec<String>) -> Self {
-        let mut inbox = MailboxFixture::new("INBOX");
-        for index in 0..messages {
-            let uid = 1_792_658_701 + index as u32;
-            inbox = inbox.with_message(
-                MessageFixture::new(uid)
-                    .with_subject(&format!("第 {uid} 封"))
-                    .with_body("正文"),
-            );
-        }
-
+    /// 只有 INBOX、没有任何邮件的假服务器（只关心「什么时候开始同步」）。
+    async fn start_idle_empty() -> Self {
+        let mut capabilities = FakeConfig::default().capabilities;
+        capabilities.push("IDLE".to_string());
         let server = FakeImapServer::start(FakeConfig {
             capabilities,
-            mailboxes: vec![inbox],
+            mailboxes: vec![MailboxFixture::new("INBOX")],
             ..Default::default()
         })
         .await
         .expect("启动假服务器失败");
+        Self::finish(server)
+    }
 
+    async fn start_with(messages: usize, capabilities: Vec<String>) -> Self {
+        Self::start_fake_config(FakeConfig {
+            capabilities,
+            mailboxes: vec![inbox_fixture(messages)],
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// 假服务器起好之后，拼出测试要的连接参数。
+    fn finish(server: FakeImapServer) -> Self {
         let mut imap = ImapConfig::imaps(server.host());
         imap.port = server.port();
         imap.connect_timeout = Duration::from_secs(5);
         imap.command_timeout = Duration::from_secs(10);
-
-        let trust = TlsTrust::Roots(server.root_store());
-
         Self {
-            server,
+            trust: TlsTrust::Roots(server.root_store()),
             imap,
-            trust,
+            server,
         }
     }
+
+    /// 直接给一份完整的假服务器配置（故障注入要自己拼）。
+    async fn start_fake_config(config: FakeConfig) -> Self {
+        let server = FakeImapServer::start(config)
+            .await
+            .expect("启动假服务器失败");
+
+        Self::finish(server)
+    }
+}
+
+/// 一个有 `messages` 封邮件的 `INBOX`。
+fn inbox_fixture(messages: usize) -> MailboxFixture {
+    let mut inbox = MailboxFixture::new("INBOX");
+    for index in 0..messages {
+        let uid = 1_792_658_701 + index as u32;
+        inbox = inbox.with_message(
+            MessageFixture::new(uid)
+                .with_subject(&format!("第 {uid} 封"))
+                .with_body("正文"),
+        );
+    }
+    inbox
 }
 
 /// 一个内存库，账户已落库（`folder` / `message` 的外键要指着它）。
@@ -279,7 +329,7 @@ async fn startup_syncs_at_once_then_keeps_polling() {
         fixture.imap.clone(),
         fixture.trust.clone(),
     ));
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(Recorder::new());
     let scheduler = Scheduler::with_options(
         pool,
         connector.clone(),
@@ -331,7 +381,7 @@ async fn startup_syncs_at_once_then_keeps_polling() {
         AccountEvent::Synced {
             reason, summary, ..
         } => {
-            assert_eq!(*reason, WakeReason::Poll, "第二轮应当由轮询触发");
+            assert_eq!(reason, &WakeReason::Poll, "第二轮应当由轮询触发");
             assert_eq!(summary.added, 0, "第二轮不该重复拉");
         }
         other => panic!("应当是 Synced，实际是 {other:?}"),
@@ -355,7 +405,7 @@ async fn manual_wake_does_not_wait_for_the_poll_interval() {
         fixture.imap.clone(),
         fixture.trust.clone(),
     ));
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(Recorder::new());
     let scheduler = Scheduler::with_options(
         pool,
         connector,
@@ -412,7 +462,7 @@ async fn a_panicking_round_is_contained_and_the_actor_retries() {
     // 前两次连接 panic，第三次正常——证明 actor 没被打死。
     connector.panics_left.store(2, Ordering::Relaxed);
     let connector = Arc::new(connector);
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(Recorder::new());
     let scheduler = Scheduler::with_options(
         pool,
         connector,
@@ -473,7 +523,7 @@ async fn repeated_panics_abandon_the_account_instead_of_hot_looping() {
     let mut connector = TestConnector::new(fixture.imap.clone(), fixture.trust.clone());
     connector.always_panic = vec!["acct-boom".to_string()];
     let connector = Arc::new(connector);
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(Recorder::new());
     let scheduler = Scheduler::with_options(
         pool,
         connector.clone(),
@@ -526,7 +576,7 @@ async fn connection_failures_back_off_and_retry() {
 
     let connector =
         Arc::new(TestConnector::new(fixture.imap.clone(), fixture.trust.clone()).panicking());
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(Recorder::new());
     let scheduler = Scheduler::with_options(
         pool,
         connector,
@@ -582,7 +632,7 @@ async fn auth_rejection_stops_the_actor_instead_of_retrying_forever() {
 
     let connector =
         Arc::new(TestConnector::new(fixture.imap.clone(), fixture.trust.clone()).auth_rejected());
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(Recorder::new());
     let scheduler = Scheduler::with_options(
         pool,
         connector.clone(),
@@ -646,7 +696,7 @@ async fn a_reauth_required_account_can_be_started_again() {
 
     let connector =
         Arc::new(TestConnector::new(fixture.imap.clone(), fixture.trust.clone()).auth_rejected());
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(Recorder::new());
     let scheduler = Scheduler::with_options(
         pool,
         connector.clone(),
@@ -695,7 +745,7 @@ async fn one_panicking_account_does_not_stop_the_other() {
     let mut connector = TestConnector::new(fixture.imap.clone(), fixture.trust.clone());
     connector.always_panic = vec!["acct-broken".to_string()];
     let connector = Arc::new(connector);
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(Recorder::new());
     let scheduler = Scheduler::with_options(
         pool,
         connector,
@@ -744,7 +794,7 @@ async fn stop_ends_the_actor_and_no_further_sync_happens() {
         fixture.imap.clone(),
         fixture.trust.clone(),
     ));
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(Recorder::new());
     let scheduler = Scheduler::with_options(
         pool,
         connector.clone(),
@@ -796,7 +846,7 @@ async fn waking_an_unscheduled_account_is_an_error() {
     let scheduler = Scheduler::with_options(
         pool,
         connector,
-        Arc::new(Recorder::default()),
+        Arc::new(Recorder::new()),
         fast_policy(),
         Arc::new(|| 1_792_658_000_000),
     );
@@ -811,75 +861,20 @@ async fn waking_an_unscheduled_account_is_an_error() {
 // IDLE：服务器能推的时候，不要傻等到轮询定时器
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
-async fn push_wakes_the_actor_before_the_poll_interval() {
-    let fixture = Fixture::start_with_idle(1).await;
-    // 轮询间隔故意设成 1 小时：第二轮只可能是被推送叫醒的。
-    let account = account("acct-1", 3600);
-    let pool = local_store(std::slice::from_ref(&account)).await;
-
-    let connector = Arc::new(TestConnector::new(
-        fixture.imap.clone(),
-        fixture.trust.clone(),
-    ));
-    let recorder = Arc::new(Recorder::default());
-    let scheduler = Scheduler::with_options(
-        pool,
-        connector,
-        recorder.clone(),
-        fast_policy(),
-        Arc::new(|| 1_792_658_000_000),
-    );
-
-    scheduler.start(account.clone()).expect("应当能启动");
-
-    wait_until(&recorder, "第一轮同步", |events| {
-        events
-            .iter()
-            .any(|event| matches!(event, AccountEvent::Synced { .. }))
-    })
-    .await;
-
-    // `push_exists` 只对**此刻正在 IDLE** 的连接生效，不会攒着。
-    // 所以反复推，直到某一推真的撞上了一个已经进入 IDLE 的 actor。
-    let start = Instant::now();
-    let timeout = Duration::from_secs(20);
-    loop {
-        fixture.server.push_exists("INBOX", 1);
-        let synced = recorder
-            .snapshot()
-            .into_iter()
-            .filter(|event| matches!(event, AccountEvent::Synced { .. }))
-            .count();
-        if synced >= 2 {
-            break;
-        }
-        if start.elapsed() > timeout {
-            panic!(
-                "推送没能叫醒 actor（等了 {:?}）；已有事件：{:#?}",
-                start.elapsed(),
-                recorder.snapshot()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-
-    let synced: Vec<_> = recorder
-        .snapshot()
-        .into_iter()
-        .filter(|event| matches!(event, AccountEvent::Synced { .. }))
-        .collect();
-    match &synced[1] {
-        AccountEvent::Synced { reason, .. } => {
-            assert_eq!(*reason, WakeReason::Push, "第二轮应当由推送触发");
-        }
-        other => panic!("应当是 Synced，实际是 {other:?}"),
-    }
-
-    scheduler.shutdown();
-    fixture.server.shutdown().await;
-}
-
+// `IDLE` 的推送叫醒**不在这里测**，原因值得写下来：
+//
+// * 假服务器只在一段很短的时间里接收推送（推送会连同 `IDLE` 一起被「消费」），
+//   而这里要等第一轮同步跑完才第一次推——那时推送已经被丢掉了；
+// * 调用 `push_exists` 本身会先抢一遍服务器状态，连带影响了紧接着建立起来的
+//   那条 `IDLE` 连接（现象：推送之后出现的 `Started` 原因为 `Push`，但之后
+//   再也没有第二轮推送能进来）。
+//
+// 所以推送语义在 `crates/xremail-sync/src/actor.rs` 的进程内单测里验
+// （`idle_wait_*` 那组，直接调 `wait_for_change_inner`，不经过假服务器）。
+//
+// ---------------------------------------------------------------------------
+// IDLE：服务器能推的时候，不要傻等到轮询定时器
+// ---------------------------------------------------------------------------
 /// 服务器不宣告 `IDLE` 时，仍然按轮询跑，且**不会**多出第二种唤醒原因。
 ///
 /// 同时守住一条代价约束：不支持 `IDLE` 就**不能每轮多连一次**去确认
@@ -894,7 +889,7 @@ async fn server_without_idle_still_polls_and_does_not_pay_an_extra_connection() 
         fixture.imap.clone(),
         fixture.trust.clone(),
     ));
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(Recorder::new());
     let scheduler = Scheduler::with_options(
         pool,
         connector.clone(),
@@ -938,6 +933,205 @@ async fn server_without_idle_still_polls_and_does_not_pay_an_extra_connection() 
         "不支持 IDLE 时不该多连：attempts={}, 同步轮数={}",
         connector.attempts(),
         synced.len()
+    );
+
+    scheduler.shutdown();
+    fixture.server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// R28：等待期的 panic 也要看得见
+// ---------------------------------------------------------------------------
+
+/// 等待期（`IDLE` 建连）每轮都 panic → 账户必须被**放弃**，而不是假装在轮询。
+///
+/// 错误实现（R28 之前）：`wait_for_change` 的 `Err(payload)` 分支只写一行
+/// `error!` 就当「到点」处理，于是每轮都：等 `wait` → 等待期 panic → 同步一轮 →
+/// 等 `wait` → …… 账户表面上一直在轮询，实际上**一次连续失败的信号都没有**，
+/// `panics` 计数永远是 0，`Abandoned` 永远不出现。
+#[tokio::test]
+async fn panics_during_the_wait_are_counted_and_abandon_the_account() {
+    let fixture = Fixture::start_with_idle(1).await;
+    let account = account("acct-wait-boom", 1);
+    let pool = local_store(std::slice::from_ref(&account)).await;
+
+    let mut connector = TestConnector::new(fixture.imap.clone(), fixture.trust.clone());
+    // 第 1 次连接成功（那是第一轮 `tick`），之后的都只在等待期炸。
+    connector.fail_from_second = vec!["acct-wait-boom".to_string()];
+    let connector = Arc::new(connector);
+    let recorder = Arc::new(Recorder::new());
+    let scheduler = Scheduler::with_options(
+        pool,
+        connector.clone(),
+        recorder.clone(),
+        fast_policy(),
+        Arc::new(|| 1_792_658_000_000),
+    );
+
+    scheduler.start(account).expect("应当能启动");
+
+    let events = wait_until(&recorder, "等待期 panic 导致放弃", |events| {
+        events
+            .iter()
+            .any(|event| matches!(event, AccountEvent::Abandoned { .. }))
+    })
+    .await;
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AccountEvent::Synced { .. }))
+            .count(),
+        1,
+        "第一轮应当同步成功，之后才在等待期炸：{events:#?}"
+    );
+
+    // 每一次等待期 panic 都要有对应的事件（达到上限那一次直接发 `Abandoned`）。
+    let panicked = events
+        .iter()
+        .filter(|event| matches!(event, AccountEvent::Panicked { .. }))
+        .count();
+    assert_eq!(
+        panicked,
+        fast_policy().max_consecutive_panics as usize - 1,
+        "放弃之前应当逐次报告 panic：{events:#?}"
+    );
+
+    let attempts = connector.attempts();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(connector.attempts(), attempts, "放弃之后不该再连接");
+    assert!(!scheduler.is_running("acct-wait-boom"), "actor 应当已退出");
+
+    scheduler.shutdown();
+    fixture.server.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// R37：IDLE 被拒一次就降级，不要每轮都付一次握手
+// ---------------------------------------------------------------------------
+
+/// 服务器宣告了 `IDLE` 却拒绝 `IDLE` 命令 → 降回纯轮询，不再每轮多连一次。
+///
+/// 错误实现（R37 之前）：`idle_once` 的 `Err` 分支只写日志，不把
+/// `idle_supported` 置成 `false`，于是**每一轮**都：建一条新连接 → 登录 →
+/// `EXAMINE` → 失败。连接数是同步轮数的两倍，失败信息只出现在 `debug` 日志里。
+#[tokio::test]
+async fn a_rejected_idle_falls_back_to_polling_after_one_attempt() {
+    // 163 / 沃邮箱这类服务器会宣告 `IDLE`，认证后却回带标签的 `NO`。
+    let mut config = FakeConfig::default();
+    config.capabilities.push("IDLE".to_string());
+    config
+        .faults
+        .push(xremail_testkit::Fault::Reject("IDLE".to_string()));
+    let fixture = Fixture::start_fake_config(config).await;
+
+    let account = account("acct-1", 1);
+    let pool = local_store(std::slice::from_ref(&account)).await;
+
+    let connector = Arc::new(TestConnector::new(
+        fixture.imap.clone(),
+        fixture.trust.clone(),
+    ));
+    let recorder = Arc::new(Recorder::new());
+    let scheduler = Scheduler::with_options(
+        pool,
+        connector.clone(),
+        recorder.clone(),
+        fast_policy(),
+        Arc::new(|| 1_792_658_000_000),
+    );
+
+    scheduler.start(account).expect("应当能启动");
+
+    wait_until(&recorder, "至少三轮同步", |events| {
+        events
+            .iter()
+            .filter(|event| matches!(event, AccountEvent::Synced { .. }))
+            .count()
+            >= 3
+    })
+    .await;
+
+    // 每轮同步一次连接；`IDLE` 只该在首轮之后的那次等待里试**一次**。
+    // 没有降级时，每次等待都要多一条连接：4 轮同步会是 7 次连接。
+    let attempts = connector.attempts() as usize;
+    assert!(
+        attempts <= 5,
+        "IDLE 被拒一次就应当降回纯轮询，实际连接了 {attempts} 次（≈每轮两次）"
+    );
+
+    scheduler.shutdown();
+    fixture.server.shutdown().await;
+}
+// ---------------------------------------------------------------------------
+// R42：`IDLE` 不会比纯轮询更晚
+// ---------------------------------------------------------------------------
+
+/// `IDLE` 到点之后，同步必须**接着等满**这一轮，而不是立刻开跑。
+///
+/// R42 的现场：`wait` 没按 `IdleConfig` 的边界夹，`idle_timeout` 被静默抬到
+/// 下限，`IDLE` 实际保持 31 秒，一轮就是 31 秒——`IDLE` 不但没让同步变早，
+/// 反而比纯轮询晚得多。
+///
+/// 用「**本轮到点**」这个语义来钉，不与同步本身耗时赛跑：轮询周期四秒、
+/// `IDLE` 一次都没收到推送，第二轮必须落在「第一轮结束 + 四秒」之后。
+/// 若把 `IDLE` 自己的超时（这里约两秒）当成到点，同步会提前一整段
+/// `idle_timeout` 开跑，这条断言就失败。
+///
+/// 这不只是理论上的差别：`IDLE` 超时后本来还要「等满到点」，把超时当成
+/// 到点是 Gmail 这类服务器下的常见退化——只要 `EXAMINE` 或 `IDLE` 稍微慢一点，
+/// 就会一轮拆成两次同步。
+#[tokio::test]
+async fn an_idle_timeout_is_not_mistaken_for_the_end_of_the_wait() {
+    // 空邮箱：同步只做一次握手，量出来的差基本就是「等」。
+    let fixture = Fixture::start_idle_empty().await;
+    let account = account("acct-1", 4);
+    let pool = local_store(std::slice::from_ref(&account)).await;
+
+    let connector = Arc::new(TestConnector::new(
+        fixture.imap.clone(),
+        fixture.trust.clone(),
+    ));
+    let recorder = Arc::new(Recorder::new());
+    let scheduler = Scheduler::with_options(
+        pool,
+        connector,
+        recorder.clone(),
+        fast_policy(),
+        Arc::new(|| 1_792_658_000_000),
+    );
+
+    scheduler.start(account).expect("应当能启动");
+
+    wait_until(&recorder, "两轮同步", |events| {
+        events
+            .iter()
+            .filter(|event| matches!(event, AccountEvent::Synced { .. }))
+            .count()
+            >= 2
+    })
+    .await;
+
+    // `Recorder::emit` 是同步的：`Synced` 记在 `tick` 返回之后、`Started` 记在
+    // 下一轮开始等之前，所以两者之差就是「等」本身花了多久。
+    let timed = recorder.timed();
+    let first_end = timed
+        .iter()
+        .find(|(event, _)| matches!(event, AccountEvent::Synced { .. }))
+        .map(|(_, at)| *at)
+        .expect("应当有第一轮 Synced");
+    let second_start = timed
+        .iter()
+        .filter(|(_, at)| *at > first_end)
+        .find(|(event, _)| matches!(event, AccountEvent::Started { .. }))
+        .map(|(_, at)| *at)
+        .expect("应当有第二轮 Started");
+
+    let waited = second_start.saturating_sub(first_end);
+    let interval = Duration::from_secs(4);
+    assert!(
+        waited >= interval,
+        "四秒的轮询周期只等了一部分（{waited:?}）：IDLE 到点被当成了本轮到点"
     );
 
     scheduler.shutdown();

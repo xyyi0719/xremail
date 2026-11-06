@@ -294,6 +294,18 @@ enum Command {
     Stop,
 }
 
+/// 等待期结束的方式。
+///
+/// 两者都在 `wait_for_change` 的 `catch_unwind` **里面**产生（R42）：命令抵达时
+/// 那条 `IDLE` 连接可能还挂着，得先把它放掉，否则下一轮只能排队等它。
+#[derive(Debug)]
+enum Change {
+    /// 到了该同步的时刻（或服务器推来了一封信）。
+    Wake(WakeReason),
+    /// 等的时候来了一条命令。
+    Command(Option<Command>),
+}
+
 /// 一个正在跑的 actor。
 #[derive(Debug)]
 struct ActorHandle {
@@ -374,7 +386,9 @@ impl AccountActor {
                     .await
                     .ok()
                     .and_then(std::result::Result::ok)
-                    .map(|capabilities| capabilities.has_str("IDLE"))
+                    .map(|capabilities| {
+                        xremail_protocol_imap::has_capability(&capabilities, "IDLE")
+                    })
             } else {
                 None
             };
@@ -399,14 +413,14 @@ impl AccountActor {
 
     /// 等「下一轮该跑了」，**顺便让服务器有机会提前叫醒我们**。
     ///
-    /// 返回本轮该报的 [`WakeReason`]。
+    /// 返回值与 panic 的处置见 [`Self::wait_for_change`]。
     ///
     /// ## 为什么 `IDLE` 取代的是 `sleep`，而不是额外加一条唤醒通道
     ///
     /// 轮询定时器本来就在等 `wait` 这么久。把这段等待换成「`IDLE` 等服务器说话」
     /// 不改变任何语义：
     /// * 服务器先说话 → `Push`，立刻同步；
-    /// * 没人说话 → `IDLE` 在 `wait` 到点时返回 `Timeout`，按 `on_timeout` 同步。
+    /// * 没人说话 → `IDLE` 到点后把本轮剩下的时间等满，再按 `on_timeout` 同步。
     ///
     /// 两条路最终都以「同步一轮」收尾，所以 **`IDLE` 绝不会让同步变少**，
     /// 只可能让它变早。这一点比「新加一条唤醒通道」好管得多：
@@ -414,46 +428,82 @@ impl AccountActor {
     ///
     /// ## 失败一律退回纯等待
     ///
-    /// 连接不上、`IDLE` 被拒、连接半死……全都 `sleep(wait)` 之后按
+    /// 连接不上、`IDLE` 被拒、连接半死……全都等到 `deadline` 之后按
     /// `on_timeout` 走。**绝不提前返回**：提前返回会让「连不上服务器」变成
     /// 「每一轮都多跑一次同步」，反而把错误放大成忙循环。
-    async fn wait_for_change(&mut self, wait: Duration, on_timeout: WakeReason) -> WakeReason {
+    ///
+    /// 两种情况都要让主循环看得见（R28）：
+    /// * 正常：本轮该报的 [`WakeReason`]；
+    /// * 等待期 panic：**原样上报消息**，由主循环与 `tick` 里的 panic 合并计数。
+    ///
+    /// 以前这里 panic 只写一行 `error!` 就当「到点」处理，主循环一无所知：
+    /// 若 `connect` 里有个必现的 panic，每轮都会撞一次，账户**永远**不会同步，
+    /// 而 UI 上显示的还是「正常轮询中」，连 `Abandoned` 都不会出现。
+    async fn wait_for_change(
+        &mut self,
+        wait: Duration,
+        on_timeout: WakeReason,
+        awake_cmd: &mut mpsc::UnboundedReceiver<Command>,
+    ) -> Result<Change, String> {
         // 与 [`Self::tick`] 同一条理由：等待期会 `connect` 并 `idle_once`，同样
         // 全是 await 点。这条分支原先**没有**包边界——它 panic 会直接撞到 tokio
         // 任务边界，任务静悄悄死掉，`reap_finished` 把尸体清掉，该账户从此不再
         // 同步，直到用户重启应用。R13 说「所有 panic 停在这里」，那就得真的
         // 盖住这条分支，而不只是 `tick`。
-        let result = AssertUnwindSafe(self.wait_for_change_inner(wait, on_timeout))
-            .catch_unwind()
-            .await;
+        let attempt = async {
+            // 「等」与「命令」放进**同一个** future，再由**一次** `catch_unwind`
+            // 盖住（R42）：以前命令在外层 `select!` 里，等到点就直接丢掉这个
+            // future——那条 `IDLE` 连接既没发 `DONE`，也**没被 drop**
+            // （`assert_unwind_safe` 拿到的是一整个 `self &mut` 的借用），推后
+            // 才在原地被悄悄放弃。下一次等待只能排队等它收尾，每轮多出整整一个
+            // `command_timeout`。
+            //
+            // 现在命令先到，就把 `wait_for_change_inner` 的结果丢掉并让它正常
+            // 收尾（`IDLE` 发 `DONE`、连接关闭），不再有「被遗弃的借用」。
+            tokio::select! {
+                biased;
+                command = awake_cmd.recv() => Change::Command(command),
+                next = AssertUnwindSafe(self.wait_for_change_inner(wait, on_timeout)) => next,
+            }
+        };
+
+        let result = AssertUnwindSafe(attempt).catch_unwind().await;
 
         match result {
-            Ok(reason) => reason,
+            Ok(change) => Ok(change),
             Err(payload) => {
+                let message = panic_message(payload.as_ref());
                 tracing::error!(
                     account = %self.account.email,
-                    panic = %panic_message(payload.as_ref()),
-                    "等待期 panic，按到点处理"
+                    %message,
+                    "等待期 panic（已被边界拦住）"
                 );
-                // 不提前返回：panic 若出在 `connect` 里会每轮重现，立即返回就成了
-                // 忙循环。等满 `wait` 再同步，与其它失败路径的处理保持一致。
-                tokio::time::sleep(wait).await;
-                on_timeout
+                // 不在这里 sleep：交给主循环按 panic 退避，原因见 [`Self::run`]。
+                Err(message)
             }
         }
     }
 
     /// [`Self::wait_for_change`] 的本体，只被那个包了 panic 边界的版本调用。
-    async fn wait_for_change_inner(
-        &mut self,
-        wait: Duration,
-        on_timeout: WakeReason,
-    ) -> WakeReason {
+    async fn wait_for_change_inner(&mut self, wait: Duration, on_timeout: WakeReason) -> Change {
+        // 本轮「本该等到」的那个时刻：从这里开始等，就**正好**等满 `wait`（R42）。
+        //
+        // 这不是「可有可无的保险」，是唯一正确的算法。以前是「`IDLE` 结束后再睡
+        // 剩下的差值」，而差值只从 `idle_once` 内部算起——建连 + 登录 +
+        // `CAPABILITY` + `EXAMINE` 每一步都可能等满 `command_timeout`，却全被
+        // 算在周期之外；等到 `IDLE` 自己超时（同样要一整个 `wait`），一轮就被拉成
+        // 「握手 + wait + wait」。
+        //
+        // 所以 `IDLE` 的超时**不等于**本轮到点：它只是「暂时没推送」，之后还要
+        // 接着等到 `deadline`。两者是同一个时间轴上的两个出口，「有人推」是提前
+        // 出局的那个。
+        let deadline = tokio::time::Instant::now() + wait;
+
         // 只在一个本该等满 `wait` 的情况下才用 `IDLE`。
         // 不确定 / 已知不支持 → 纯等待，一行代价也没有。
         if self.idle_supported != Some(true) {
-            tokio::time::sleep(wait).await;
-            return on_timeout;
+            wait_until(deadline).await;
+            return Change::Wake(on_timeout);
         }
 
         let session = match self.connector.connect(&self.account).await {
@@ -464,20 +514,32 @@ impl AccountActor {
                     %error,
                     "IDLE 建连失败，退回纯等待"
                 );
-                tokio::time::sleep(wait).await;
-                return on_timeout;
+                wait_until(deadline).await;
+                return Change::Wake(on_timeout);
             }
         };
 
-        // `idle_timeout` 就用本轮要等的时间：这样「有人推」和「到点了」
+        // `idle_timeout` 就是本轮要等的时间：这样「有人推」和「到点了」
         // 是同一个时间轴上的两个出口，不需要额外协调。
-        // （`IdleConfig::new` 会把它夹到 RFC 2177 的 29 分钟以内。）
-        let config = IdleConfig::new(self.policy.command_timeout, wait, "INBOX");
+        //
+        // 但要按 `IdleConfig` 自己的下限夹一下（R42）：`IdleConfig::new` 会把
+        // 小于下限的 `idle_timeout` 抬到下限，若这里直接传 `wait`，那么 `wait`
+        // 比下限还短时 `IDLE` 会比纯等待**更晚**结束，违反本函数的承诺
+        // （「只可能让同步变早」）。提前夹好、`IDLE` 结束后再把剩下的时间等满，
+        // 两条路径就以同一个时刻为终点。
+        let idle_wait = idle_wait_for(wait);
+        let config = IdleConfig::new(self.policy.command_timeout, idle_wait, "INBOX");
 
-        match idle_once(session, &config).await {
+        let idle_result = idle_once(session, &config).await;
+        match idle_result {
             Ok(outcome) => match outcome.event {
-                IdleEvent::MailboxChanged => WakeReason::Push,
-                IdleEvent::Timeout => on_timeout,
+                IdleEvent::MailboxChanged => Change::Wake(WakeReason::Push),
+                IdleEvent::Timeout => {
+                    // `IDLE` 到点只是「这段时间没人推」，**不是**本轮到点：
+                    // 还要等满整个周期（R42）。握手已经花掉的时间从这里扣。
+                    wait_until(deadline).await;
+                    Change::Wake(on_timeout)
+                }
                 IdleEvent::Unsupported => {
                     // 记下来，以后不再试。
                     tracing::debug!(
@@ -486,20 +548,28 @@ impl AccountActor {
                     );
                     self.idle_supported = Some(false);
                     // 仍然等满 `wait`：本轮本来就该等到这个时刻才同步。
-                    tokio::time::sleep(wait).await;
-                    on_timeout
+                    wait_until(deadline).await;
+                    Change::Wake(on_timeout)
                 }
             },
             Err(error) => {
                 // 连接在 IDLE 期间坏了。**不**提前返回：把它当「没被叫醒」，
                 // 等到点正常同步，否则坏连接会变成忙循环。
+                //
+                // 也不再把 `IDLE` 当「可能支持」一直试下去（R37）：`IDLE`
+                // 失败几乎总是服务器侧的确定性拒绝（`init` 拿到带标签的 `NO`）。
+                // 每轮都先建一条连接、握手、`EXAMINE`、再被拒——付 30 秒超时的
+                // 代价换一个必然的失败，还和正常同步抢连接数。既然这一轮已经
+                // 证明了「用不了」，就降回纯轮询；下次 `start`（用户手动同步、
+                // 重启应用）会重新探测。
                 tracing::debug!(
                     account = %self.account.email,
                     %error,
-                    "IDLE 失败，本轮退回轮询"
+                    "IDLE 失败，以后只用轮询，本轮仍然等到点"
                 );
-                tokio::time::sleep(wait).await;
-                on_timeout
+                self.idle_supported = Some(false);
+                wait_until(deadline).await;
+                Change::Wake(on_timeout)
             }
         }
     }
@@ -507,7 +577,8 @@ impl AccountActor {
     /// actor 主循环。
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Command>) {
         let account_id = self.account.id.clone();
-        // `None` = 立刻跑（启动时）。
+        // 注意：这是「本轮结束 → 下一次**开始**等」的延后量，不是两个周期之间的
+        // 完整间隔。真正的周期由 `wait_for_change` 里的 deadline 兜底（R42）。
         let mut delay: Option<Duration> = None;
         let mut reason = WakeReason::Startup;
         // 定时器到点时该报什么原因：正常轮询是 `Poll`，失败后的退避是 `Retry`。
@@ -530,17 +601,52 @@ impl AccountActor {
                     }
                 }
                 Some(wait) => {
-                    // `biased`：命令优先于到点，点「刷新」不用等定时器。
-                    //
-                    // 第二路是 `IDLE`：它与 `sleep(wait)` 二选一（见
-                    // `wait_for_change`），所以无论走哪条路，都不会比纯轮询更晚。
-                    tokio::select! {
-                        biased;
-                        command = rx.recv() => match command {
+                    // 命令与「等到点」的赛跑在 `wait_for_change` 里面（R42）：
+                    // 到点时它负责先把 `IDLE` 连接放掉，主循环这边只处理结果。
+                    match self.wait_for_change(wait, timeout_reason, &mut rx).await {
+                        Ok(Change::Command(command)) => match command {
                             None | Some(Command::Stop) => break,
                             Some(Command::Sync(next)) => reason = next,
                         },
-                        next = self.wait_for_change(wait, timeout_reason) => reason = next,
+                        Ok(Change::Wake(next)) => reason = next,
+                        // 等待期 panic（R28）：和 `tick` 里的 panic 走**同一套**
+                        // 计数与退避。否则「每轮都 panic 的等待」会让账户
+                        // 表面正常、实际一轮都同步不了，还永远不会被放弃。
+                        Err(message) => {
+                            panics += 1;
+                            tracing::error!(
+                                account = %self.account.email,
+                                %message,
+                                panics,
+                                "同步任务在等待期 panic（已被任务边界拦住）"
+                            );
+                            if panics >= self.policy.max_consecutive_panics {
+                                emit(
+                                    &self.sink,
+                                    AccountEvent::Abandoned {
+                                        account_id: account_id.clone(),
+                                        message,
+                                    },
+                                );
+                                break;
+                            }
+                            // 退避后再跑一轮：上一轮可能压根没开始，
+                            // 立刻重跑就是忙循环。
+                            let retry_in = backoff;
+                            backoff = self.policy.grow(backoff);
+                            timeout_reason = WakeReason::Retry;
+                            delay = Some(retry_in);
+                            emit(
+                                &self.sink,
+                                AccountEvent::Panicked {
+                                    account_id: account_id.clone(),
+                                    reason,
+                                    message,
+                                    retry_in,
+                                },
+                            );
+                            continue;
+                        }
                     }
                 }
             }
@@ -654,6 +760,23 @@ impl AccountActor {
 /// 那不该让一个账户的同步停摆。
 fn emit(sink: &Arc<dyn EventSink>, event: AccountEvent) {
     let _ = std::panic::catch_unwind(AssertUnwindSafe(|| sink.emit(event)));
+}
+
+/// 等到 `deadline` 为止；已经过了就立刻返回。
+///
+/// 本轮该结束的时刻在建连 `IDLE` **之前**就定下了，所以握手花掉的时间、
+/// `IDLE` 到点返回的时间都自动从这段等待里扣掉——每轮同步严格按轮询周期
+/// 发生，`IDLE` 只可能让它变早（R37/R42）。
+async fn wait_until(deadline: tokio::time::Instant) {
+    tokio::time::sleep_until(deadline).await;
+}
+
+/// 交给 `IDLE` 的等待时长：就是轮询周期本身，只在 `IdleConfig` 的边界上夹一下。
+///
+/// 下限**绝不能**用 `command_timeout`（R42）：那会把「每秒轮询」变成
+/// 「每 30 秒才醒来一次」，与用户设的周期无关。
+fn idle_wait_for(wait: Duration) -> Duration {
+    wait.clamp(IdleConfig::MIN_IDLE_TIMEOUT, IdleConfig::MAX_IDLE_TIMEOUT)
 }
 
 /// 从 panic 载荷里取一段人能看的文字。
@@ -905,6 +1028,34 @@ mod tests {
 
         let payload = std::panic::catch_unwind(|| std::panic::panic_any(42u8)).unwrap_err();
         assert_eq!(panic_message(payload.as_ref()), "未知 panic 载荷");
+    }
+
+    #[test]
+    fn idle_wait_tracks_the_poll_interval_not_the_command_timeout() {
+        // R42：以前直接把 `wait` 传给 `IdleConfig::new`，它按自己的下限夹，
+        // 小于下限的轮询被静默抬长——`IDLE` 反而比纯轮询更晚结束。
+        assert_eq!(
+            idle_wait_for(Duration::from_secs(300)),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            idle_wait_for(Duration::from_millis(300)),
+            Duration::from_millis(300)
+        );
+        // 策略里的 `command_timeout` 不参与：它是单条命令的上限，不是轮询周期。
+        assert_ne!(
+            idle_wait_for(Duration::from_secs(1)),
+            policy().command_timeout
+        );
+    }
+
+    #[test]
+    fn idle_wait_stays_within_the_idle_config_bounds() {
+        assert_eq!(idle_wait_for(Duration::ZERO), IdleConfig::MIN_IDLE_TIMEOUT);
+        assert_eq!(
+            idle_wait_for(Duration::from_secs(86_400)),
+            IdleConfig::MAX_IDLE_TIMEOUT
+        );
     }
 
     #[test]
