@@ -580,21 +580,40 @@ pub struct MessageBody {
 }
 
 /// An attachment descriptor.
+///
+/// 对应 `attachment` 表的一行，**只描述元数据与「本地文件在哪」**，
+/// 从不携带字节：附件走文件系统，既不进 SQLite 的大列，也不进 IPC。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Attachment {
     pub id: String,
     pub message_id: String,
+    /// 未经编码的可见文件名（解析侧已解开 RFC 2231 / RFC 2047）。
     pub filename: Option<String>,
     pub mime: Option<String>,
+    /// **解码后**的字节数（落盘大小），不是 base64 的线上长度。
+    ///
+    /// 下载前是解析出来的长度；下载后是实际落盘的字节数。
     pub size: Option<i64>,
-    /// `Content-ID` for inline parts.
+    /// `Content-ID` for inline parts（去掉尖括号，大小写保持原样）。
     pub content_id: Option<String>,
     pub inline: bool,
     /// Path of the downloaded blob, `None` while not yet fetched.
     pub local_path: Option<String>,
     pub sha256: Option<String>,
     pub fetched: bool,
+    /// MIME 部件路径（IMAP 风格，如 `1.2`），本封邮件内唯一且稳定。
+    ///
+    /// **下载时按它去服务器取那一段**，也是「正文里的 `cid:` 对上哪个部件」的依据。
+    /// 老数据可能没有（`None`）——那样的行无法按需下载。
+    pub part_key: Option<String>,
+    /// 落盘完成的时刻（epoch 毫秒）；未下载为 `None`（ROADMAP「离线缓存状态」）。
+    pub downloaded_at_ms: Option<i64>,
+    /// 这个部件的 `Content-Transfer-Encoding`（小写，如 `base64`）。
+    ///
+    /// 下载时按它解码——**不能猜**：一段纯 ASCII 的文本附件按 base64 解会解成垃圾。
+    /// 解析时会填上；老数据可能是 `None`（按 8bit 原样处理）。
+    pub transfer_encoding: Option<String>,
 }
 
 /// 发信队列条目的状态。

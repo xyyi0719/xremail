@@ -22,7 +22,9 @@ use tauri::webview::InvokeRequest;
 use xremail_core::AppError;
 use xremail_core::model::{Account, Folder, Message, MessageFlags};
 use xremail_shell_lib::cmd;
-use xremail_shell_lib::service::{AccountService, ComposeService, MessageService, SyncService};
+use xremail_shell_lib::service::{
+    AccountService, AttachmentService, ComposeService, MessageService, SyncService,
+};
 use xremail_shell_lib::state::{AppState, Credentials, Services};
 use xremail_sync::{AccountConnector, ConnectFuture, NoopSink, RetryPolicy, Scheduler};
 
@@ -59,6 +61,11 @@ fn app() -> (tauri::App<MockRuntime>, tauri::WebviewWindow<MockRuntime>) {
             messages: MessageService::new(pool.clone()),
             sync: SyncService::new(pool.clone()),
             compose: ComposeService::new(pool.clone(), AccountService::new(pool.clone())),
+            attachments: AttachmentService::new(
+                pool.clone(),
+                MessageService::new(pool.clone()),
+                std::path::PathBuf::from("/tmp/xremail-test"),
+            ),
         },
         Scheduler::with_options(
             pool.clone(),

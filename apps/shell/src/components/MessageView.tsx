@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import AttachmentPanel from "./AttachmentPanel";
 import type { Message, MessageBody } from "../types";
 import { isUnread } from "../types";
 
@@ -11,6 +12,13 @@ interface Props {
   /** 切换已读 / 未读。 */
   onToggleSeen: (message: Message) => void | Promise<void>;
   onError: (message: string) => void;
+  /**
+   * 附件列表拉不出来时的回调，和 `onError` **分开**。
+   *
+   * `onError`（App 的 `handleError`）除了记错误还会清掉当前选中的邮件；
+   * 附件拉不出来不该让整封信消失，所以这里给一条独立的通道。
+   */
+  onAttachmentError: (message: string) => void;
 }
 
 /**
@@ -45,6 +53,7 @@ function MessageView({
   message,
   onToggleSeen,
   onError,
+  onAttachmentError,
 }: Props) {
   const [body, setBody] = useState<MessageBody | null>(null);
   const [loading, setLoading] = useState(false);
@@ -143,6 +152,18 @@ function MessageView({
       {!loading && !html && !plain && (
         <p className="panel-empty">这封邮件没有正文。</p>
       )}
+
+      {/*
+        附件在正文**下面**：先读信再看附件，和所有邮件客户端一样。
+        正文还在取的时候先不问附件（省一次往返）。
+      */}
+      <AttachmentPanel
+        accountId={accountId}
+        folderId={folderId}
+        message={message}
+        ready={!loading}
+        onError={onAttachmentError}
+      />
     </section>
   );
 }

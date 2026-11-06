@@ -7,6 +7,7 @@
 //! * 不在这里做业务规则；业务规则属于服务层。
 
 pub mod account;
+pub mod attachment;
 pub mod dkim;
 pub mod folder;
 pub mod message;

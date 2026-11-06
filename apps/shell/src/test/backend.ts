@@ -1,7 +1,11 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { vi } from "vitest";
+import { formatBytes } from "../attachmentLimits";
+import type { AttachmentLimits } from "../attachmentLimits";
 import { FLAG_FLAGGED, FLAG_SEEN } from "../types";
 import type {
+  Attachment,
+  AttachmentDownload,
   Account,
   DkimConfig,
   DraftDetail,
@@ -84,6 +88,21 @@ export interface BackendOptions {
   dkimError?: Error | null;
   /** set_dkim_config 抛这个错。 */
   dkimSaveError?: Error | null;
+  /**
+   * `list_attachments` 返回的附件（按 messageId 存）。
+   *
+   * 未登记的邮件返回空列表——「没有附件」是最常见的真实情况。
+   */
+  attachments?: Record<string, Attachment[]>;
+  /** `download_attachment` 抛这个错（测「下载失败」）。 */
+  downloadError?: Error | null;
+  /**
+   * `attachment_limits` 命令下发的上限。
+   *
+   * 默认 `DEFAULT_ATTACHMENT_LIMITS`（与 `xremail-core` 的常量同值）。
+   * 用例传一组**明显不同**的数字，就能证明界面阈值来自后端而不是写死。
+   */
+  attachmentLimits?: AttachmentLimits;
 }
 
 export interface Backend {
@@ -128,6 +147,12 @@ export interface Backend {
   dkimSaveError: Error | null;
   /** 每个账户的 DKIM 配置（**不含私钥**，像真的 `account_dkim` 表）。 */
   dkimConfigs: Map<string, DkimConfig>;
+  /** `list_attachments` 返回的附件（按 messageId 存）。 */
+  attachments: Record<string, Attachment[]>;
+  /** `download_attachment` 抛这个错。 */
+  downloadError: Error | null;
+  /** `attachment_limits` 命令下发的上限。 */
+  attachmentLimits: AttachmentLimits;
   /** 所有 invoke 调用（含参数），按顺序。 */
   calls: InvokeCall[];
   /** 装给 `invoke` 的实现。 */
@@ -145,12 +170,22 @@ export interface SentEntry {
   state: SendResult["state"];
 }
 
-/** 单个附件上限（10 MiB）。 */
-const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
-/** 一封信的附件个数上限。 */
-const MAX_ATTACHMENTS = 5;
-/** 一封信的附件总大小上限（20 MiB）。 */
-const MAX_TOTAL_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+/**
+ * 假后端默认下发的附件上限。
+ *
+ * 真后端是从 `xremail-core::attachment` 的三个常量转发的；
+ * 假后端照抄一组**同样**的数字（10 MiB / 5 个 / 18 MiB）。
+ *
+ * 注意：UI 的校验**不读这里的常量**，它读 `attachment_limits` 命令的返回值。
+ * 所以用例可以用 `BackendOptions.attachmentLimits` 把它改成别的数字，
+ * 而 UI 的阈值会跟着变——这正是「前端没有自己写死数字」的证据。
+ */
+const DEFAULT_ATTACHMENT_LIMITS = {
+  maxAttachmentBytes: 10 * 1024 * 1024,
+  maxAttachmentsPerMessage: 5,
+  maxTotalAttachmentBytes: 18 * 1024 * 1024,
+};
+
 /** 没登记大小的附件，假后端统一报这个大小。 */
 const DEFAULT_STUB_ATTACHMENT_SIZE = 2048;
 
@@ -224,6 +259,9 @@ export function createBackend(options: BackendOptions = {}): Backend {
       charset: null,
     },
     calls: [],
+    attachments: { ...(options.attachments ?? {}) },
+    downloadError: options.downloadError ?? null,
+    attachmentLimits: { ...(options.attachmentLimits ?? DEFAULT_ATTACHMENT_LIMITS) },
     impl: async () => undefined,
     callsTo(cmd: string): InvokeCall[] {
       return backend.calls.filter((call) => call.cmd === cmd);
@@ -347,6 +385,82 @@ export function createBackend(options: BackendOptions = {}): Backend {
       return removed;
     },
     open_message: () => backend.messageBody,
+
+    // ---------------- 附件上限 ----------------
+    // 真后端从 `xremail-core::attachment` 的常量转发；这里返回假后端自己那一组。
+    attachment_limits: () => ({ ...backend.attachmentLimits }),
+
+    // ---------------- 附件（读信侧） ----------------
+    //
+    // 真后端只回元数据，字节留在磁盘上；这里也一样，
+    // 假后端连「字节」这个概念都没有——前端拿不到附件内容。
+
+    list_attachments: (args) => {
+      const messageId = String(args.messageId ?? "");
+      return (backend.attachments[messageId] ?? []).map((one) => ({ ...one }));
+    },
+    download_attachment: (args) => {
+      if (backend.downloadError) {
+        throw backend.downloadError;
+      }
+      const messageId = String(args.messageId ?? "");
+      const attachmentId = String(args.attachmentId ?? "");
+      const attachment = (backend.attachments[messageId] ?? []).find(
+        (one) => one.id === attachmentId,
+      );
+      if (!attachment) {
+        throw new Error("这个附件不存在");
+      }
+      const download: AttachmentDownload = {
+        attachmentId: attachment.id,
+        // 路径形状与真后端一致（内容寻址的文件名只是占位）。
+        path: `C:/tmp/xremail/attachments/${messageId}/${attachmentId}.bin`,
+        name: attachment.filename,
+        size: attachment.size,
+        sha256: "0".repeat(64),
+        // 已经下载过的走缓存分支，不再「取网络」。
+        cached: attachment.downloaded,
+      };
+      // 真后端会把库里的行标成已下载；这里同步一下，
+      // 免得前端刷新列表后看到「又变成没下载」。
+      backend.attachments[messageId] = (
+        backend.attachments[messageId] ?? []
+      ).map((one) =>
+        one.id === attachmentId
+          ? {
+              ...one,
+              downloaded: true,
+              downloadedAtMs: one.downloadedAtMs ?? Date.now(),
+              localPath: download.path,
+            }
+          : one,
+      );
+      return download;
+    },
+    open_attachment: (args) => {
+      const messageId = String(args.messageId ?? "");
+      const attachmentId = String(args.attachmentId ?? "");
+      const attachment = (backend.attachments[messageId] ?? []).find(
+        (one) => one.id === attachmentId,
+      );
+      if (!attachment?.localPath) {
+        throw new Error("附件还没有下载到本地");
+      }
+      // 真后端交给系统：`open_path` 打开默认程序。
+      void attachment.localPath;
+      return null;
+    },
+    save_attachment_as: (args) => {
+      const messageId = String(args.messageId ?? "");
+      const attachmentId = String(args.attachmentId ?? "");
+      const attachment = (backend.attachments[messageId] ?? []).find(
+        (one) => one.id === attachmentId,
+      );
+      if (!attachment?.localPath) {
+        throw new Error("附件还没有下载到本地");
+      }
+      return String(args.targetPath ?? "");
+    },
     create_account: () => ({}),
 
     // ---------------- 写信（草稿 / 发送） ----------------
@@ -367,16 +481,24 @@ export function createBackend(options: BackendOptions = {}): Backend {
             : (backend.fileSizes[one.path] ?? DEFAULT_STUB_ATTACHMENT_SIZE),
         mime: one.mime !== "" ? one.mime : guessMime(one.path),
       }));
-      // 上限以后端为准（前端只是提前拦一道）。
-      if (attachments.length > MAX_ATTACHMENTS) {
-        throw new Error(`附件数量超过上限（最多 ${MAX_ATTACHMENTS} 个）`);
+      // 上限以后端为准（前端只是提前拦一道）。这里用的是假后端**自己下发**的
+      // 那一组数字，和真后端「常量 → 命令 → 校验」是同一条路。
+      const limits = backend.attachmentLimits;
+      if (attachments.length > limits.maxAttachmentsPerMessage) {
+        throw new Error(
+          `附件数量超过上限（最多 ${limits.maxAttachmentsPerMessage} 个）`,
+        );
       }
-      if (attachments.some((one) => one.size > MAX_ATTACHMENT_BYTES)) {
-        throw new Error("单个附件超过上限（10 MiB）");
+      if (attachments.some((one) => one.size > limits.maxAttachmentBytes)) {
+        throw new Error(
+          `单个附件超过上限（${formatBytes(limits.maxAttachmentBytes)}）`,
+        );
       }
       const total = attachments.reduce((sum, one) => sum + one.size, 0);
-      if (total > MAX_TOTAL_ATTACHMENT_BYTES) {
-        throw new Error("附件总大小超过上限（20 MiB）");
+      if (total > limits.maxTotalAttachmentBytes) {
+        throw new Error(
+          `附件总大小超过上限（${formatBytes(limits.maxTotalAttachmentBytes)}）`,
+        );
       }
       const dto: DraftDto = {
         id,
@@ -501,8 +623,12 @@ export function createBackend(options: BackendOptions = {}): Backend {
     if (!handler) {
       throw new Error(`测试里没有为命令「${cmd}」准备 mock`);
     }
-    return handler(call.args);
+    const result = handler(call.args);
+    if (cmd === "download_attachment") {
+    }
+    return result;
   };
 
   return backend;
 }
+

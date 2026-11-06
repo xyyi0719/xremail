@@ -11,7 +11,9 @@ use sqlx::SqlitePool;
 use xremail_api::SecretValue;
 use xremail_sync::Scheduler;
 
-use crate::service::{AccountService, ComposeService, MessageService, SyncService};
+use crate::service::{
+    AccountService, AttachmentService, ComposeService, MessageService, SyncService,
+};
 
 /// 本次会话的账户凭据（**只在内存里**，不落盘）。
 ///
@@ -63,6 +65,8 @@ pub struct Services {
     pub sync: SyncService,
     /// 发信服务。
     pub compose: ComposeService,
+    /// 附件下载服务（把附件流式落到 `<data_dir>/attachments/…`）。
+    pub attachments: AttachmentService,
 }
 
 /// 应用共享状态。
@@ -77,6 +81,8 @@ pub struct AppState {
     pub sync: SyncService,
     /// 发信服务（写信 → 草稿 → 提交给服务器）。
     pub compose: ComposeService,
+    /// 附件下载服务。
+    pub attachments: AttachmentService,
     /// 后台同步调度器：一个账户一个 actor。
     ///
     /// 它是**唯一的长期同步循环**。Command 里那种「点一下同步一次」
@@ -105,6 +111,7 @@ impl AppState {
             messages: services.messages,
             sync: services.sync,
             compose: services.compose,
+            attachments: services.attachments,
             scheduler,
             pool,
             credentials,

@@ -16,17 +16,32 @@ import { setInvokeImpl } from "./tauriState";
 export const ACCOUNT_EMAIL = "me@example.com";
 
 /**
- * 把 pending 的 promise 链跑完，并让 React 把结果刷到界面上。
+ * 让出一个宏任务，把 pending 的 promise 链跑完。
+ *
+ * 平时用不上（`settle` 已经够了）；只有确实需要 `setTimeout` 跑过之后
+ * 再收尾时，才**先在 act 外面**调它，再进 `settle`——顺序不能反。
  *
  * 用一个 `setTimeout(0)` 而不是几个 `Promise.resolve()`：
  * 微任务队列里可能还排着好几层 `.then()`，宏任务能让它们全部跑完。
  */
-export async function settle(): Promise<void> {
-  await act(async () => {
-    await new Promise((resolve) => {
-      setTimeout(resolve, 0);
-    });
+export async function nextMacrotask(): Promise<void> {
+  await new Promise((resolve) => {
+    setTimeout(resolve, 0);
   });
+}
+
+/**
+ * 把 pending 的 promise 链跑完，并让 React 把结果刷到界面上。
+ *
+ * 只用一个空的 **异步** `act`：`await act(async () => {})` 会自动把当前
+ * 排着的微任务（也就是 `invoke` 返回的 promise 链）跑完，再把结果刷出去。
+ *
+ * 这里**不要**再套 `setTimeout`：宏任务会在 `act` 退出之后才跑，
+ * 那就变成「在 act 之外更新状态」——React 19 的 act 环境一旦被
+ * 这样破坏，后面所有更新都会被悄悄丢掉（组件看着像「点了没反应」）。
+ */
+export async function settle(): Promise<void> {
+  await act(async () => {});
 }
 
 export interface AppHarness {
@@ -34,6 +49,14 @@ export interface AppHarness {
   user: ReturnType<typeof userEvent.setup>;
   /** 选中账户 → 选中文件夹；返回时邮件列表已经加载完。 */
   openFolder(name?: string): Promise<void>;
+  /**
+   * 点一下，并把随之而来的异步更新等到落定。
+   *
+   * `user.click` 自己会把指针那几拍跑完，但它**不会**等 `onClick` 之后
+   * 排进队列的 `.then()`（比如下载完的 `setState`）。少这一下的话，
+   * 界面看起来「点了没反应」，其实只是还没刷出来。
+   */
+  click(target: Element): Promise<void>;
 }
 
 /**
@@ -52,5 +75,11 @@ export async function renderApp(backend: Backend): Promise<AppHarness> {
     await settle();
   };
 
-  return { backend, user, openFolder };
+  const click = async (target: Element): Promise<void> => {
+    // 点一下，再把 user-event / React 排下的那几拍推完。
+    await user.click(target);
+    await settle();
+  };
+
+  return { backend, user, openFolder, click };
 }

@@ -507,6 +507,77 @@ body {
   overflow-x: auto;
 }
 
+/* ------------------------------------------------------------ 附件（读信侧） */
+/*
+ * 附件在正文下面。名字可能很长（中文文件名尤其），
+ * `overflow-wrap: anywhere` 让它断行而不是把面板撑宽。
+ */
+.message-attachments {
+  margin-top: 1rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid color-mix(in srgb, currentColor 12%, transparent);
+}
+
+.message-attachments-title {
+  margin: 0 0 0.5rem;
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.message-attachment-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.message-attachment {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 0.75rem;
+  padding: 0.5rem 0.6rem;
+  border-radius: 0.5rem;
+  background: color-mix(in srgb, currentColor 5%, transparent);
+}
+
+.message-attachment-name {
+  flex: 1 1 12rem;
+  overflow-wrap: anywhere;
+  font-size: 0.9rem;
+}
+
+.message-attachment-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.message-attachment-actions .message-flag-button:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/* 「已保存到 …」：路径本身是可点的按钮（交给文件管理器）。 */
+.message-attachment-saved {
+  margin: 0.75rem 0 0;
+  font-size: 0.875rem;
+}
+
+.message-attachment-link {
+  padding: 0;
+  font: inherit;
+  color: var(--accent, currentColor);
+  text-decoration: underline;
+  background: none;
+  border: none;
+  cursor: pointer;
+  overflow-wrap: anywhere;
+  text-align: left;
+}
+
 .account-actions {
   display: flex;
   gap: 8px;

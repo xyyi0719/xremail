@@ -173,10 +173,30 @@ pub struct MessageBodyView {
 impl MessageBodyView {
     /// 从领域对象构造（顺带消毒 HTML）。
     pub fn from_domain(body: MessageBody) -> Self {
+        Self::from_domain_with_images(body, &[])
+    }
+
+    /// 从领域对象构造，并把 `cid:` 内联图片换成 `data:`。
+    ///
+    /// `images` 是**已经读进内存**的内联图片（见
+    /// [`xremail_core::inline_image`]）。处理顺序是刻意的：
+    /// 1. 先把能对上的 `<img src="cid:…">` 换成 `data:`，并用
+    ///    [`xremail_core::inline_image::SAFE_IMAGE_OPEN`] 之类的一次性控制字符
+    ///    把这段**圈起来**；
+    /// 2. 圈外的一切照旧过消毒器（远程图片、脚本、样式都照删）；
+    /// 3. 圈内的片段是**我们自己拼的**（只有 `src="data:image/…"` 与转义过的 `alt`），
+    ///    直接把圈去掉。
+    ///
+    /// 这样即使消毒器的行为再变，也不会出现「没经过消毒的原文混进输出」：
+    /// 圈内只可能是本函数自己写出去的字节。
+    pub fn from_domain_with_images(
+        body: MessageBody,
+        images: &[xremail_core::inline_image::InlineImage],
+    ) -> Self {
         let html_safe = body
             .html_raw
             .as_deref()
-            .map(xremail_core::html::sanitize_html)
+            .map(|html| sanitize_with_inline_images(html, images))
             .filter(|html| !html.is_empty());
         MessageBodyView {
             message_id: body.message_id,
@@ -185,6 +205,39 @@ impl MessageBodyView {
             charset: body.charset,
         }
     }
+}
+
+/// 消毒 HTML，但保留**本机已下载**的内联图片。
+///
+/// 没有内联图片时与 [`xremail_core::html::sanitize_html`] 完全等价。
+pub fn sanitize_with_inline_images(
+    html: &str,
+    images: &[xremail_core::inline_image::InlineImage],
+) -> String {
+    use xremail_core::inline_image::{SAFE_IMAGE_CLOSE, SAFE_IMAGE_OPEN, rewrite_inline_images};
+
+    if images.is_empty() {
+        return xremail_core::html::sanitize_html(html);
+    }
+
+    let rewritten = rewrite_inline_images(html, images);
+    let mut out = String::with_capacity(rewritten.html.len());
+    let mut rest = rewritten.html.as_str();
+
+    while let Some(start) = rest.find(SAFE_IMAGE_OPEN) {
+        out.push_str(&xremail_core::html::sanitize_html(&rest[..start]));
+        let after_open = &rest[start + SAFE_IMAGE_OPEN.len()..];
+        let Some(end) = after_open.find(SAFE_IMAGE_CLOSE) else {
+            // 理论上不会发生（改写与扫描是同一个函数），兜底：剩下的全交给消毒器。
+            rest = after_open;
+            break;
+        };
+        out.push_str(&after_open[..end]);
+        rest = &after_open[end + SAFE_IMAGE_CLOSE.len()..];
+    }
+    out.push_str(&xremail_core::html::sanitize_html(rest));
+
+    out
 }
 
 #[derive(Debug, Clone)]
@@ -196,6 +249,14 @@ impl MessageService {
     /// 用连接池构造。
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    /// 列出某封邮件的附件（只含元数据，**不含字节**）。
+    pub async fn list_attachments(
+        &self,
+        message_id: &str,
+    ) -> AppResult<Vec<xremail_core::model::Attachment>> {
+        xremail_store::dao::attachment::list_attachments(&self.pool, message_id).await
     }
 
     /// 列出某账户的全部文件夹（**显示名已解码**）。

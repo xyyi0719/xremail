@@ -52,7 +52,7 @@ pub use actor::{
     AccountConnector, AccountEvent, Clock, ConnectFuture, EventSink, NoopSink, RetryPolicy,
     Scheduler, WakeReason, system_clock,
 };
-pub use body::{fetch_body, read_body};
+pub use body::{fetch_attachment_part, fetch_body, read_body};
 pub use boot::boot_id;
 pub use diff::{UidDiff, UidSet, diff_uids};
 pub use epoch::{EpochTransition, PendingOperationBinding, StoredEpoch, plan_epoch_transition};

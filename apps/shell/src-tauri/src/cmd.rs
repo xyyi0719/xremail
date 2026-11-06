@@ -14,6 +14,7 @@ use xremail_core::AppEvent;
 use xremail_core::model::{Account, MailOperation, Message, OperationState, SyncState};
 use xremail_store::dao::operation as operation_dao;
 
+use crate::service::AttachmentDownload;
 use crate::service::compose::{DraftDetail, DraftDto, DraftInput, SendResult};
 use crate::service::credential::CredentialService;
 use crate::service::current_time_ms;
@@ -44,6 +45,36 @@ pub fn app_info(state: State<'_, AppState>) -> AppInfo {
         version: env!("CARGO_PKG_VERSION"),
         platform: std::env::consts::OS,
         data_dir: Some(state.data_dir.display().to_string()),
+    }
+}
+
+/// 写信侧的附件上限，供前端校验时**直接取用**而不是自己抄一遍。
+///
+/// 三个数字都从 `xremail_core::attachment` 读：那份常量是唯一事实来源
+/// （发信校验在 `service::compose`，收信侧的落盘上限也在用它）。
+/// 前端如果把数字写死，就会出现「前端放行 20 MiB、后端只收 18 MiB、
+/// 用户点发送才被拒」这类事故——所以这里**不重写数字，只转发**。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentLimits {
+    /// 单个附件的字节上限。
+    pub max_attachment_bytes: u64,
+    /// 一封信的附件个数上限。
+    pub max_attachments_per_message: usize,
+    /// 一封信的附件总字节上限（18 MiB——不是直觉上的 20 MiB，见常量注释）。
+    pub max_total_attachment_bytes: u64,
+}
+
+/// 返回附件上限（发明细用，不需要任何状态）。
+#[tauri::command]
+pub fn attachment_limits() -> AttachmentLimits {
+    use xremail_core::attachment::{
+        MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS_PER_MESSAGE, MAX_TOTAL_ATTACHMENT_BYTES,
+    };
+    AttachmentLimits {
+        max_attachment_bytes: MAX_ATTACHMENT_BYTES,
+        max_attachments_per_message: MAX_ATTACHMENTS_PER_MESSAGE,
+        max_total_attachment_bytes: MAX_TOTAL_ATTACHMENT_BYTES,
     }
 }
 
@@ -252,13 +283,18 @@ pub async fn open_message(
     };
 
     // 本地有正文 → 直接返回（**HTML 已消毒**）。
+    //
+    // 已下载的内联图片在这里换成 `data:`（`cid:` 之外的外链照样被删）。
     if let Some(body) = state
         .messages
         .get_body(&account_id, &folder_id, uid)
         .await
         .map_err(|e| user_error(&e))?
     {
-        return Ok(Some(MessageBodyView::from_domain(body)));
+        let images = state.attachments.inline_images(&body.message_id).await;
+        return Ok(Some(MessageBodyView::from_domain_with_images(
+            body, &images,
+        )));
     }
 
     // 有邮件但没正文 → **按需**去服务器拉。需要凭据与连接。
@@ -321,6 +357,180 @@ pub async fn open_message(
         .get_body_view(&account_id, &folder_id, uid)
         .await
         .map_err(|e| user_error(&e))
+}
+
+// ---------------------------------------------------------------------------
+// 附件（B2）
+//
+// 三个命令都在**本文件末尾**：附件是后加的一块，独立成段便于与其它改动合并。
+// 共同约定：
+// * **字节不走 IPC**——下载返回的是本地路径，打开/另存交由系统；
+// * 参数里的 `messageId` 由前端从列表里拿，服务器定位仍用 `(accountId, folderId, uid)`；
+// * 所有路径都由后端算（库里记的 + 附件目录），前端传不进来任何路径。
+// ---------------------------------------------------------------------------
+
+/// 列出某封邮件的附件（只含元数据，不含字节）。
+#[tauri::command]
+pub async fn list_attachments(
+    state: State<'_, AppState>,
+    message_id: String,
+) -> Result<Vec<AttachmentDto>, String> {
+    let attachments = state
+        .attachments
+        .list(&message_id)
+        .await
+        .map_err(|e| user_error(&e))?;
+    Ok(attachments.iter().map(AttachmentDto::from_domain).collect())
+}
+
+/// 下载一个附件到本地文件。
+///
+/// 已经把文件下到本地时**直接返回**（`cached = true`），不重连服务器。
+#[tauri::command]
+pub async fn download_attachment(
+    state: State<'_, AppState>,
+    account_id: String,
+    folder_id: String,
+    uid: i64,
+    attachment_id: String,
+) -> Result<AttachmentDownload, String> {
+    let message = state
+        .messages
+        .get_message(&account_id, &folder_id, uid)
+        .await
+        .map_err(|e| user_error(&e))?
+        .ok_or_else(|| "本地没有这封邮件，请先同步".to_string())?;
+
+    let folder = state
+        .messages
+        .list_folders(&account_id)
+        .await
+        .map_err(|e| user_error(&e))?
+        .into_iter()
+        .find(|folder| folder.id == folder_id)
+        .ok_or_else(|| "文件夹不存在".to_string())?;
+
+    // 已有文件 → 不需要连网，也不需要凭据。
+    let attachment = state
+        .attachments
+        .get_meta(&message.id, &attachment_id)
+        .await
+        .map_err(|e| user_error(&e))?;
+    if let Some(done) = state.attachments.existing(&attachment) {
+        return Ok(done);
+    }
+
+    let account = state
+        .accounts
+        .get(&account_id)
+        .await
+        .map_err(|e| user_error(&e))?
+        .ok_or_else(|| format!("账户 {account_id} 不存在"))?;
+    let Some(credential) = resolve_credential(&state, &account).await? else {
+        return Err("这个账户还没保存授权码，请先同步一次".to_string());
+    };
+    let mut session = state
+        .sync
+        .connect(&account, &credential)
+        .await
+        .map_err(|e| user_error(&e))?;
+
+    let remote_name = folder.raw_name.clone();
+    let download = state
+        .attachments
+        .download_with(
+            &message,
+            &attachment_id,
+            &remote_name,
+            |_, remote, uid, part| {
+                let remote = remote.clone();
+                async move {
+                    xremail_sync::fetch_attachment_part(&mut session, &remote, uid, &part).await
+                }
+            },
+        )
+        .await
+        .map_err(|e| user_error(&e))?;
+
+    Ok(download)
+}
+
+/// 用系统默认程序打开一个**已经下载好**的附件。
+///
+/// 没下载过就报错——不在「打开」里偷偷触发一次网络下载。
+#[tauri::command]
+pub async fn open_attachment(
+    state: State<'_, AppState>,
+    message_id: String,
+    attachment_id: String,
+) -> Result<(), String> {
+    let path = state
+        .attachments
+        .local_path(&message_id, &attachment_id)
+        .await
+        .map_err(|e| user_error(&e))?;
+    // 交路径给系统；字节不经过前端。
+    tauri_plugin_opener::open_path(path, None::<&str>).map_err(|e| format!("打不开文件: {e}"))
+}
+
+/// 把已下载的附件**另存为**（系统「保存」对话框由前端弹，路径作为**入参之外的返回值**）。
+#[tauri::command]
+pub async fn save_attachment_as(
+    state: State<'_, AppState>,
+    message_id: String,
+    attachment_id: String,
+    target_path: String,
+) -> Result<String, String> {
+    let source = state
+        .attachments
+        .local_path(&message_id, &attachment_id)
+        .await
+        .map_err(|e| user_error(&e))?;
+    let target = std::path::PathBuf::from(&target_path);
+    if target.is_dir() {
+        return Err("目标是一个目录".to_string());
+    }
+    std::fs::copy(&source, &target).map_err(|e| format!("另存为失败: {e}"))?;
+    Ok(target.to_string_lossy().to_string())
+}
+
+/// 前端看到的附件（camelCase，**没有字节**）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachmentDto {
+    /// 附件 id（本封邮件内唯一）。
+    pub id: String,
+    /// 文件名（已解开 RFC 2231 / RFC 2047）。
+    pub filename: Option<String>,
+    pub content_type: Option<String>,
+    /// 解码后字节数（下载后是落盘字节数）。
+    pub size: Option<i64>,
+    /// 内联部件的内容地址（去尖括号），非内联为 `null`。
+    pub content_id: Option<String>,
+    /// 正文里的内联图（可能已经在正文里渲染出来了）。
+    pub is_inline: bool,
+    /// 是否已经落到本地。
+    pub downloaded: bool,
+    /// 落盘时刻（epoch 毫秒）。
+    pub downloaded_at_ms: Option<i64>,
+    /// 本地路径（仅已下载时有；前端只用来显示「在哪里」）。
+    pub local_path: Option<String>,
+}
+
+impl AttachmentDto {
+    fn from_domain(attachment: &xremail_core::model::Attachment) -> Self {
+        Self {
+            id: attachment.id.clone(),
+            filename: attachment.filename.clone(),
+            content_type: attachment.mime.clone(),
+            size: attachment.size,
+            content_id: attachment.content_id.clone(),
+            is_inline: attachment.inline,
+            downloaded: attachment.fetched,
+            downloaded_at_ms: attachment.downloaded_at_ms,
+            local_path: attachment.local_path.clone(),
+        }
+    }
 }
 
 /// 把某个账户的授权码保存到**平台钥匙串**。

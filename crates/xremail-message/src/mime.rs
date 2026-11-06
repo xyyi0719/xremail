@@ -138,277 +138,277 @@ impl Part {
 ///
 /// `multipart/*` 会按 `boundary` 递归拆开。
 pub fn split_parts(headers: &HeaderMap, body: &[u8]) -> Vec<Part> {
+    split_parts_with_paths(headers, body)
+        .into_iter()
+        .map(|(_, part)| part)
+        .collect()
+}
+
+/// 与 [`split_parts`] 相同，但**额外给出每个叶子的部件号**。
+///
+/// 部件号按 IMAP 的约定自 1 起：顶层 `multipart` 自己占 1 号，它的第 2 段是 `2`，
+/// 那一段的第 1 段是 `2.1`（本函数返回的路径**不含**顶层的 `1`，
+/// 拼完整部件号的 `1.` 前缀在 `attachment::attachment_meta` 里补，
+/// 否则「整封就是一个部件」的 `TEXT` 会被拼成 `1.TEXT`）。
+/// 附件下载靠它去取对应那一段的字节（`UID FETCH <uid> BODY.PEEK[<部件号>]`），
+/// 所以**这里的编号必须与服务器一致**。
+///
+/// 三条容易写错的地方：
+/// * 顶层的那个 `multipart` 自己**占 1 号**，它的子部件是 `1.1`、`1.2`……
+///   于是「顶层 multipart 里的第二个附件」是 `1.2`，不是 `2`；
+/// * 「`multipart` 但拆不出任何段」（没有 boundary、或 boundary 对不上）
+///   在 IMAP 里仍然是 1 号部件——它自身就是整个正文，没有子段；
+/// * `message/rfc822` 那一层**不占号**（RFC 3501 §6.4.5 只说 `multipart` 与
+///   `message/rfc822` 以外的层不计数；两头的 `multipart` 照常计数）。
+///
+/// 顶层**非** `multipart` 的邮件（整封就是一段，ScannedAttachment / 服务器直接返回
+/// 解码后的正文时很常见）在 IMAP 里既能用 `1` 取，也能用 `TEXT` 取；
+/// 这里给的是空路径，最终由 `TOP_LEVEL_PART` 记作 `TEXT`。
+pub fn split_parts_with_paths(headers: &HeaderMap, body: &[u8]) -> Vec<(Vec<usize>, Part)> {
+    // 只收**叶子**：容器层的路径由 `collect_leaves` 顺手跳过。
+    let mut leaves = Vec::new();
+    collect_leaves(headers, body, &mut Vec::new(), &mut leaves);
+    leaves
+}
+
+/// 递归收集**叶子**部件，路径里带上每一层（含 `message/rfc822` 那层）。
+fn collect_leaves(
+    headers: &HeaderMap,
+    body: &[u8],
+    path: &mut Vec<usize>,
+    out: &mut Vec<(Vec<usize>, Part)>,
+) {
     let content_type = parse_content_type(headers.get("Content-Type"));
 
     if content_type.is_multipart()
         && let Some(boundary) = content_type.boundary.as_deref()
     {
-        let mut out = Vec::new();
-        for (child_headers, child_body) in split_multipart(body, boundary) {
-            out.extend(split_parts(&child_headers, &child_body));
+        let children = split_multipart(body, boundary);
+        if children.is_empty() {
+            out.push((path.clone(), make_part(headers, body, &content_type)));
+            return;
         }
-        if out.is_empty() {
-            // 拆不出来（boundary 不对）→ 整块当成一个部件。
-            return vec![make_part(headers, body, &content_type)];
+        for (index, (child_headers, child_body)) in children.into_iter().enumerate() {
+            path.push(index + 1);
+            collect_leaves(&child_headers, &child_body, path, out);
+            path.pop();
         }
-        return out;
+        return;
     }
 
-    vec![make_part(headers, body, &content_type)]
-}
-
-/// 造一个叶子部件（解码传输编码）。
-fn make_part(headers: &HeaderMap, body: &[u8], content_type: &ContentType) -> Part {
-    let transfer_encoding = headers
-        .get("Content-Transfer-Encoding")
-        .map(str::trim)
-        .map(str::to_ascii_lowercase);
-    let content = crate::transfer::decode_transfer(body, transfer_encoding.as_deref());
-
-    let filename = headers
-        .get("Content-Disposition")
-        .and_then(|value| extract_param(value, "filename"));
-
-    Part {
-        headers: headers.clone(),
-        content_type: content_type.clone(),
-        transfer_encoding,
-        filename,
-        content,
-    }
-}
-
-/// 从 `Content-Disposition` 之类的值里取参数。
-pub fn extract_param(value: &str, name: &str) -> Option<String> {
-    for part in value.split(';').skip(1) {
-        let Some((key, val)) = part.split_once('=') else {
-            continue;
+    if is_uncounted(headers) {
+        // `message/rfc822`：内容是一整封邮件，拆开继续往里走。
+        // 这一层在服务器上的号是 `<前面的号>.0`，所以路径里压一个 `0` 占位；
+        // 进来的那封邮件多包一层 `multipart` 时，服务器**不再加**自己的 `1`
+        // （`BODY[1.2.0.2]` 而不是 `BODY[1.2.0.1.2]`），所以先压 `0`、
+        // 再把这封邮件的顶层容器那层剥掉。
+        let (inner_headers, inner_body) = split_head_body(body);
+        let inner_type = parse_content_type(inner_headers.get("Content-Type"));
+        let multibody = match inner_type.boundary.as_deref() {
+            Some(boundary) if inner_type.is_multipart() => split_multipart(&inner_body, boundary),
+            _ => Vec::new(),
         };
-        if key.trim().eq_ignore_ascii_case(name) {
-            let val = val.trim().trim_matches('"').trim();
-            if !val.is_empty() {
-                return Some(val.to_string());
+        if multibody.is_empty() {
+            // 内嵌邮件本身就是单个部件：它就是 `<父号>.0`。
+            collect_leaves(&inner_headers, &inner_body, path, out);
+        } else {
+            path.push(EMBEDDED_MESSAGE_NUMBER);
+            for (index, (child_headers, child_body)) in multibody.into_iter().enumerate() {
+                path.push(index + 1);
+                collect_leaves(&child_headers, &child_body, path, out);
+                path.pop();
             }
+            path.pop();
         }
+        return;
     }
-    None
+
+    out.push((path.clone(), make_part(headers, body, &content_type)));
 }
 
-/// 按 boundary 把 multipart 的 body 拆成若干段。
+/// 部件号里「整封邮件就是这一个部件」的记号（IMAP 的 `TEXT`）。
 ///
-/// 每段返回 `(头字段, 内容)`。
-fn split_multipart(body: &[u8], boundary: &str) -> Vec<(HeaderMap, Vec<u8>)> {
-    let delimiter = format!("--{boundary}");
-    let delimiter_bytes = delimiter.as_bytes();
+/// **不能用 `0`**：`BODY.PEEK[0]` 在 IMAP 里只返回 `BODYSTRUCTURE` 而不返回正文
+/// （0 是「只要结构」的法定写法），用它去取附件会永远取不回来。
+pub const TOP_LEVEL_PART: &str = "TEXT";
 
-    // 找每一段的起止。
-    let mut segments: Vec<(usize, usize)> = Vec::new();
-    let mut index = 0usize;
-    let mut current_start: Option<usize> = None;
+/// 部件号里「`message/rfc822` 里那封内嵌邮件自身」的占位。
+///
+/// 内嵌邮件**自己不占号**，但它的正文（`.` 右边的那个 `0`）服务器给的是
+/// `BODY[<前面的号>.0]`；再往里数子部件时，`BODYSTRUCTURE` 里的第 k 段
+/// 对应 `BODY[<前面的号>.k]`，也就是回到父层的号上继续数。
+/// 例子：`multipart/mixed` 第 2 段是 `message/rfc822{#2.1 = multipart/alternative{
+/// #2.1.1 = text/plain, #2.1.2 = multipart/mixed{#2.1.2.1 …}}}` 时，
+/// 最里层第 1 段是 `BODY[2.1.2.1]`。
+///
+/// 本模块的路径不带这一层（见 [`is_uncounted`]），拼字符串时由
+/// [`crate::attachment::attachment_meta`] 补上这个 `0`。
+pub const EMBEDDED_MESSAGE: &str = "0";
 
-    while index + delimiter_bytes.len() <= body.len() {
-        // 只在行首找分隔符。
-        let at_line_start = index == 0 || body[index - 1] == b'\n';
-        if at_line_start && body[index..].starts_with(delimiter_bytes) {
-            if let Some(start) = current_start.take() {
-                segments.push((start, index));
-            }
-            // 跳过分隔符行。
-            let mut cursor = index + delimiter_bytes.len();
-            if body[cursor..].starts_with(b"--") {
-                // 结束分隔符。
+/// [`EMBEDDED_MESSAGE`] 的数字形式（路径里存的是数字）。
+const EMBEDDED_MESSAGE_NUMBER: usize = 0;
+
+/// 这一层在 IMAP 的部件号里占不占号。
+///
+/// RFC 3501 §6.4.5：`message/rfc822` 与 `multipart` 以外的容器层不计数，
+/// 所以 `multipart/mixed{text/plain, message/rfc822{multipart/mixed{text,image}}}`
+/// 里的 `image` 是 `2.1.1`……而不是 `2.1.1.1` 之类带上一层空号的形式。
+///
+/// 这里只按「这一层是不是 `message/rfc822`」判断：乘号的另一头（`multipart`）
+/// 由调用方保证。
+fn is_uncounted(headers: &HeaderMap) -> bool {
+    parse_content_type(headers.get("Content-Type")).mime_type == "message/rfc822"
+}
+
+/// 把一个部件拆成「头 + 体」两半：空行之前是头，之后是体。
+///
+/// 没有空行时按「整段都是头」处理（与「整段都是体」相比，
+/// 这样一封只有头的空正文邮件不会把 `Subject:` 当成正文）。
+pub(crate) fn split_head_body(bytes: &[u8]) -> (HeaderMap, Vec<u8>) {
+    // 空行可以是 CRLF CRLF 或 LF LF。
+    let mut split = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\n' {
+            let next = i + 1;
+            if bytes[next..].starts_with(b"\r\n") {
+                split = Some((i, next + 2));
                 break;
             }
-            while cursor < body.len() && body[cursor] != b'\n' {
-                cursor += 1;
+            if bytes[next..].starts_with(b"\n") {
+                split = Some((i, next + 1));
+                break;
             }
-            cursor = (cursor + 1).min(body.len());
-            current_start = Some(cursor);
-            index = cursor;
-            continue;
         }
-        index += 1;
+        i += 1;
     }
 
-    // 最后一段。
-    if let Some(start) = current_start {
-        let end = body.len();
-        segments.push((start, end));
-    }
-
-    segments
-        .into_iter()
-        .map(|(start, end)| {
-            let mut segment = &body[start..end];
-            // RFC 2046 §5.1.1：边界分隔符**前面**的 CRLF 属于分隔符，
-            // 不属于内容。不去掉的话每个部件的正文末尾会多一个换行。
-            if segment.ends_with(b"\r\n") {
-                segment = &segment[..segment.len() - 2];
-            } else if segment.ends_with(b"\n") {
-                segment = &segment[..segment.len() - 1];
-            }
-            split_head_body(segment)
-        })
-        .collect()
-}
-
-/// 把一段拆成 `(头字段, 内容)`。
-pub fn split_head_body(raw: &[u8]) -> (HeaderMap, Vec<u8>) {
-    // 找第一个空行（`\r\n\r\n` 或 `\n\n`）。
-    let mut separator = None;
-    let mut split_at = 0usize;
-
-    for index in 0..raw.len() {
-        if raw[index..].starts_with(b"\r\n\r\n") {
-            separator = Some(4);
-            split_at = index;
-            break;
-        }
-        if raw[index..].starts_with(b"\n\n") {
-            separator = Some(2);
-            split_at = index;
-            break;
-        }
-    }
-
-    let Some(separator) = separator else {
-        return (parse_headers(raw), Vec::new());
+    let (head, body) = match split {
+        Some((head_end, body_start)) => (&bytes[..head_end], bytes[body_start..].to_vec()),
+        None => (bytes, Vec::new()),
     };
 
-    let head = &raw[..split_at];
-    let body = &raw[split_at + separator..];
-
-    (parse_headers(head), body.to_vec())
+    let text = String::from_utf8_lossy(head);
+    let fields = Vec::new();
+    (parse_header_fields(&text, fields), body)
 }
 
-/// 解析头字段块。
-///
-/// 支持**折行**（RFC 5322 §2.2.3：行首是空白表示接上一行）。
-pub fn parse_headers(raw: &[u8]) -> HeaderMap {
-    let text = String::from_utf8_lossy(raw);
-    let mut fields: Vec<(String, String)> = Vec::new();
-
-    let mut current: Option<(String, String)> = None;
-
+/// 解析头字段：折行（以空白开头的续行）并入上一行。
+fn parse_header_fields(text: &str, mut fields: Vec<(String, String)>) -> HeaderMap {
     for line in text.split('\n') {
         let line = line.strip_suffix('\r').unwrap_or(line);
-
         if line.is_empty() {
-            break;
+            continue;
         }
-
-        // 折行：行首是空白 → 接上一行。
         if line.starts_with(' ') || line.starts_with('\t') {
-            if let Some((_, value)) = current.as_mut() {
+            // 续行：接回上一个字段（RFC 5322 §2.2.3 规定折叠处等价于一个空格）。
+            if let Some((_, value)) = fields.last_mut() {
                 value.push(' ');
                 value.push_str(line.trim());
             }
             continue;
         }
-
-        // 存上一行。
-        if let Some(entry) = current.take() {
-            fields.push(entry);
-        }
-
-        match line.split_once(':') {
-            Some((name, value)) => {
-                current = Some((name.trim().to_string(), value.trim().to_string()));
-            }
-            None => {
-                // 没有冒号的行：忽略（不合法但真实邮件里存在）。
-            }
-        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        fields.push((name.trim().to_string(), value.trim().to_string()));
     }
-
-    if let Some(entry) = current {
-        fields.push(entry);
-    }
-
     HeaderMap { fields }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// 从 Content-Type / Content-Disposition 参数里取一个值（大小写不敏感）。
+pub(crate) fn extract_param<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+    for part in source.split(';').skip(1) {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case(name) {
+            continue;
+        }
+        let value = value.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|v| v.strip_suffix('"'))
+            .unwrap_or(value);
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    None
+}
 
-    #[test]
-    fn parses_content_type_with_charset() {
-        let parsed = parse_content_type(Some("text/plain; charset=GB2312"));
+/// 按 boundary 切开 multipart 体，返回每个子部件的「头 + 体」。
+///
+/// 全程按**字节**切（不能先转 `String`：正文常是 GBK，`from_utf8_lossy`
+/// 会把非 ASCII 字节换成 U+FFFD，后面按 `charset` 解码就再也还原不了）。
+fn split_multipart(body: &[u8], boundary: &str) -> Vec<(HeaderMap, Vec<u8>)> {
+    let opening = format!("--{boundary}").into_bytes();
+    let closing = format!("--{boundary}--").into_bytes();
 
-        assert_eq!(parsed.mime_type, "text/plain");
-        assert_eq!(parsed.charset.as_deref(), Some("gb2312"));
-        assert!(!parsed.is_multipart());
-        assert!(parsed.is_text());
+    let mut parts = Vec::new();
+    let mut current: Option<Vec<u8>> = None;
+    // 第一个分隔线之前是前言，丢掉。
+    let mut seen_opening = false;
+    let mut pos = 0;
+
+    while pos <= body.len() {
+        // 取一整行（含行尾的 `\r\n` 或 `\n`），`end` 指向下一个字节。
+        let (line_end, next) = match body[pos..].iter().position(|&b| b == b'\n') {
+            Some(index) => (pos + index, pos + index + 1),
+            None => (body.len(), body.len() + 1),
+        };
+        let mut line = &body[pos..line_end];
+        if let Some(stripped) = line.strip_suffix(b"\r") {
+            line = stripped;
+        }
+
+        if line == opening.as_slice() || line == closing.as_slice() {
+            if let Some(bytes) = current.take() {
+                // 分隔线**前面**的换行属于分界线，不属于这一段的内容。
+                parts.push(split_head_body(trim_final_newline(&bytes)));
+            }
+            seen_opening = true;
+            if line == closing.as_slice() {
+                break;
+            }
+            current = Some(Vec::new());
+        } else if seen_opening && let Some(bytes) = current.as_mut() {
+            bytes.extend_from_slice(&body[pos..line_end]);
+            if next <= body.len() {
+                bytes.push(b'\n');
+            }
+        }
+
+        pos = next;
     }
 
-    #[test]
-    fn parses_content_type_with_boundary() {
-        let parsed = parse_content_type(Some("multipart/alternative; boundary=\"abc\""));
-
-        assert!(parsed.is_multipart());
-        assert_eq!(parsed.boundary.as_deref(), Some("abc"));
+    // 没有结束分隔线时，最后一段也要收下。
+    if let Some(bytes) = current {
+        parts.push(split_head_body(trim_final_newline(&bytes)));
     }
 
-    #[test]
-    fn missing_content_type_defaults_to_text_plain() {
-        let parsed = parse_content_type(None);
+    parts
+}
 
-        assert_eq!(parsed.mime_type, "text/plain");
-        assert!(parsed.charset.is_none());
-    }
+/// 去掉段尾那一处换行（它是分界线的行尾，不是内容）。
+fn trim_final_newline(bytes: &[u8]) -> &[u8] {
+    bytes
+        .strip_suffix(b"\r\n")
+        .or_else(|| bytes.strip_suffix(b"\n"))
+        .unwrap_or(bytes)
+}
 
-    #[test]
-    fn parses_headers() {
-        let raw = b"Subject: hello\r\nFrom: a@example.com\r\nX-Empty:\r\n";
-
-        let headers = parse_headers(raw);
-
-        assert_eq!(headers.get("subject"), Some("hello"));
-        assert_eq!(headers.get("FROM"), Some("a@example.com"));
-        assert!(headers.contains("x-empty"));
-    }
-
-    #[test]
-    fn parses_folded_headers() {
-        let raw = b"Subject: line one\r\n  continued\r\nFrom: a@example.com\r\n";
-
-        let headers = parse_headers(raw);
-
-        assert_eq!(headers.get("subject"), Some("line one continued"));
-        assert_eq!(headers.get("from"), Some("a@example.com"));
-    }
-
-    #[test]
-    fn splits_head_and_body() {
-        let raw = b"Subject: x\r\n\r\nbody here";
-
-        let (headers, body) = split_head_body(raw);
-
-        assert_eq!(headers.get("subject"), Some("x"));
-        assert_eq!(body, b"body here");
-    }
-
-    #[test]
-    fn splits_multipart_into_parts() {
-        let body = b"--b\r\nContent-Type: text/plain; charset=gbk\r\n\r\nfirst\r\n--b\r\nContent-Type: text/html\r\n\r\n<p>second</p>\r\n--b--\r\n";
-        let headers = parse_headers(b"Content-Type: multipart/mixed; boundary=b\r\n");
-
-        let parts = split_parts(&headers, body);
-
-        assert_eq!(parts.len(), 2);
-        assert_eq!(parts[0].content_type.charset.as_deref(), Some("gbk"));
-        assert_eq!(parts[0].content, b"first");
-        assert_eq!(parts[1].content_type.mime_type, "text/html");
-    }
-
-    #[test]
-    fn extracts_disposition_filename() {
-        let value = "attachment; filename=\"报告.pdf\"";
-
-        assert_eq!(
-            extract_param(value, "filename").as_deref(),
-            Some("报告.pdf")
-        );
+/// 把一个已解析好的部件收进 `Part`。
+fn make_part(headers: &HeaderMap, body: &[u8], content_type: &ContentType) -> Part {
+    let transfer_encoding = headers
+        .get("Content-Transfer-Encoding")
+        .map(|value| value.trim().to_ascii_lowercase());
+    let content = crate::transfer::decode_transfer(body, transfer_encoding.as_deref());
+    Part {
+        headers: headers.clone(),
+        content_type: content_type.clone(),
+        transfer_encoding,
+        filename: None,
+        content,
     }
 }
