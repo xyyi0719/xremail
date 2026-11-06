@@ -27,5 +27,7 @@ export default defineConfig({
     // jest-dom 匹配器 + act 环境 + 「console 必须干净」的检查。
     setupFiles: ["./src/test/setup.ts"],
     include: ["src/**/*.test.{ts,tsx}"],
+    // 默认 5s：并行跑时 CPU 被抢，user-event 的逐帧交互会超时，TEST_TIMEOUT_MS 可以按机器调。
+    testTimeout: Number(process.env.TEST_TIMEOUT_MS ?? 15000),
   },
 });

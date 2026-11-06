@@ -16,8 +16,8 @@
 > 2026-10-30 验证（当时的数字）：`cargo fmt` / `cargo clippy -D warnings` / `cargo test`（**687 个 Rust 用例**）/
 > `npm typecheck` / `npm test`（**67 个前端用例**）/ `npm build` / `cargo sqlx prepare --check` 均通过，
 > CI 四个 job 全绿。
-> 2026-11-06 复跑：`cargo test --workspace` **869 passed / 0 failed / 1 ignored**（`--list` 870）、
-> `npm test` **12 个文件 / 69 条**、`npm run test:e2e`（Playwright）**2 个文件 / 5 条**全绿。
+> 2026-11-06 复跑：`cargo test --workspace` **987 passed / 0 failed / 1 ignored**（`--list` 988）、
+> `npm test` **15 个文件 / 95 条**、`npm run test:e2e`（Playwright）**2 个文件 / 5 条**全绿。
 >
 > **已落地**：存储层（`xremail-store`，含 FTS5 全文索引）、密文封装（`xremail-crypto`）、
 > L2 契约（`xremail-api`）、同步引擎（`xremail-sync`）、IMAP / SMTP 协议层
