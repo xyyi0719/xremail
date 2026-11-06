@@ -11,6 +11,7 @@ members = [
     "crates/xremail-protocol-smtp",
     "crates/xremail-testkit",
     "crates/xremail-message",
+    "crates/xremail-dkim",
     "crates/xremail-diagnostics",
     "apps/shell/src-tauri",
 ]
@@ -41,6 +42,7 @@ xremail-sync = { path = "crates/xremail-sync" }
 xremail-protocol-imap = { path = "crates/xremail-protocol-imap" }
 xremail-protocol-smtp = { path = "crates/xremail-protocol-smtp" }
 xremail-message = { path = "crates/xremail-message" }
+xremail-dkim = { path = "crates/xremail-dkim" }
 xremail-testkit = { path = "crates/xremail-testkit" }
 
 anyhow = "1"
@@ -51,6 +53,12 @@ serde_json = "1"
 encoding_rs = "0.8"
 # MIME 的 base64 传输编码。
 base64 = "0.22"
+# RSA / SHA-256 / Ed25519 的原语（DKIM 签名用）。
+# 版本与 rustls 拉进来的同一份：依赖图里只有一个 ring 0.17.14。
+ring = "0.17"
+# 把私钥文本在使用后立刻抹掉（DKIM 私钥只在栈上待一小会儿）。
+zeroize = "1"
+
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "fs"] }
 tracing = "0.1"
 # `FutureExt::catch_unwind`：给后台任务加 panic 边界（R13）。

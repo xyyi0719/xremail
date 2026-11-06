@@ -43,6 +43,7 @@ use xremail_protocol_smtp::{
 use xremail_store::dao::send_queue as send_queue_dao;
 
 use super::account::AccountService;
+use super::dkim::DkimService;
 use super::sent_copy::{SentCopyOutcome, SentCopyService};
 use super::{current_time_ms, new_operation_id};
 
@@ -259,16 +260,20 @@ pub struct ComposeService {
     /// 163 的服务器会自己存副本，QQ 不会——所以这一步是**自适应**的：
     /// 先查「已发送」里有没有这封信，没有才自己补一份（见 [`SentCopyService`]）。
     sent_copy: SentCopyService,
+    /// 发信前的 DKIM 签名（账户配了才动字节）。
+    dkim: DkimService,
 }
 
 impl ComposeService {
     /// 用连接池与账户服务构造。
     pub fn new(pool: SqlitePool, accounts: AccountService) -> Self {
+        let dkim = DkimService::new(accounts.clone());
         Self {
             pool,
             accounts,
             trust: TlsTrust::SystemRoots,
             sent_copy: SentCopyService::new(ImapTlsTrust::SystemRoots),
+            dkim,
         }
     }
 
@@ -284,11 +289,13 @@ impl ComposeService {
         smtp_trust: TlsTrust,
         imap_trust: ImapTlsTrust,
     ) -> Self {
+        let dkim = DkimService::new(accounts.clone());
         Self {
             pool,
             accounts,
             trust: smtp_trust,
             sent_copy: SentCopyService::new(imap_trust),
+            dkim,
         }
     }
 
@@ -375,8 +382,24 @@ impl ComposeService {
             in_reply_to: entry.in_reply_to.clone(),
             references: entry.references.clone(),
         };
-        let built = build_message(&outgoing, &self.build_options(&account, now))
+        let mut built = build_message(&outgoing, &self.build_options(&account, now))
             .map_err(|e| AppError::Invalid(format!("邮件内容有问题：{e}")))?;
+
+        // 2.5) DKIM：在**冻结之前**盖戳。
+        //
+        // 签名覆盖的是「最终字节」，所以它必须发生在这里——签完的
+        // `built.bytes` 就是紧跟着被冻结的那份字节，重试发的也是同一份。
+        // 账户没配 DKIM 时返回 `None`，字节一个都不动。
+        //
+        // 失败**不降级**：拿不到私钥／签不出来就报错，不偷偷发出一封没签的信
+        // （草稿还在，用户可以修好配置再发）。
+        if let Some(signed) = self
+            .dkim
+            .sign_message(&self.pool, &account.id, &built.bytes, now)
+            .await?
+        {
+            built.bytes = signed;
+        }
 
         // 3) 冻结字节：从这一刻起，重试发的都是同一份。
         let queued = send_queue_dao::queue_for_sending(

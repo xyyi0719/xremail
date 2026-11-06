@@ -87,6 +87,9 @@ fn app() -> (tauri::App<MockRuntime>, tauri::WebviewWindow<MockRuntime>) {
             cmd::save_draft,
             cmd::send_message,
             cmd::resend_uncertain,
+            cmd::set_dkim_config,
+            cmd::get_dkim_config,
+            cmd::clear_dkim_config,
         ])
         .build(mock_context(noop_assets()))
         .expect("构建 mock 应用失败");
@@ -736,5 +739,167 @@ fn resend_uncertain_reports_camel_case_fields_and_a_missing_entry() {
     assert!(
         err.to_string().contains("no-such-entry"),
         "报错里要带上那个 id，实际是：{err}"
+    );
+}
+
+/// 一份可用的 DKIM 私钥（RFC 6376 之外的测试钥，2048 位 PKCS#1）。
+const DKIM_TEST_KEY: &str =
+    include_str!("../../../../crates/xremail-dkim/tests/fixtures/test_private_key.pem");
+
+/// 建一个账户并返回它的 id（`create_account` 的返回值就是 `Account`）。
+fn create_account_id(webview: &tauri::WebviewWindow<MockRuntime>) -> String {
+    let body = get_ipc_response(
+        webview,
+        request(
+            "create_account",
+            json!({ "request": valid_body("user@163.com") }),
+        ),
+    )
+    .expect("创建应当成功");
+    let value: serde_json::Value = body.deserialize().expect("反序列化失败");
+    value["id"].as_str().expect("账户应当有 id").to_string()
+}
+
+#[test]
+fn get_dkim_config_is_null_before_anything_is_configured() {
+    let (_app, webview) = app();
+    let account_id = create_account_id(&webview);
+
+    let body = get_ipc_response(
+        &webview,
+        request("get_dkim_config", json!({ "accountId": account_id })),
+    )
+    .expect("命令应当成功");
+    let value: serde_json::Value = body.deserialize().expect("反序列化失败");
+
+    assert_eq!(value, serde_json::Value::Null);
+}
+
+/// **私钥绝不回传**：`get_dkim_config` 的返回值里只能有选择器、域名与公钥。
+///
+/// 这封信面量 JSON 就是前端看到的东西，所以断言直接打在序列化结果上：
+/// 一旦有人给 DTO 加了「顺手把私钥带上」的字段，这条用例会立刻红。
+#[test]
+fn dkim_config_round_trips_without_the_private_key() {
+    let (_app, webview) = app();
+    let account_id = create_account_id(&webview);
+
+    let body = get_ipc_response(
+        &webview,
+        request(
+            "set_dkim_config",
+            json!({
+                "accountId": account_id,
+                "selector": "sel",
+                "domain": "Example.COM",
+                "privateKeyPem": DKIM_TEST_KEY,
+            }),
+        ),
+    )
+    .expect("配置应当成功");
+    let value: serde_json::Value = body.deserialize().expect("反序列化失败");
+
+    assert_eq!(value["selector"], "sel");
+    // 域名会被规范化成小写。
+    assert_eq!(value["domain"], "example.com");
+    assert_eq!(value["headerAlg"], "rsa-sha256");
+    assert_eq!(value["enabled"], true);
+    assert_eq!(value["dnsName"], "sel._domainkey.example.com");
+    assert!(
+        value["publicKey"]
+            .as_str()
+            .is_some_and(|key| key.starts_with("MIIBIjANBgkq")),
+        "应当回传 SPKI 公钥，实际是：{value}"
+    );
+    assert!(
+        value["dnsRecord"]
+            .as_str()
+            .is_some_and(|record| record.starts_with("v=DKIM1; k=rsa; p=")),
+        "应当给出可直接贴进 DNS 的记录，实际是：{value}"
+    );
+
+    // 私钥的任何一段都不能出现在结果里。
+    let text = value.to_string();
+    assert!(
+        !text.contains("PRIVATE KEY"),
+        "返回值里出现了私钥 PEM：{text}"
+    );
+    let body_line = DKIM_TEST_KEY.lines().nth(1).expect("测试钥第二行是 base64");
+    assert!(
+        !text.contains(&body_line[..40]),
+        "返回值里出现了私钥正文：{text}"
+    );
+
+    // 再取一次，形状必须一样（说明只改了钥匙串，库里没存私钥）。
+    let again: serde_json::Value = get_ipc_response(
+        &webview,
+        request("get_dkim_config", json!({ "accountId": account_id })),
+    )
+    .expect("命令应当成功")
+    .deserialize()
+    .expect("反序列化失败");
+    assert_eq!(again, value);
+}
+
+#[test]
+fn clear_dkim_config_removes_the_configuration() {
+    let (_app, webview) = app();
+    let account_id = create_account_id(&webview);
+
+    get_ipc_response(
+        &webview,
+        request(
+            "set_dkim_config",
+            json!({
+                "accountId": account_id,
+                "selector": "sel",
+                "domain": "example.com",
+                "privateKeyPem": DKIM_TEST_KEY,
+            }),
+        ),
+    )
+    .expect("配置应当成功");
+
+    let cleared: serde_json::Value = get_ipc_response(
+        &webview,
+        request("clear_dkim_config", json!({ "accountId": account_id })),
+    )
+    .expect("命令应当成功")
+    .deserialize()
+    .expect("反序列化失败");
+    assert_eq!(cleared, json!(true));
+
+    let gone: serde_json::Value = get_ipc_response(
+        &webview,
+        request("get_dkim_config", json!({ "accountId": account_id })),
+    )
+    .expect("命令应当成功")
+    .deserialize()
+    .expect("反序列化失败");
+    assert_eq!(gone, serde_json::Value::Null);
+}
+
+#[test]
+fn set_dkim_config_rejects_a_selector_that_is_not_a_dns_label() {
+    let (_app, webview) = app();
+    let account_id = create_account_id(&webview);
+
+    let err = get_ipc_response(
+        &webview,
+        request(
+            "set_dkim_config",
+            json!({
+                "accountId": account_id,
+                "selector": "坏 选择器",
+                "domain": "example.com",
+                "privateKeyPem": DKIM_TEST_KEY,
+            }),
+        ),
+    )
+    .expect_err("非法选择器应当报错");
+
+    assert!(
+        err.to_string().contains("选择器"),
+        "报错应当指明是选择器的问题，实际是：{err}"
     );
 }

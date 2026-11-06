@@ -6278,6 +6278,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "xremail-dkim"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "ring",
+ "thiserror 2.0.21",
+ "zeroize",
+]
+
+[[package]]
 name = "xremail-message"
 version = "0.1.0"
 dependencies = [
@@ -6326,6 +6336,7 @@ name = "xremail-shell"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "serde",
  "serde_json",
  "sqlx",
@@ -6343,12 +6354,14 @@ dependencies = [
  "windows",
  "xremail-api",
  "xremail-core",
+ "xremail-dkim",
  "xremail-message",
  "xremail-protocol-imap",
  "xremail-protocol-smtp",
  "xremail-store",
  "xremail-sync",
  "xremail-testkit",
+ "zeroize",
 ]
 
 [[package]]
