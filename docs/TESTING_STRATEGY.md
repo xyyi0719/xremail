@@ -1,7 +1,7 @@
 # 测试策略
 
-> 状态：规范已定义，测试设施**已部分落地**（Rust 803 个用例 / 前端 67 个用例，
-> 假 IMAP 与假 SMTP 服务器可用；Playwright E2E 与 fuzz 未开始，见 §5）。适用于个人研究项目与 AI 编码工作流。
+> 状态：规范已定义，测试设施**已部分落地**（Rust 843 个用例 / 前端 69 个用例 / Playwright E2E 5 条，
+> 假 IMAP 与假 SMTP 服务器可用；fuzz 未开始，见 §5）。适用于个人研究项目与 AI 编码工作流。
 > 目标：以可重复证据证明数据正确、安全隔离和失败恢复，不以覆盖率或编译成功代替验收。
 > 维护者：xyyi0719
 
@@ -102,19 +102,24 @@ Mock 通过不能证明服务商兼容。Playwright 浏览器通过不能证明 
 | **T6** | HTML 清洗攻击样本集（OWASP XSS + 追踪像素） | 安全门槛，且纯函数、CI 友好 | 无 | P2 | ✅ 完成（2026-10-30，`xremail-core::html`：`javascript:` / `data:` / `on*` / `style` 里的 `url(javascript:)` / 整封邮件的 `html`+`body` 壳；**未开始**：真正完备的 OWASP 样本集） |
 | **T7** | 假 IMAP/SMTP 服务器跑完整同步链路 | 覆盖状态机集成，但要先有 T2 | T2 | P2 | ✅ 完成（IMAP：假服务器 + 拉取 + 回写（标记与移动/删除两条通道）端到端；SMTP：假服务器 + 能力协商 + 提交往返，`xremail-testkit`） |
 | **T8** | 故障注入（断线、超时、乱序响应、丢应答） | 验证「不确定结果不盲重发」等语义 | T7 | P2/P3 | 🟡 **部分**：断线/超时/丢应答已覆盖（→ `uncertain`）；**乱序响应**未覆盖 |
-| **T9** | 前端组件与 E2E | 界面层，先保证后端语义正确再投入 | T5 | P3+ | 🟡 **部分**：前端组件用例 **12 个文件 / 69 个**（Vitest + Testing Library）；**Playwright E2E 未开始** |
-| **T10** | fuzz（MIME / HTML / IMAP 响应解析） | 防御性加固，非功能正确性 | T5/T6 | P2+ | ⬜ 未开始 |
+| **T9** | 前端组件与 E2E | 界面层，先保证后端语义正确再投入 | T5 | P3+ | 🟡 **部分**：前端组件用例 **12 个文件 / 69 个**（Vitest + Testing Library）；**Playwright E2E 已落地**（2026-11-06）：`apps/shell/playwright.config.ts` + `apps/shell/e2e/` 共 **2 个 spec 文件 / 5 条用例**，实测 **5 passed / 0 failed**（本地 12.2s；`CI=true` 模拟 10.8s）。起的是 Vite 开发服务器 + 真实 chromium，**不拉 Tauri 窗口**（CI 上没有 WebView），`window.__TAURI_INTERNALS__` 由 `page.addInitScript` 注入假后端。覆盖：① 文件夹邮件列表按 UID 倒序显示标题与发件人（含 `list_messages` 入参）；② 点开一封看到正文、打开不自动标已读；③ 写信面板没写收件人时前端拦下、不调 `send_message`（含「地址之间有空白」提醒）；④ 改动后 800ms 防抖自动存草稿、草稿箱里出现这一封；⑤ 收件人 + 主题填好后发送显示「已发送」与 `Message-ID`，发完发送按钮停用。已接进 CI 的 `web` job。**未覆盖**：附件与富文本编辑器（组件层在用），以及 `uncertain` 二次确认流 |
+| **T10** | fuzz（MIME / HTML / IMAP 响应解析） | 防御性加固，非功能正确性 | T5/T6 | P2+ | ⬜ 未开始（E 组 2026-11-06 复核：全仓没有 fuzz target、没有 `cargo-fuzz` 配置、CI 里也没有 fuzz 步骤，**这条仍成立**） |
 
-**Rust 用例总数：4 → 842**（2026-10-30 达 687；2026-11-03 随调度器 700、
+**Rust 用例总数：4 → 843**（2026-10-30 达 687；2026-11-03 随调度器 700、
 移动/删除写路径 747、崩溃恢复 778、IDLE 客户端侧与调度器接线 790、
 认证失败终态 792、审计修复（重发幂等 / 命令超时 / panic 边界补漏）797、
-认证分类纠偏（R25）802、文档审计补正 803、A 组审计缺陷修复（R26–R42）835、对账时机与租约（R29/R32/R33）842）；
+认证分类纠偏（R25）802、文档审计补正 803、A 组审计缺陷修复（R26–R42）835、对账时机与租约（R29/R32/R33）842；
+2026-11-06 E 组全量复跑仍是 843，未新增用例）；
 其中 **1 个是 `#[ignore]`**（`apps/shell/src-tauri/tests/real_mail_roundtrip.rs:68`，
-真实邮箱往返、会真的发信），所以 `cargo test` 实际执行 **841** 个。
-**注意口径**：803 是 2026-11-04 用 `--list` 点的数，835 / 842 是 2026-11-06 把
+真实邮箱往返、会真的发信），所以 `cargo test` 实际执行 **842** 个
+（2026-11-06 实测：`cargo test --workspace -j 4 --no-fail-fast`，62 个测试二进制，
+累加所有 `test result:` 行 = **842 passed / 0 failed / 1 ignored**）。
+**注意口径**：803 是 2026-11-04 用 `--list` 点的数，835 / 842 / 843 是 2026-11-06 把
 62 个测试二进制**全跑一遍**累加的（同一口径下修正 R34 回归前是 833 passed
-+ 2 failed；842 那一轮是 842 passed / 0 failed / 1 ignored）。两者都自洽，但换了数法就别互相比，也不要拿它当「新增了多少条」。
++ 2 failed；842 那一轮是 842 passed / 0 failed / 1 ignored，E 组复跑也是）。两种数法在本轮**已经对齐**
+（同日同仓库 `--list` 也是 843），但历史节点是按当年当时的口径记的，**不要跨口径互相减**，也不要拿它当「新增了多少条」。
 **前端用例 0 → 69**（12 个文件；`npx vitest run` 实测 12 个文件 / 69 条，R30 补了 4 条）。
+**端到端 0 → 5**（2 个 spec 文件；`npx playwright test` 实测 5 passed，见 T9）。
 
 ### 5.1.1 一条新规矩：用**变异测试**证明用例有效
 
@@ -152,15 +157,17 @@ cargo test --workspace -- --list | grep -c ': test$'
 该数字随每次提交变化，写入 CHANGELOG。**用例数本身不是质量证明**——它只用于回答「比上次多了多少」。
 CI 已在 `Test` 步骤后输出该计数（见 `.github/workflows/ci.yml`）。
 
-计数：**803**（Windows 本机实测；含 1 个 `#[ignore]`，实际执行 **802**）。
-上一次记录是 802（2026-11-04 认证分类纠偏之后）。
+计数：**843**（2026-11-06 在 Windows 本机实测；含 1 个 `#[ignore]`，实际执行 **842**）。
+同一天用「全量跑一遍累加 `test result:`」的数法也是 842 passed + 1 ignored，两种口径已经对齐。
+上一条记录是 803（2026-11-04，`--list` 口径，实际执行 802）。
 
 > Linux CI 的计数自 2026-10-28 起就没有再更新（当时是 **544**）。
 > 它与上面的 Windows 数字**不是同一时点**，不要相减得到「差多少条」。
 
 > 一律以 `cargo test --workspace` 在本机的实测输出为准。
-新增 103 条 Rust 用例的分布：发信服务层 8、存储层 `send_queue` 18、协议层 SMTP 提交 12、
-MIME 构建（`xremail-message::compose`）、假服务器故障注入与端到端同步、IPC 线格式。
+近期新增用例的分布（2026-10-30 那轮共 103 条）：发信服务层 8、存储层 `send_queue` 18、
+协议层 SMTP 提交 12、MIME 构建（`xremail-message::compose`）、假服务器故障注入与端到端同步、IPC 线格式。
+之后的增量见 §5.1 的节点列表（调度器 13、移动/删除写路径 24、崩溃恢复 11、IDLE、对账与租约等）。
 
 ### 5.4 明确不做的
 
@@ -180,13 +187,14 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --no-fail-fast
 npm run typecheck --prefix apps/shell
-npm test --prefix apps/shell        # vitest run
+npm test --prefix apps/shell        # vitest run（12 个文件 / 69 条）
+npm run test:e2e --prefix apps/shell # playwright test（2 个 spec / 5 条；CI 里先跑 playwright install chromium）
 npm run build --prefix apps/shell
 ```
 
 ### 6.1 本地改一行就跑全量是浪费：用 `scripts/test_changed.py`
 
-全量是 **803 个用例**，改一段注释也跑一遍，等于把最贵的一步做成最高频的一步。
+全量是 **843 个用例**，改一段注释也跑一遍，等于把最贵的一步做成最高频的一步。
 本地日常改成：
 
 ```bash
@@ -209,7 +217,8 @@ python scripts/test_changed.py --all      # 发版 / 推 PR 前跑全量
 另外 `cargo test -p` 仍然要编译上游依赖，「省」的是**用例执行**与无关包的链接，
 不是编译。
 
-2026-10-30 实测（**当时的数字**，不是现状；现在为 803 个 Rust 用例、67 个前端用例）：
+2026-10-30 实测（**当时的数字**，不是现状；现在为 843 个 Rust 用例、69 个前端用例、5 条 E2E，
+见 §5.1 与 §5.3）：
 以上六条在本机全部通过；`cargo test --workspace` 实际执行 **544** 个 Rust 用例
 （0 失败），CI 上 Linux 是 **538**（少 6 条 Windows 专属用例），`npm test` 跑 **27** 个前端用例（5 个文件，0 失败）。
 用例数为进度指标，不等于业务已验证。
@@ -222,7 +231,9 @@ python scripts/test_changed.py --all      # 发版 / 推 PR 前跑全量
 CI 的 runner 内存更小，必要时同样要限并发。
 
 现有 CI 的具体执行项以 `.github/workflows/ci.yml` 为准；有 workflow 不等于远端已经跑绿。
-Vitest、Playwright、假协议服务器、fuzz、故障注入尚待建设，不在本文虚构已通过结果。
+Vitest 与假协议服务器已经在跑；**Playwright E2E 于 2026-11-06 落地**并接进 `web` job
+（装 chromium → `npm run test:e2e` → 失败时上传 trace 与截图）。**尚未建设**：fuzz（T10）与更完整的
+故障注入（T8 的乱序响应），不在本文虚构已通过结果。
 新增测试工具时提交安装方式、命令与最小验证用例。真实凭据测试不得进入普通 PR CI。
 
 ## 7. 性能与 Android 验收

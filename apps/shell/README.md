@@ -16,7 +16,8 @@ npm run dev            # 仅前端（Vite，端口 1420）
 npm run tauri dev      # 完整应用（桌面）
 npm run tauri build    # 打包桌面版
 npm run typecheck      # TypeScript 类型检查
-npm run test           # Vitest 单元测试（12 个文件 / 67 个用例）
+npm run test           # Vitest 单元测试（12 个文件 / 69 个用例）
+npm run test:e2e       # Playwright 端到端（2 个 spec / 5 条；首次先 npx playwright install chromium）
 npm run android:init   # 生成 Android 工程（需 Android SDK/NDK，只做一次）
 npm run android:dev    # 在 Android 设备/模拟器上运行
 ```

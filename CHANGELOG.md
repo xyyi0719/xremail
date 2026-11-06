@@ -7,6 +7,19 @@
 ## [Unreleased]
 
 ### Added
+- **Playwright 端到端测试落地**（2026-11-06，T9）
+  - `apps/shell/playwright.config.ts` + `apps/shell/e2e/`：**2 个 spec / 5 条用例**，
+    `npm run test:e2e --prefix apps/shell` 实测 5 passed（本地约 12 秒）
+  - 不拉 Tauri 窗口：`@tauri-apps/api` 的 `invoke` 只是一行
+    `window.__TAURI_INTERNALS__.invoke(...)`，所以 `page.addInitScript` 注入一个
+    按命令分发的假后端即可（`e2e/daemon.ts`，思路同 `src/test/backend.ts`，
+    后者依赖 vitest 的 `vi` 不能直接复用），起的是 Vite 开发服务器 + 真实 chromium
+  - 覆盖：邮件列表（倒序、标题、发件人、`list_messages` 入参）→ 点开看正文
+    （打开不自动标已读）→ 写信面板（没写收件人时前端拦下、`800ms` 自动存草稿、
+    填好后发送显示「已发送」与 `Message-ID` 且发送按钮停用）
+  - CI 的 `web` job 新增三步：装 chromium → 跑 E2E → 失败时上传 trace/截图
+  - 用例数（2026-11-06 全量实测）：`cargo test --workspace` **842 passed / 0 failed /
+    1 ignored**（`--list` 843）、`npm test` **12 个文件 / 69 条**、E2E **2 个文件 / 5 条**
 - **`uncertain` 的「再发一次」人工出口打通**（2026-11-06，R30）
   - 之前界面上那条「再发一次」走的是 `send_message({fresh: true})`：**新写一封
     草稿、生成新的 `Message-ID`**，等于给用户又发了一封新信，而原来那封仍挂在

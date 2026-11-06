@@ -203,11 +203,13 @@ UIDVALIDITY 不得为 0（RFC 3501），收到 0 视为协议错误。
   对账不能凭空造第二套真相。
 * **同时收掉的残骸**：孤儿操作（文件夹已删 → `folder_missing`；移动目标已删 →
   `destination_missing`）、绑定旧 epoch 的操作（→ `epoch_changed`，与 §4.3 一致）。
-* **幂等**。触发点是应用启动（`apps/shell/src-tauri/src/lib.rs:196`）——
-  **必须**在这里做而不是只靠调度器：调度器只对「已交给它调度」的账户跑，
-  而崩溃恢复必须对**每个**账户都发生。幂等是为了容忍重复调用，
-  **不是**因为现在已经有两处触发点（目前只有启动一处）。
-  **未做**：actor 的 `Startup` 轮还没调它。
+* **幂等**。触发点有两个：应用启动（`apps/shell/src-tauri/src/lib.rs:197`）与
+  **每轮同步成功之后**（2026-11-06 随 R33 新增，`crates/xremail-sync/src/actor.rs:437 reconcile_after_tick`，
+  `Synced` 事件前调用）。
+  启动时要做的理由：调度器只对「已交给它调度」的账户跑，
+  而崩溃恢复必须对**每个**账户都发生。幂等是为了容忍重复调用。
+  **仍未做**：actor 的 `Startup` 轮**不单独**先对一次账——它靠第一轮 `tick`
+  成功后的 `reconcile_after_tick` 顺带覆盖。
 * 纯函数 `plan_reconcile` 把「观测 → 决定」从 IO 里拆出来，可单测；
   `reconcile_account_as` 是执行的壳。
 * 用例：`crates/xremail-sync/tests/crash_recovery.rs` 11 个（含「活着的进程的行不动」

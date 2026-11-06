@@ -112,6 +112,26 @@ jobs:
         # typecheck 与 build 都发现不了「点了没反应」这类回归。
         run: npm run test --prefix apps/shell
 
+      - name: Install Playwright chromium
+        # E2E 用**真实 chromium + 真实 Vite 开发服务器**跑，不拉 Tauri 窗口
+        # （见 apps/shell/playwright.config.ts 的说明）。只装 chromium：
+        # 另外两个引擎这里用不上，每个都差不多要 150MB 的下载。
+        run: npx --prefix apps/shell playwright install --with-deps chromium
+
+      - name: E2E tests
+        # 端到端主干：打开邮箱看到列表 → 点开看到正文 → 写信面板校验 / 存草稿 / 发送。
+        run: npm run test:e2e --prefix apps/shell
+
+      - name: Upload E2E artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-failure
+          path: |
+            apps/shell/e2e-results/
+            apps/shell/playwright-report/
+          retention-days: 7
+
       - name: Build
         run: npm run build --prefix apps/shell
 

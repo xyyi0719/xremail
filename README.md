@@ -13,9 +13,11 @@
 > **v0.3.0 · P0–P3 已出关 / P4 平台化未开始**（2026-10-30）
 >
 > 架构持续复核。当前设计见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
-> 2026-10-30 验证：`cargo fmt` / `cargo clippy -D warnings` / `cargo test`（**687 个 Rust 用例**）/
+> 2026-10-30 验证（当时的数字）：`cargo fmt` / `cargo clippy -D warnings` / `cargo test`（**687 个 Rust 用例**）/
 > `npm typecheck` / `npm test`（**67 个前端用例**）/ `npm build` / `cargo sqlx prepare --check` 均通过，
 > CI 四个 job 全绿。
+> 2026-11-06 复跑：`cargo test --workspace` **842 passed / 0 failed / 1 ignored**（`--list` 843）、
+> `npm test` **12 个文件 / 69 条**、`npm run test:e2e`（Playwright）**2 个文件 / 5 条**全绿。
 >
 > **已落地**：存储层（`xremail-store`，含 FTS5 全文索引）、密文封装（`xremail-crypto`）、
 > L2 契约（`xremail-api`）、同步引擎（`xremail-sync`）、IMAP / SMTP 协议层
@@ -84,7 +86,7 @@
 | SMTP | **自研协议层**（rustls + x509-parser，**未用 lettre**） | 0.23 / 0.16 |
 | 存储 | SQLite (sqlx, WAL) + FTS5 | 0.9 |
 | 全文索引 | FTS5 **trigram**（外部内容表 + 触发器维护） | — |
-| 密钥库 | 平台 SecretStore（**尚未接入**） | 待定 |
+| 密钥库 | 平台 SecretStore（**Windows 已接入**，2026-10-26，Windows 凭据管理器；其它平台仍是「如实报错」的桩） | 待定 |
 | 密码学 | argon2 + chacha20poly1305 | 0.6 / 0.11 |
 
 > **与早期规划不同**：原计划里的 TanStack Query / Router / Zustand、Tailwind + shadcn/ui、
