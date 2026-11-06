@@ -321,11 +321,7 @@ mod tests {
         // R42：下限不能把调用方给的 300ms 静默改成 1 秒。
         // 调度器把「本轮该等多久」直接当 `idle_timeout`，
         // 一旦被放大，IDLE 就比纯轮询**还晚**醒来。
-        let config = IdleConfig::new(
-            Duration::from_secs(10),
-            Duration::from_millis(300),
-            "INBOX",
-        );
+        let config = IdleConfig::new(Duration::from_secs(10), Duration::from_millis(300), "INBOX");
         assert_eq!(config.idle_timeout, Duration::from_millis(300));
     }
 
