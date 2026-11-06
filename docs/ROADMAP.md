@@ -184,12 +184,19 @@
     `owner_boot IS NULL OR owner_boot <> 本次 boot` 的行
   - **先回收、后判过期**（顺序本身是语义）：反过来，一条属于上次进程、
     次数也已到顶的 `running` 会被 `expire_exhausted` 漏掉，永远卡在 `running`
+  - **本进程认领的行也有出口**（2026-11-06，R32）：`crates/xremail-store/src/dao/operation.rs:570`
+    的 `RUNNING_LEASE_MS`（15 分钟）+ `reclaim_stale_running`，超过租约没写终态的行
+    收成 `uncertain / lease_expired`；它在 `expire_exhausted` **之前**调用
   - `uncertain` **绝不**改回 `queued` / `retryable`：那等于替服务器判断
-    「上次没执行」。只有人的显式决定能改它
+    「上次没执行」。只有人的显式决定能改它——外加一条**时间出口**（2026-11-06，R29）：
+    超过 `UNCERTAIN_STALE_MS`（72 小时，`crates/xremail-sync/src/reconcile.rs:57`）转
+    `failed / stale_unresolved`，文案让用户去服务器上核对后再决定
   - 同时收掉：孤儿操作（文件夹已删 → `folder_missing`；移动目标已删 →
     `destination_missing`）、旧 epoch 操作（→ `epoch_changed`）
-  - 幂等：重复执行都不动手（触发点是**应用启动一处**，
-    `apps/shell/src-tauri/src/lib.rs:196`；actor 的 `Startup` 轮尚未调它）
+  - 幂等：重复执行都不动手（触发点两处：**应用启动**
+    `apps/shell/src-tauri/src/lib.rs:197`，以及 **每轮同步成功后**
+    `crates/xremail-sync/src/actor.rs:437 reconcile_after_tick`，2026-11-06 随 R33 落地；
+    actor 的 `Startup` 轮本身不单独对账）
   - 用例：`tests/crash_recovery.rs` 11 个
 - [x] **账户调度器**（2026-11-03）：`crates/xremail-sync/src/actor.rs`。
   - 一个账户一个 actor，彼此隔离（一个账户的服务器卡住不拖住另一个）
