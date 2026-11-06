@@ -212,8 +212,16 @@ async fn server_rejecting_list_is_an_error_not_an_empty_list() {
         .await
         .expect_err("服务器拒绝了 LIST，同步必须报错");
 
+    // B1：`LIST` 被 `NO` 拒是**语义**失败——重连一万次也一样失败，
+    // 所以既不能变成空列表，也**不能**被当成「会话可恢复」去触发短重连。
     assert!(
-        err.to_string().contains("文件夹") || err.to_string().contains("LIST"),
+        !xremail_sync::is_session_recoverable(&err),
+        "服务器拒绝 LIST 是语义错误，不该被当成掉线：{err}"
+    );
+    // 文案本身由 `pull::map_protocol_error` 透传服务器给的细节（B1 之前是
+    // 「列文件夹失败: …」的前缀）；这里钉住的是「细节没被丢掉」。
+    assert!(
+        err.to_string().contains("injected fault"),
         "实际错误是：{err}"
     );
 
