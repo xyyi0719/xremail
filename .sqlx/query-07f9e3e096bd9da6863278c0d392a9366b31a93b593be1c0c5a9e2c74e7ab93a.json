@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO account\n             (id, email, provider, auth_kind, imap_host, imap_port, imap_tls,\n              smtp_host, smtp_port, smtp_tls, smtp_auth, username, sync_mode,\n              poll_interval_secs, created_at, updated_at)\n           VALUES ('a1', 'a1@example.com', 'netease_163', 'password',\n                   'imap.example.com', 993, 'implicit',\n                   'smtp.example.com', 465, 'implicit', 'login',\n                   'a1@example.com', 'poll', 300, 1, 1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "07f9e3e096bd9da6863278c0d392a9366b31a93b593be1c0c5a9e2c74e7ab93a"
+}

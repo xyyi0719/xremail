@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO message (id, account_id, folder_id, uid, uidvalidity)\n           VALUES ('m1', 'a1', 'f1', 1, 42)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "fbf5ccd58a45ec96b84cbc5b98bc6ce74cc023b11f718c76fa86d79f8abc4509"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        UPDATE attachment\n        SET local_path = ?, sha256 = ?, size = ?, fetched = 1, downloaded_at = ?\n        WHERE message_id = ? AND id = ?\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "cf177746de99a9d20a5aa36385dcc6e78ec93c83fbe302ba4ad98ef0e438b239"
+}

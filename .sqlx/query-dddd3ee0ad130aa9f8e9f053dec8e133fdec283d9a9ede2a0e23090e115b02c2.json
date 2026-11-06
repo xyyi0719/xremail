@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT part_key FROM attachment WHERE message_id = ? AND part_key IS NOT NULL",
+  "describe": {
+    "columns": [
+      {
+        "name": "part_key",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "attachment",
+            "name": "part_key"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "dddd3ee0ad130aa9f8e9f053dec8e133fdec283d9a9ede2a0e23090e115b02c2"
+}

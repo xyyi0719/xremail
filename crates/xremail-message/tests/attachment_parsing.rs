@@ -18,12 +18,13 @@ fn mail(lines: &[&str]) -> Vec<u8> {
 
 #[test]
 fn nested_multipart_yields_numbered_attachments() {
-    // 顶层 mixed
-    //   1. multipart/alternative
-    //        1.1 text/plain
-    //        1.2 text/html
-    //   2. application/pdf（附件）
-    //   3. image/png（内联图）
+    // 顶层 multipart/mixed 自己**占 1 号**（IMAP 的规则），它的子部件是 1.1–1.3：
+    //   1     multipart/mixed
+    //   1.1     multipart/alternative
+    //   1.1.1     text/plain
+    //   1.1.2     text/html
+    //   1.2     application/pdf（附件）
+    //   1.3     image/png（内联图）
     let raw = mail(&[
         "Subject: 带附件的邮件",
         "From: sender@example.com",
@@ -66,7 +67,7 @@ fn nested_multipart_yields_numbered_attachments() {
     assert_eq!(parsed.attachments.len(), 2, "{:#?}", parsed.attachments);
 
     let pdf = &parsed.attachments[0];
-    assert_eq!(pdf.part_number, "2");
+    assert_eq!(pdf.part_number, "1.2");
     assert_eq!(pdf.filename.as_deref(), Some("合同.pdf"));
     assert_eq!(pdf.content_type, "application/pdf");
     assert_eq!(pdf.size, 9, "解码后是 `%PDF-1.4\\n` 共 9 字节");
@@ -74,7 +75,7 @@ fn nested_multipart_yields_numbered_attachments() {
     assert_eq!(pdf.content_id, None);
 
     let logo = &parsed.attachments[1];
-    assert_eq!(logo.part_number, "3");
+    assert_eq!(logo.part_number, "1.3");
     assert!(logo.is_inline);
     assert_eq!(logo.content_id.as_deref(), Some("logo@example.com"));
     assert_eq!(logo.content_type, "image/png");
@@ -105,7 +106,7 @@ fn quoted_printable_attachment_is_measured_after_decoding() {
 
     assert_eq!(parsed.attachments.len(), 1);
     let log = &parsed.attachments[0];
-    assert_eq!(log.part_number, "2");
+    assert_eq!(log.part_number, "1.2");
     assert_eq!(log.filename.as_deref(), Some("日志.txt"), "RFC 2047 名字");
     // QP 里 `=`+CRLF 是软换行，去掉后是「日志 第一 =一行」（等号前那个空格是硬空格，
     // 不在行尾，所以不会被编码）；UTF-8 汉字各 3 字节，共 6 个汉字 = 18 字节，+3 = 21。
@@ -168,7 +169,7 @@ fn inline_part_without_filename_is_not_listed() {
 }
 
 #[test]
-fn top_level_attachment_is_part_one() {
+fn top_level_attachment_is_numbered_text() {
     let raw = mail(&[
         "Content-Type: application/octet-stream",
         "Content-Disposition: attachment; filename=data.bin",
@@ -179,9 +180,52 @@ fn top_level_attachment_is_part_one() {
     let parsed = parse_message(&raw).expect("应当能解析");
 
     assert_eq!(parsed.attachments.len(), 1);
-    assert_eq!(parsed.attachments[0].part_number, "1");
+    assert_eq!(parsed.attachments[0].part_number, "TEXT");
     assert_eq!(parsed.attachments[0].filename.as_deref(), Some("data.bin"));
     assert_eq!(parsed.attachments[0].size, 9);
+}
+
+#[test]
+fn a_forwarded_message_is_numbered_through_its_zero_layer() {
+    // message/rfc822 在服务器上的号是「父号.0」；内嵌邮件自己的顶层 multipart
+    // **不再加**那层 1，所以里面第 2 段直接是 `1.2.0.2`：
+    //   1                          multipart/mixed（顶层）
+    //   1.1                        text/plain
+    //   1.2.0                      message/rfc822 里的那封内嵌邮件
+    //   1.2.0.1 / 1.2.0.2          └ 内嵌邮件的正文 + 附件（那层 multipart 不占号）
+    let raw = mail(&[
+        "Content-Type: multipart/mixed; boundary=\"outer\"",
+        "",
+        "--outer",
+        "Content-Type: text/plain; charset=utf-8",
+        "",
+        "请转发的邮件见下",
+        "--outer",
+        "Content-Type: message/rfc822",
+        "",
+        "Subject: 内嵌邮件",
+        "Content-Type: multipart/mixed; boundary=\"inner\"",
+        "",
+        "--inner",
+        "Content-Type: text/plain; charset=utf-8",
+        "",
+        "内嵌正文",
+        "--inner",
+        "Content-Type: application/pdf",
+        "Content-Disposition: attachment; filename=\"内嵌.pdf\"",
+        "Content-Transfer-Encoding: base64",
+        "",
+        "JVBERi0xLjQK",
+        "--inner--",
+        "--outer--",
+        "",
+    ]);
+
+    let parsed = parse_message(&raw).expect("应当能解析");
+
+    assert_eq!(parsed.attachments.len(), 1, "{:#?}", parsed.attachments);
+    assert_eq!(parsed.attachments[0].part_number, "1.2.0.2");
+    assert_eq!(parsed.attachments[0].filename.as_deref(), Some("内嵌.pdf"));
 }
 
 #[test]

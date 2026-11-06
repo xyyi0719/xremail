@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO mail_operation\n             (id, account_id, folder_id, uid, uidvalidity, kind, intent, state, created_at, updated_at)\n           VALUES ('op1', 'a1', 'f1', 1, 42, 'set_flags', '{\"seen\":true}', 'queued', 1, 1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "e63e6b7b125e22ee0446be6ab432e090f86eb3537f5c775df83d319660ae05e0"
+}

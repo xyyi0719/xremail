@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE account SET provider = 'not_a_provider' WHERE id = 'a1'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "8180c753a75ef95c3450b66d37e472fca9f4cad99f761b580dfac35b04a8d5e8"
+}

@@ -262,9 +262,11 @@ fn is_uncounted(headers: &HeaderMap) -> bool {
 
 /// 把一个部件拆成「头 + 体」两半：空行之前是头，之后是体。
 ///
+/// 对外公开是因为诊断工具（`xremail-diagnostics` 的 charset-probe）也要按同一规则切。
+///
 /// 没有空行时按「整段都是头」处理（与「整段都是体」相比，
 /// 这样一封只有头的空正文邮件不会把 `Subject:` 当成正文）。
-pub(crate) fn split_head_body(bytes: &[u8]) -> (HeaderMap, Vec<u8>) {
+pub fn split_head_body(bytes: &[u8]) -> (HeaderMap, Vec<u8>) {
     // 空行可以是 CRLF CRLF 或 LF LF。
     let mut split = None;
     let mut i = 0;
