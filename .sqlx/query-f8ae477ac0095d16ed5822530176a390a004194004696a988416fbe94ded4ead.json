@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        UPDATE mail_operation\n        SET state = 'uncertain',\n            error_kind = 'lease_expired',\n            error_message = ?,\n            owner_boot = NULL,\n            started_at = NULL,\n            updated_at = ?\n        WHERE account_id = ?\n          AND state = 'running'\n          AND owner_boot = ?\n          AND started_at IS NOT NULL\n          AND started_at <= ?\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "f8ae477ac0095d16ed5822530176a390a004194004696a988416fbe94ded4ead"
+}
