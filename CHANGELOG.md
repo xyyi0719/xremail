@@ -7,6 +7,31 @@
 ## [Unreleased]
 
 ### Added
+- **`uncertain` 的「再发一次」人工出口打通**（2026-11-06，R30）
+  - 之前界面上那条「再发一次」走的是 `send_message({fresh: true})`：**新写一封
+    草稿、生成新的 `Message-ID`**，等于给用户又发了一封新信，而原来那封仍挂在
+    未确认名单里——服务端已有的 `resend_uncertain` 全仓没有调用者
+  - 新增 Tauri 命令 `resend_uncertain(entryId)`（账户取自发信记录本身，不信前端
+    传的 `accountId`），前端 `ComposePanel` 的确认分支改调它，按返回的
+    `sent` / `uncertain` / `failed` 分别更新结果提示与未确认名单
+  - 顺手修掉：「再发一次」失败后原来那封从名单里消失、无法撤回
+  - 用例：前端 4 条（`apps/shell/src/__tests__/compose-uncertain.test.tsx`）+
+    `apps/shell/src-tauri/tests/compose_service.rs` 2 条 + `tests/command_ipc.rs` 1 条
+- **A 组审计缺陷集中修复**（2026-11-06，R26–R28 / R31 / R34–R42，详见
+  [ISSUES_AND_RISKS §4](docs/ISSUES_AND_RISKS.md)），其中用户能感觉到的几处：
+  - 一则错授权码不再被永久重试（早先已修），**标旗/搬移意图不会被每轮重发**
+    （R26、R34），**同一封邮件不会因为两条 flush 并发而搬出两份**（R34）
+  - 服务器不回应时**不再永久挂住**：写路径的 `select` / `examine` 与
+    `COPY` / `MOVE` / `STORE \Deleted` / `UID EXPUNGE` 全部补上命令超时
+    （R27、R38）
+  - 无 `UIDPLUS` 的服务器上**不再假装删成功**（邮件不会下一轮又自己回来，
+    R35）；移动成功后按 `COPYUID` 的目标 UID 直接写回本地（R39）
+  - `IDLE` 的三个边界（能力大小写、25 分钟上限、`EXAMINE` 只有 `NO` 才回退，
+    R41/R42）；探测失败的账户**当轮就不再尝试 IDLE**，不再每轮白付一次 TLS
+    （R37）；等待期的 panic 也会计数并在达上限后放弃账户（R28）
+  - 假服务器按宣告能力 gate `MOVE` / `UID EXPUNGE`，并在 `MOVE` 后补发
+    untagged `EXPUNGE`——「能力探测漏判」与「untagged 穿插」这两类 bug
+    以后在 CI 里会红（R40）
 - **认证失败成为终态，不再无限重试**（2026-11-03）
   - `SyncState::ReauthRequired` 从 2026-10-26 就声明好了（`crates/xremail-core/src/model.rs:566`，
     注释写「a human has to act」），但**全仓没有任何地方发它**——实际行为是
