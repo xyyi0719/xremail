@@ -16,6 +16,7 @@
 pub mod account;
 pub mod compose;
 pub mod credential;
+pub mod dkim;
 pub mod message;
 pub mod scheduler;
 pub mod sent_copy;
@@ -24,6 +25,7 @@ pub mod sync;
 pub use account::AccountService;
 pub use compose::{ComposeService, DraftDto, DraftInput, SendResult, SendResultState};
 pub use credential::CredentialService;
+pub use dkim::{DkimConfigDto, DkimService};
 pub use message::{FolderDto, MessageFlag, MessageService, SearchHitDto};
 pub use sent_copy::{SentCopyOutcome, SentCopyService};
 pub use sync::SyncService;

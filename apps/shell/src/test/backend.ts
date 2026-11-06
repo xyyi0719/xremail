@@ -3,6 +3,7 @@ import { vi } from "vitest";
 import { FLAG_FLAGGED, FLAG_SEEN } from "../types";
 import type {
   Account,
+  DkimConfig,
   DraftDetail,
   DraftDto,
   DraftInput,
@@ -79,6 +80,10 @@ export interface BackendOptions {
    * 测 HTML 渲染路径时传一个带 `htmlSafe` 的。
    */
   messageBody?: MessageBody;
+  /** get_dkim_config 抛这个错。 */
+  dkimError?: Error | null;
+  /** set_dkim_config 抛这个错。 */
+  dkimSaveError?: Error | null;
 }
 
 export interface Backend {
@@ -117,6 +122,12 @@ export interface Backend {
   searchHits: SearchHit[];
   /** `open_message` 返回的正文。 */
   messageBody: MessageBody;
+  /** `get_dkim_config` 抛这个错。 */
+  dkimError: Error | null;
+  /** `set_dkim_config` 抛这个错。 */
+  dkimSaveError: Error | null;
+  /** 每个账户的 DKIM 配置（**不含私钥**，像真的 `account_dkim` 表）。 */
+  dkimConfigs: Map<string, DkimConfig>;
   /** 所有 invoke 调用（含参数），按顺序。 */
   calls: InvokeCall[];
   /** 装给 `invoke` 的实现。 */
@@ -203,6 +214,9 @@ export function createBackend(options: BackendOptions = {}): Backend {
     sentEntries: [],
     fileSizes: { ...(options.fileSizes ?? {}) },
     searchHits: options.searchHits ?? [],
+    dkimError: options.dkimError ?? null,
+    dkimSaveError: options.dkimSaveError ?? null,
+    dkimConfigs: new Map<string, DkimConfig>(),
     messageBody: options.messageBody ?? {
       messageId: "<m1@example.com>",
       textPlain: "正文内容",
@@ -286,6 +300,51 @@ export function createBackend(options: BackendOptions = {}): Backend {
         throw backend.syncError;
       }
       return { folders: backend.folders.length, added: 0, removed: 0 };
+    },
+    // ---------------- DKIM ----------------
+
+    // 假后端也**不回传私钥**：这里只有选择器、域名和公钥，
+    // 跟真的 `get_dkim_config` 一个口径。
+    // 表里存的就这份形状（`backend.dkimConfigs`），像真的 `account_dkim` 表——
+    // 私钥不在里面，它只存在于「用户刚刚提交的那次请求」里。
+    get_dkim_config: (args) => {
+      if (backend.dkimError) {
+        throw backend.dkimError;
+      }
+      const accountId = String(args.accountId ?? "");
+      const config = backend.dkimConfigs.get(accountId);
+      return config ? { ...config } : null;
+    },
+    set_dkim_config: (args) => {
+      if (backend.dkimSaveError) {
+        throw backend.dkimSaveError;
+      }
+      const accountId = String(args.accountId ?? "");
+      const selector = String(args.selector ?? "").trim();
+      const domain = String(args.domain ?? "").trim().toLowerCase();
+      const privateKeyPem = String(args.privateKeyPem ?? "");
+      const previous = backend.dkimConfigs.get(accountId);
+      if (privateKeyPem.trim() === "" && previous === undefined) {
+        throw "请填写 DKIM 私钥（PEM）";
+      }
+      const saved: DkimConfig = {
+        accountId,
+        selector,
+        domain,
+        headerAlg: "rsa-sha256",
+        enabled: true,
+        publicKey: "MIIBIjANBgkq-stub-public-key",
+        dnsName: `${selector}._domainkey.${domain}`,
+        dnsRecord: `v=DKIM1; k=rsa; p=MIIBIjANBgkq-stub-public-key`,
+      };
+      // 只记「有没有私钥」这件事本身，私钥字符串不留在假后端里。
+      backend.dkimConfigs.set(accountId, saved);
+      return { ...saved };
+    },
+    clear_dkim_config: (args) => {
+      const accountId = String(args.accountId ?? "");
+      const removed = backend.dkimConfigs.delete(accountId);
+      return removed;
     },
     open_message: () => backend.messageBody,
     create_account: () => ({}),

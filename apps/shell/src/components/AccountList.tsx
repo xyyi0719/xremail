@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Account, Notice, SyncResult } from "../types";
 import { PROVIDER_LABELS, SYNC_MODE_LABELS, TLS_LABELS } from "../types";
 import SyncPanel from "./SyncPanel";
+import DkimPanel from "./DkimPanel";
 
 interface Props {
   accounts: Account[];
@@ -116,6 +117,9 @@ function AccountList({
                 删除
               </button>
             </div>
+            {/* DKIM 会改变「发出的字节」，所以单独一块、默认折叠的内容放在
+                账户操作区下面；未配置时它只显示一行「未配置」。 */}
+            <DkimPanel account={account} onNotice={onNotice} />
           </li>
         ))}
       </ul>

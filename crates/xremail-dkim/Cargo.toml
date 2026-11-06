@@ -1,0 +1,16 @@
+[package]
+name = "xremail-dkim"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "DKIM（RFC 6376）规范化与签名：纯函数，不做 IO"
+
+[dependencies]
+base64 = { workspace = true }
+ring = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true, features = ["derive"] }
+
+[dev-dependencies]
+ring = { workspace = true }

@@ -36,6 +36,10 @@ xremail-protocol-imap = { workspace = true }
 # SMTP 协议层（真发信）与 MIME 构建（发信用的字节）。
 xremail-protocol-smtp = { workspace = true }
 xremail-message = { workspace = true }
+# DKIM 签名（发信前给冻结字节盖章）。
+xremail-dkim = { workspace = true }
+# 私钥在内存里用完即抹。
+zeroize = { workspace = true }
 sqlx = { workspace = true }
 # 异步运行时：服务层要 `tokio::time::sleep`（补「已发送」副本前等一拍）。
 tokio = { workspace = true }
@@ -54,6 +58,8 @@ windows = { workspace = true }
 [dev-dependencies]
 # 临时目录用于测试库文件。
 tempfile = "3"
+# DKIM 端到端用例要从 `b=` 里拆出签名再验一次。
+base64 = { workspace = true }
 tokio = { workspace = true }
 # 假 SMTP 服务器：发信链路必须在 CI 里能跑，不能依赖真实邮箱。
 xremail-testkit = { workspace = true }

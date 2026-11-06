@@ -17,6 +17,7 @@ use xremail_store::dao::operation as operation_dao;
 use crate::service::compose::{DraftDetail, DraftDto, DraftInput, SendResult};
 use crate::service::credential::CredentialService;
 use crate::service::current_time_ms;
+use crate::service::dkim::{DkimConfigDto, DkimConfigInput, DkimService};
 use crate::service::message::SearchHitDto;
 use crate::service::message::{FolderDto, MessageBodyView, MessageFlag};
 use crate::state::AppState;
@@ -98,6 +99,11 @@ pub async fn delete_account<R: Runtime>(
         // `stop` 对一个没被调度的账户是幂等的（直接返回），不用先查。
         let _ = state.scheduler.stop(&id);
         state.forget_credential(&id);
+        // DKIM 私钥在另一条钥匙串条目里（`xremail:dkim:<id>`），
+        // 账户行删掉之后它就是孤儿了，一并清掉。
+        let _ = DkimService::new(state.accounts.clone())
+            .clear(state.pool(), &id)
+            .await;
 
         let event = AppEvent::AccountRemoved { account_id: id };
         app.emit(event.name(), &event).map_err(|e| e.to_string())?;
@@ -368,6 +374,65 @@ pub async fn forget_credential(
     state.forget_credential(&account_id);
 
     Ok(deleted)
+}
+
+/// 保存某个账户的 DKIM 配置（选择器 / 签名域 / 私钥）。
+///
+/// * 私钥只写进平台钥匙串（引用名 `xremail:dkim:<accountId>`），
+///   数据库 `account_dkim` 表只存选择器、签名域、算法与引用名；
+/// * 返回的是**可以给用户看的那一份**：选择器、签名域、DNS 记录，
+///   **不含私钥**；
+/// * 保存前会拿这把钥真签一段再验回来——抄错的钥当场报错，而不是发信时才发现。
+///
+/// 传空私钥表示「保留已有的钥，只改选择器 / 域名」。
+#[tauri::command]
+pub async fn set_dkim_config(
+    state: State<'_, AppState>,
+    account_id: String,
+    selector: String,
+    domain: String,
+    private_key_pem: String,
+) -> Result<DkimConfigDto, String> {
+    let service = DkimService::new(state.accounts.clone());
+    let input = DkimConfigInput {
+        account_id: &account_id,
+        selector: &selector,
+        domain: &domain,
+        private_key_pem: &private_key_pem,
+    };
+    service
+        .set(state.pool(), &input, current_time_ms())
+        .await
+        .map_err(|e| user_error(&e))
+}
+
+/// 读某个账户的 DKIM 配置（没配就是 `None`）。
+///
+/// **不含私钥**：只回选择器、签名域、从私钥算出来的公钥（`p=` 的值）与
+/// 建议发布的 DNS 记录。
+#[tauri::command]
+pub async fn get_dkim_config(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<Option<DkimConfigDto>, String> {
+    DkimService::new(state.accounts.clone())
+        .get(state.pool(), &account_id)
+        .await
+        .map_err(|e| user_error(&e))
+}
+
+/// 清掉某个账户的 DKIM 配置：删钥匙串里的私钥 + 删表里那一行。
+///
+/// 返回是否真的删掉了表里的配置。清完之后这个账户发信**不再签名**。
+#[tauri::command]
+pub async fn clear_dkim_config(
+    state: State<'_, AppState>,
+    account_id: String,
+) -> Result<bool, String> {
+    DkimService::new(state.accounts.clone())
+        .clear(state.pool(), &account_id)
+        .await
+        .map_err(|e| user_error(&e))
 }
 
 /// 标记变更的结果（给前端看的）。

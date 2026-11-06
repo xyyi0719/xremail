@@ -254,6 +254,32 @@ export interface Notice {
 }
 
 /**
+ * 账户的 DKIM 配置（对应后端 `DkimConfigDto`）。
+ *
+ * ## 这里**没有**私钥
+ *
+ * 私钥存在操作系统的钥匙串里，`get_dkim_config` / `set_dkim_config`
+ * 的返回值里只有选择器、域名和**公钥**——后端不会把它回传给前端，
+ * 所以这个类型里也不可能有私钥字段。
+ */
+export interface DkimConfig {
+  accountId: string;
+  /** `s=`：DNS 记录名里的选择器。 */
+  selector: string;
+  /** `d=`：签名域。 */
+  domain: string;
+  /** `a=`：签名算法，目前只有 `rsa-sha256`。 */
+  headerAlg: string;
+  enabled: boolean;
+  /** SPKI 公钥的 base64；钥匙串里读不到私钥时为 `null`。 */
+  publicKey: string | null;
+  /** 要发布的 DNS 记录名，如 `default._domainkey.example.com`。 */
+  dnsName: string | null;
+  /** 可直接贴进 DNS 的 TXT 内容，如 `v=DKIM1; k=rsa; p=…`。 */
+  dnsRecord: string | null;
+}
+
+/**
  * 草稿里的一个附件（对应后端 `DraftAttachment`）。
  *
  * ## 为什么传路径而不是字节
