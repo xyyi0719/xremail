@@ -166,8 +166,50 @@ export interface MessageBody {
   charset: string | null;
 }
 
-/** 同步结果（对应 `cmd::SyncResult`）。 */
-export interface SyncResult {
+/**
+ * 一封邮件的一个附件（对应 `cmd::AttachmentDto`）。
+ *
+ * **只有元数据，没有字节**：字节留在后端的磁盘上（`<数据目录>/attachments/…`），
+ * 前端要的是「下载 / 打开 / 另存为」三个动作，从不经 IPC 搬运内容。
+ */
+export interface Attachment {
+  id: string;
+  /** 文件名（可能已经解码过 RFC 2231 / RFC 2047；后端保证不含路径分隔符）。 */
+  filename: string;
+  /** 媒体类型，例如 `application/pdf`。 */
+  contentType: string;
+  /** 解码后的字节数；`0` 表示未知。 */
+  size: number;
+  /** 内联图片的 Content-ID（去掉了尖括号），普通附件为 `null`。 */
+  contentId: string | null;
+  /** 是不是正文里引用的内联资源（`cid:` 图片）。 */
+  isInline: boolean;
+  /** 本地是否已经有这份文件。 */
+  downloaded: boolean;
+  /** 落盘时间（毫秒时间戳）。 */
+  downloadedAtMs: number | null;
+  /**
+   * 本地文件的绝对路径——**只用于展示**（「已保存到 …」）。
+   *
+   * 前端从不读它：打开 / 另存为都走后端命令。
+   */
+  localPath: string | null;
+}
+
+/** 一次下载的结果（对应 `service::attachment::AttachmentDownload`）。 */
+export interface AttachmentDownload {
+  attachmentId: string;
+  /** 本地文件的绝对路径（展示用，前端不读它）。 */
+  path: string;
+  /** 建议的文件名（另存为时作为默认名）。 */
+  name: string;
+  size: number;
+  sha256: string;
+  /** `true` 表示本地早就有了，没有再去服务器取。 */
+  cached: boolean;
+}
+
+/** 同步结果（对应 `cmd::SyncResult`）。 */export interface SyncResult {
   folders: number;
   added: number;
   removed: number;

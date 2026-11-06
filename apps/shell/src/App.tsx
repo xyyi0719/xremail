@@ -19,6 +19,7 @@ import type {
   SyncResult,
 } from "./types";
 import { describeFlagIntent, isStarred, isUnread } from "./types";
+import { loadAttachmentLimits } from "./attachmentLimits";
 import "./App.css";
 
 /**
@@ -53,6 +54,8 @@ function App() {
   const [accounts, setAccounts] = useState<Account[] | null>(null);
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // 附件（读信侧）的错误单独一条通道，理由见 `handleAttachmentError`。
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
   // 「命令成功了，但结果有区别」的反馈走这条通道，跟 `error` 分开：
   // 成功的操作不能显示成错误。
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -88,6 +91,9 @@ function App() {
     void invoke<AppInfo>("app_info")
       .then(setInfo)
       .catch((e) => setError(String(e)));
+    // 附件上限在后端（`xremail-core::attachment`），启动时问一次并缓存：
+    // 写信面板的校验是同步的，拿不到就交给后端拦。
+    void loadAttachmentLimits((cmd) => invoke<unknown>(cmd));
   }, [refresh]);
 
   useEffect(() => {
@@ -221,6 +227,19 @@ function App() {
 
   const handleError = useCallback((message: string) => setError(message), []);
 
+  /**
+   * 附件的错误单独记一条。
+   *
+   * 正文那边传下来的 `handleError` 除了记错误之外，还会清掉当前选中的邮件
+   * （那是对的：正文拉不出来，留在这一封也没意义）。但附件列表拉不出来
+   * 不该让整封信消失——用户还能读正文、还看得见其他附件。所以附件自己
+   * 一条错误通道，显示在主错误下面，换一封邮件时清掉。
+   */
+  const handleAttachmentError = useCallback(
+    (message: string) => setAttachmentError(message),
+    [],
+  );
+
   const handleNotice = useCallback((n: Notice) => setNotice(n), []);
 
   /**
@@ -317,6 +336,12 @@ function App() {
         </p>
       )}
 
+      {attachmentError && (
+        <p className="app-error" data-testid="attachment-error" role="alert">
+          附件：{attachmentError}
+        </p>
+      )}
+
       {notice && (
         <div
           className={`app-notice app-notice-${notice.kind}`}
@@ -398,6 +423,7 @@ function App() {
                       message={message}
                       onToggleSeen={handleToggleSeen}
                       onError={handleError}
+                      onAttachmentError={handleAttachmentError}
                     />
                   )}
                 </>

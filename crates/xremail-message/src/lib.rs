@@ -26,6 +26,7 @@
 //! 3. **顶层几乎都是 multipart**——只看顶层 `Content-Type` 看不到正文的
 //!    charset，必须**递归**拆解。
 
+pub mod attachment;
 pub mod body;
 pub mod charset;
 pub mod compose;
@@ -33,8 +34,10 @@ pub mod encoded_word;
 pub mod mime;
 pub mod transfer;
 
+pub use attachment::{AttachmentMeta, attachment_meta, filename_from_headers};
 pub use body::{
-    MessageError, ParsedHeaders, ParsedMessage, parse_addresses, parse_headers, parse_message,
+    MAX_ATTACHMENT_PARTS, MessageError, ParsedHeaders, ParsedMessage, parse_addresses,
+    parse_headers, parse_message,
 };
 pub use charset::{decode, decode_lossy, encoding_for_label, guess_encoding, normalize_label};
 pub use compose::{
@@ -43,5 +46,7 @@ pub use compose::{
 // 附件类型与领域模型共用**同一个定义**：领域层（xremail-core）与构建层
 // 各写一份的话，就得在中间加一层无意义的转换。
 pub use encoded_word::{decode_encoded_words, encode_header_value};
-pub use mime::{ContentType, HeaderMap, Part, parse_content_type, split_parts};
+pub use mime::{
+    ContentType, HeaderMap, Part, parse_content_type, split_parts, split_parts_with_paths,
+};
 pub use xremail_core::model::SendAttachment;

@@ -24,7 +24,9 @@ use std::sync::Arc;
 use tauri::Manager;
 
 use crate::service::scheduler::{AppConnector, TauriSink};
-use crate::service::{AccountService, ComposeService, MessageService, SyncService};
+use crate::service::{
+    AccountService, AttachmentService, ComposeService, MessageService, SyncService,
+};
 use crate::state::{AppState, Credentials, Services};
 
 /// 数据库文件名（位于数据目录下）。
@@ -70,6 +72,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             cmd::app_info,
+            cmd::attachment_limits,
             cmd::list_accounts,
             cmd::create_account,
             cmd::delete_account,
@@ -78,6 +81,10 @@ pub fn run() {
             cmd::list_messages,
             cmd::search_messages,
             cmd::open_message,
+            cmd::list_attachments,
+            cmd::download_attachment,
+            cmd::open_attachment,
+            cmd::save_attachment_as,
             cmd::save_credential,
             cmd::forget_credential,
             cmd::set_message_flag,
@@ -243,6 +250,13 @@ fn init_storage(app: &tauri::AppHandle) -> Result<AppState, Box<dyn std::error::
         Arc::new(crate::service::current_time_ms),
     );
 
+    // 附件服务：附件落到 `<data_dir>/attachments/…`（字节不进数据库、不进 IPC）。
+    let attachments = AttachmentService::new(
+        pool.clone(),
+        MessageService::new(pool.clone()),
+        data_dir.clone(),
+    );
+
     Ok(AppState::new(
         data_dir,
         Services {
@@ -250,6 +264,7 @@ fn init_storage(app: &tauri::AppHandle) -> Result<AppState, Box<dyn std::error::
             messages: MessageService::new(pool.clone()),
             sync,
             compose: ComposeService::new(pool.clone(), AccountService::new(pool.clone())),
+            attachments,
         },
         scheduler,
         credentials,

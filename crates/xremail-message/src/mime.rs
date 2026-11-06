@@ -138,23 +138,50 @@ impl Part {
 ///
 /// `multipart/*` 会按 `boundary` 递归拆开。
 pub fn split_parts(headers: &HeaderMap, body: &[u8]) -> Vec<Part> {
+    split_parts_with_paths(headers, body)
+        .into_iter()
+        .map(|(_, part)| part)
+        .collect()
+}
+
+/// 与 [`split_parts`] 相同，但**额外给出每个叶子的部件号**。
+///
+/// 部件号按 IMAP 的约定自 1 起：顶层唯一部件是 `1`，`multipart` 的第 2 段的
+/// 第 1 段是 `2.1`。附件下载靠它去取对应那一段的字节，
+/// 所以**这里的编号必须与渲染层的遍历顺序一致**。
+pub fn split_parts_with_paths(headers: &HeaderMap, body: &[u8]) -> Vec<(Vec<usize>, Part)> {
+    let mut out = Vec::new();
+    collect_parts(headers, body, &mut Vec::new(), &mut out);
+    out
+}
+
+/// 递归收集叶子部件，`position` 只对叶子有意义。
+fn collect_parts(
+    headers: &HeaderMap,
+    body: &[u8],
+    parent: &mut Vec<usize>,
+    out: &mut Vec<(Vec<usize>, Part)>,
+) {
     let content_type = parse_content_type(headers.get("Content-Type"));
 
     if content_type.is_multipart()
         && let Some(boundary) = content_type.boundary.as_deref()
     {
-        let mut out = Vec::new();
-        for (child_headers, child_body) in split_multipart(body, boundary) {
-            out.extend(split_parts(&child_headers, &child_body));
-        }
-        if out.is_empty() {
+        let children = split_multipart(body, boundary);
+        if children.is_empty() {
             // 拆不出来（boundary 不对）→ 整块当成一个部件。
-            return vec![make_part(headers, body, &content_type)];
+            out.push((parent.clone(), make_part(headers, body, &content_type)));
+            return;
         }
-        return out;
+        for (index, (child_headers, child_body)) in children.into_iter().enumerate() {
+            parent.push(index + 1);
+            collect_parts(&child_headers, &child_body, parent, out);
+            parent.pop();
+        }
+        return;
     }
 
-    vec![make_part(headers, body, &content_type)]
+    out.push((parent.clone(), make_part(headers, body, &content_type)));
 }
 
 /// 造一个叶子部件（解码传输编码）。

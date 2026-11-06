@@ -11,9 +11,16 @@
 
 use xremail_core::model::Address;
 
+use crate::attachment::{AttachmentMeta, attachment_meta};
 use crate::charset;
 use crate::encoded_word::decode_encoded_words;
-use crate::mime::{HeaderMap, Part, split_head_body, split_parts};
+use crate::mime::{HeaderMap, Part, split_head_body, split_parts_with_paths};
+
+/// 一封邮件最多认多少个附件部件。
+///
+/// 与发信侧的 `MAX_ATTACHMENTS`（5）不是一个概念：收信时对方想塞多少是多少，
+/// 这里只防「恶意邮件把解析吃爆」。1000 远超正常邮件，又小到不会撑爆内存。
+pub const MAX_ATTACHMENT_PARTS: usize = 1000;
 
 /// 解析失败。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -63,6 +70,12 @@ pub struct ParsedMessage {
     pub charset: Option<String>,
     /// 有附件。
     pub has_attachment: bool,
+    /// 附件部件的元数据（**不含字节**），按部件号顺序。
+    ///
+    /// 最多 [`MAX_ATTACHMENT_PARTS`] 条——这是**解析侧**的硬上限，
+    /// 防止一封塞了几万个 part 的邮件把内存吃满；超出的部分直接丢弃，
+    /// 上层靠「条数到了上限」判断要不要提示用户。
+    pub attachments: Vec<AttachmentMeta>,
     /// 解码时**出现过非法字节**（被替换成 U+FFFD）。
     ///
     /// 用来诊断「解码得对不对」：真邮箱里的邮件如果这里为 `true`，
@@ -98,7 +111,8 @@ fn parse_header_map(headers: &HeaderMap) -> ParsedHeaders {
 /// 解析一封邮件。
 pub fn parse_message(raw: &[u8]) -> Result<ParsedMessage, MessageError> {
     let (headers, body) = split_head_body(raw);
-    let parts = split_parts(&headers, &body);
+    let numbered = split_parts_with_paths(&headers, &body);
+    let parts: Vec<&Part> = numbered.iter().map(|(_, part)| part).collect();
 
     let mut parsed = ParsedMessage {
         headers: parse_header_map(&headers),
@@ -111,12 +125,32 @@ pub fn parse_message(raw: &[u8]) -> Result<ParsedMessage, MessageError> {
     // 多个候选时取**第一个**（服务器一般按「纯文本在前」排）。
     let plain: Option<&Part> = parts
         .iter()
+        .copied()
         .find(|part| part.content_type.mime_type == "text/plain");
     let html: Option<&Part> = parts
         .iter()
+        .copied()
         .find(|part| part.content_type.mime_type == "text/html");
 
-    parsed.has_attachment = parts.iter().any(Part::is_attachment);
+    parsed.has_attachment = parts.iter().any(|part| part.is_attachment());
+
+    // 附件元数据：只认 `Content-Disposition`，不看「内容看起来像不像文件」。
+    // 有序遍历，保证 `part_number` 与 IMAP 的编号一致。
+    for (path, part) in &numbered {
+        if parsed.attachments.len() >= MAX_ATTACHMENT_PARTS {
+            break;
+        }
+        let size = i64::try_from(part.content.len()).unwrap_or(i64::MAX);
+        if let Some(meta) = attachment_meta(
+            &part.headers,
+            Some(path.as_slice()),
+            &part.content_type.mime_type,
+            size,
+            part.transfer_encoding.as_deref(),
+        ) {
+            parsed.attachments.push(meta);
+        }
+    }
 
     if let Some(part) = plain {
         let charset = part.content_type.charset.clone();

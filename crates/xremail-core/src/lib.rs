@@ -9,6 +9,8 @@ pub mod attachment;
 pub mod error;
 pub mod event;
 pub mod html;
+pub mod inline_error;
+pub mod inline_image;
 pub mod model;
 
 pub use address::{
@@ -21,6 +23,11 @@ pub use attachment::{
 pub use error::{AppError, AppResult};
 pub use event::AppEvent;
 pub use html::{html_to_text, sanitize_html};
+pub use inline_error::InlineImageError;
+pub use inline_image::{
+    InlineImage, MAX_INLINE_IMAGE_BYTES, MAX_INLINE_TOTAL_BYTES, Rewrite, SAFE_IMAGE_CLOSE,
+    SAFE_IMAGE_OPEN, inline_replacements, rewrite_inline_images,
+};
 pub use model::{
     Account, Address, Attachment, AuthKind, Folder, Message, MessageBody, MessageFlags,
     ProviderKind, ServerConfig, SmtpAuth, SyncMode, SyncState, TlsMode,

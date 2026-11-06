@@ -14,6 +14,7 @@
 //! [ARCHITECTURE §1.6](../../../../../docs/ARCHITECTURE.md)）。
 
 pub mod account;
+pub mod attachment;
 pub mod compose;
 pub mod credential;
 pub mod message;
@@ -22,6 +23,7 @@ pub mod sent_copy;
 pub mod sync;
 
 pub use account::AccountService;
+pub use attachment::{AttachmentDownload, AttachmentService};
 pub use compose::{ComposeService, DraftDto, DraftInput, SendResult, SendResultState};
 pub use credential::CredentialService;
 pub use message::{FolderDto, MessageFlag, MessageService, SearchHitDto};

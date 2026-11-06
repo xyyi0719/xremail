@@ -10,11 +10,12 @@
  *    交互测试最常见的坑就是「测过了但控制台在报警」，这里直接把它变成红灯。
  *
  * 另外把 Tauri 的文件选择对话框插件 mock 掉：真插件会拉起原生窗口，
- * 单元测试里没法用。
+ * 单元测试里没法用。`opener` 同理——它会真的去开系统浏览器 / 文件管理器。
  */
 import "@testing-library/jest-dom/vitest";
 import { afterEach, beforeEach, vi } from "vitest";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, save } from "@tauri-apps/plugin-dialog";
+import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 
 // 不开这个开关，React 19 的 `act(...)` 会警告「当前测试环境不支持 act」。
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
@@ -25,6 +26,13 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
   message: vi.fn(async () => undefined),
   ask: vi.fn(async () => false),
   confirm: vi.fn(async () => false),
+}));
+
+// 交给系统的两个出口：开链接、开文件。真实现会拉起外部程序。
+// 用例直接断言 `vi.mocked(openUrl)` / `vi.mocked(openPath)` 收到了什么。
+vi.mock("@tauri-apps/plugin-opener", () => ({
+  openUrl: vi.fn(async () => undefined),
+  openPath: vi.fn(async () => undefined),
 }));
 
 interface ConsoleRecord {
@@ -41,6 +49,14 @@ beforeEach(() => {
   // 文件选择框默认「一个都没选」：用例需要选文件时自己改返回值。
   vi.mocked(open).mockReset();
   vi.mocked(open).mockResolvedValue(null);
+  vi.mocked(save).mockReset();
+  vi.mocked(save).mockResolvedValue(null);
+
+  // 交给系统的动作默认「成功且什么都不做」，用例可以改返回值或断言调用。
+  vi.mocked(openUrl).mockReset();
+  vi.mocked(openUrl).mockResolvedValue(undefined);
+  vi.mocked(openPath).mockReset();
+  vi.mocked(openPath).mockResolvedValue(undefined);
 
   const errorSpy = vi
     .spyOn(console, "error")

@@ -13,6 +13,7 @@ import type {
   DraftInput,
   SendResult,
 } from "../types";
+import * as ATTACHMENT_LIMITS from "../attachmentLimits";
 
 interface Props {
   /** 用哪个账户发信（写进草稿的 accountId）。 */
@@ -69,14 +70,10 @@ interface PendingConfirm {
 /** 自动存草稿的防抖间隔（毫秒）。 */
 const AUTOSAVE_DELAY_MS = 800;
 
-/** 单个附件大小上限（10 MiB）。 */
-const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
-
-/** 一封信的附件个数上限。 */
-const MAX_ATTACHMENTS = 5;
-
-/** 一封信的附件总大小上限（20 MiB）。 */
-const MAX_TOTAL_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+// 附件上限**不在这里定义**：后端是唯一事实来源，
+// 由 `attachment_limits` 命令在应用启动时下发（见 `../attachmentLimits`）。
+// 这个文件里不写任何上限数字——曾经前端写 20 MiB、后端 18 MiB，
+// 用户在前端能过、点发送才被拒。
 
 /**
  * 可执行 / 脚本类扩展名黑名单（**不含点**，小写）。
@@ -196,28 +193,51 @@ function formatBytes(bytes: number): string {
 /**
  * 附件上限检查（前端提前拦一道；后端也会强制）。
  *
+ * 上限**从后端拿**（[`ATTACHMENT_LIMITS.limits`]，应用启动时预热）。
+ * 还没拿到就跳过这一道：后端会在保存草稿 / 发信时用同一组常量再校验，
+ * 前端这里只是让用户早点看到错误。
+ *
  * 注意：**新选的文件大小前端拿不到**（`open()` 只给路径），
  * 所以这里只能拦住「个数」与「已知大小」的附件；真实大小由后端读文件时校验。
  */
 function checkAttachmentLimits(attachments: DraftAttachment[]): string | null {
-  if (attachments.length > MAX_ATTACHMENTS) {
-    return `一封信最多 ${MAX_ATTACHMENTS} 个附件，现在有 ${attachments.length} 个`;
+  const limits = ATTACHMENT_LIMITS.limits();
+  if (!limits) {
+    return null;
+  }
+  const labels = ATTACHMENT_LIMITS.limitLabels(limits);
+  if (attachments.length > limits.maxAttachmentsPerMessage) {
+    return `一封信最多 ${labels.count}附件，现在有 ${attachments.length} 个`;
   }
   const tooBig = attachments.find(
-    (one) => one.size > MAX_ATTACHMENT_BYTES,
+    (one) => one.size > limits.maxAttachmentBytes,
   );
   if (tooBig) {
-    return `附件「${tooBig.name}」超过单个附件上限（10 MiB）`;
+    return `附件「${tooBig.name}」超过单个附件上限（${labels.single}）`;
   }
   const total = attachments.reduce((sum, one) => sum + one.size, 0);
-  if (total > MAX_TOTAL_ATTACHMENT_BYTES) {
-    return `附件总大小超过上限（20 MiB）`;
+  if (total > limits.maxTotalAttachmentBytes) {
+    return `附件总大小超过上限（${labels.total}）`;
   }
   return null;
 }
 
-/** 表单是不是完全空的（空草稿不值得往库里写）。 */
-function isEmptyForm(form: ComposeForm): boolean {
+/**
+ * 附件区下面那行提示文字。
+ *
+ * 上限从后端来（[`ATTACHMENT_LIMITS.limits`]）；还没预热好就不要编数字，
+ * 只说「以后端为准」。
+ */
+function attachmentHintText(): string {
+  const limits = ATTACHMENT_LIMITS.limits();
+  if (!limits) {
+    return "附件的大小与个数以保存时后端的校验为准；";
+  }
+  const labels = ATTACHMENT_LIMITS.limitLabels(limits);
+  return `单个附件不超过 ${labels.single}，一封信最多 ${labels.count}，合计不超过 ${labels.total}；`;
+}
+
+/** 表单是不是完全空的（空草稿不值得往库里写）。 */function isEmptyForm(form: ComposeForm): boolean {
   return (
     form.to.trim() === "" &&
     form.cc.trim() === "" &&
@@ -1136,8 +1156,7 @@ function ComposePanel({ accountId, accountEmail, onClose }: Props) {
         </div>
       </div>
 
-      <p className="compose-hint">
-        单个附件不超过 10 MiB，一封信最多 5 个，合计不超过 20 MiB；
+      <p className="compose-hint">{attachmentHintText()}
         可执行文件与脚本不能作为附件。实际大小以保存时后端的校验为准。
       </p>
 
