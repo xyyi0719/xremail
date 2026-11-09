@@ -22,12 +22,15 @@
 3. 应用数据目录里建出了 `xremail.db`；
 4. `_sqlx_migrations` 全部成功（`success = 1`），且条数与 `migrations/` 里的
    `.sql` 文件数一致——**这条能抓到「迁移写错但没人发现」**；
-5. 日志里没有 `panicked`。
+5. 日志里没有 `panicked`；
+6. **托盘图标真的渲染出来了**：`$XDG_RUNTIME_DIR/tray-icon/` 下有 PNG，
+   且日志里没有「创建托盘图标失败」。这一步需要一个**可写的**
+   `XDG_RUNTIME_DIR`——脚本自己建一个传给应用（见下）。
 
 不验：
 * GUI 的外观与交互（Xvfb 里没有真实输入，也没有人工判断）；
-* 托盘图标（Xvfb 下 libayatana-appindicator 拿不到可写路径，会 warn 跳过——
-  这是**已知**的环境限制，不算失败）；
+* 托盘的**外观与点击行为**（Xvfb 里没有真实输入；但**图标是否渲染成功**
+  是可以验的——见下面第 6 步）；
 * IMAP/SMTP 真实收发（需要真实账号）。
 
 ## 用法
@@ -141,9 +144,17 @@ def main() -> None:
         print("4. 在 Xvfb 里启动（40 秒超时，预期是被 timeout 杀掉）")
         data_dir = workdir / "data"
         data_dir.mkdir()
+        # 托盘（libayatana-appindicator）会把图标渲染成 PNG 写到
+        # `$XDG_RUNTIME_DIR/tray-icon/`。默认的 `/run/user/<uid>` 在沙箱/容器里
+        # 常常是**只读**的，于是托盘建不出来、只打一条 warn——
+        # 那不是应用的问题，是运行环境没有给一个可写的地方。
+        runtime_dir = workdir / "runtime"
+        runtime_dir.mkdir()
+        runtime_dir.chmod(0o700)  # XDG 规范要求 0700，否则 appindicator 会拒绝
         env = {
             **os.environ,
             "XDG_DATA_HOME": str(data_dir),
+            "XDG_RUNTIME_DIR": str(runtime_dir),
             "RUST_LOG": "info",
             "APPIMAGE_EXTRACT_AND_RUN": "1",
             # 托盘在 Xvfb 下拿不到可写路径，会 warn 后跳过；不是失败。
@@ -197,7 +208,30 @@ def main() -> None:
             )
         ok(f"{len(rows)} 条迁移全部成功（与 migrations/ 的 {expected} 个文件一致）")
 
-        print("6. 关键表都在")
+        print("6. 托盘图标（libayatana-appindicator）")
+        tray_failed = "创建托盘图标失败" in log
+        icons = list((runtime_dir / "tray-icon").glob("*.png")) if (
+            runtime_dir / "tray-icon"
+        ).is_dir() else []
+        if tray_failed:
+            fail(
+                "托盘创建失败（日志里有「创建托盘图标失败」）。\n"
+                + "\n".join(l for l in log.splitlines() if "托盘" in l)
+            )
+        if not icons:
+            fail(
+                "没有在 $XDG_RUNTIME_DIR/tray-icon/ 下找到渲染出来的图标 PNG。\n"
+                f"运行目录内容：{list(runtime_dir.iterdir())}"
+            )
+        # 图标像素尺寸也能读出来更硬，但 stdlib 里没有 PNG 解析器；
+        # 文件存在 + 非空 + 有 PNG magic 就够了。
+        icon = icons[0]
+        head = icon.read_bytes()[:8]
+        if head != b"\x89PNG\r\n\x1a\n":
+            fail(f"{icon.name} 不是合法的 PNG（开头是 {head!r}）")
+        ok(f"{icon.name}（{icon.stat().st_size} 字节，PNG）")
+
+        print("7. 关键表都在")
         tables = {
             name
             for (name,) in connection.execute(

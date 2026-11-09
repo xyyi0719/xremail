@@ -34,7 +34,7 @@
 //! 「登录后后台同步已经在跑」，这个在当前实现下已经满足（窗口开着，
 //! 同样是后台同步在跑）。
 
-use tauri::menu::MenuBuilder;
+use tauri::menu::{CheckMenuItemBuilder, Menu, MenuBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Manager, Runtime};
 
@@ -56,12 +56,31 @@ pub enum TrayAction {
     SyncNow,
     /// 真退出进程（经 `RunEvent::Exit`，不是 `process::exit`）。
     Quit,
+    /// 切换「开机自启」。
+    ///
+    /// **没有「打开」和「关闭」两个菜单项**：那会让菜单长得像「状态指示器」，
+    /// 用户点哪一个都得先自己判断当前是开还是关。一个勾选项，点一下就切换——
+    /// 状态由菜单的勾显示，读的是系统里**真**的状态（不是内存里的布尔值）。
+    ToggleAutostart,
 }
 
 /// 菜单 id 常量。菜单项与回调各引用一次，不写字面量。
 pub const MENU_SHOW: &str = "tray-show";
 pub const MENU_SYNC_NOW: &str = "tray-sync-now";
 pub const MENU_QUIT: &str = "tray-quit";
+pub const MENU_AUTOSTART: &str = "tray-autostart";
+
+/// 托盘菜单的句柄。
+///
+/// 为什么需要它：`TrayIcon` **不暴露 `menu()`**，而「开机自启」那一项的勾
+/// 得在切换之后改。存一份 `Menu` 是唯一能拿到子项的路子。
+///
+/// 用泛型 `R` 而不是写死 `Wry`：`install` 本身是泛型的，测试用的 `MockRuntime`
+/// 也要能走到这条路径——写死 Wry 的话，mock 下 `try_state` 永远拿不到，
+/// 这类「只在 mock 下静默失效」的分支最难发现。
+pub struct TrayMenuState<R: Runtime> {
+    menu: Menu<R>,
+}
 
 impl TrayAction {
     /// 菜单 id → 动作。未知 id（不是我们的菜单项）→ `None`，**不猜**。
@@ -73,6 +92,7 @@ impl TrayAction {
             MENU_SHOW => Some(Self::Show),
             MENU_SYNC_NOW => Some(Self::SyncNow),
             MENU_QUIT => Some(Self::Quit),
+            MENU_AUTOSTART => Some(Self::ToggleAutostart),
             _ => None,
         }
     }
@@ -123,9 +143,22 @@ pub fn show_main_window<R: Runtime>(app: &AppHandle<R>) {
 /// * **macOS**：左键单击会先弹菜单（除非 `show_menu_on_left_click(false)`），
 ///   所以单击也要走菜单里的「显示主窗口」。
 pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
+    // 开机自启那一项是**勾选项**：进来时先读系统里的真实状态，别让它一开始就说谎。
+    // 读不到就当作没开（理由见 [`refresh_autostart_check`]）。
+    let autostart_enabled = {
+        use tauri_plugin_autostart::ManagerExt as _;
+        app.autolaunch().is_enabled().unwrap_or(false)
+    };
+    // 勾选项单独建：`MenuBuilder` 没有能带初始勾选状态的 `check()`，
+    // 而我们要的正是「一打开菜单，勾就是对的那个」。
+    let autostart = CheckMenuItemBuilder::with_id(MENU_AUTOSTART, "开机自启")
+        .checked(autostart_enabled)
+        .build(app)?;
     let menu = MenuBuilder::new(app)
         .text(MENU_SHOW, "显示主窗口")
         .text(MENU_SYNC_NOW, "立即同步")
+        .separator()
+        .item(&autostart)
         .separator()
         .text(MENU_QUIT, "退出")
         .build()?;
@@ -160,6 +193,15 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     }
 
     builder.build(app)?;
+    // 把勾选项的句柄交给应用状态：`TrayIcon` 不暴露 `menu()`，
+    // 之后要改这一项的勾（[`refresh_autostart_check`]）就只能靠这个句柄。
+    // 用 `manage` 而不是存进 `AppState`：它只属于托盘，和业务状态无关；
+    // 重复 `manage` 同一类型会 panic，所以先 `try_manage`——托盘只建一次，
+    // 但 `install` 失败后重试的路径不该因为这条 panic。
+    let _ = app.manage(TrayMenuState { menu: menu.clone() });
+    // 建好之后立刻把勾刷成真实状态：上面那份是**建菜单那一刻**读的，
+    // 中间可能被用户在别处改过（概率低，但重读一次是免费的）。
+    refresh_autostart_check(app);
     Ok(())
 }
 
@@ -203,7 +245,72 @@ fn run_action<R: Runtime>(app: &AppHandle<R>, action: TrayAction) {
         // `RunEvent::Exit`，`Scheduler::shutdown` 才跑得到。换成
         // `std::process::exit(0)` 就等于悄悄丢掉那段收尾。
         TrayAction::Quit => app.exit(0),
+        TrayAction::ToggleAutostart => toggle_autostart(app),
         TrayAction::SyncNow => {}
+    }
+}
+
+/// 切换开机自启，然后把菜单里的勾**按系统的真实状态**重画一遍。
+///
+/// ## 为什么读系统状态而不是自己记一个 bool
+///
+/// 用户完全可以在启动器设置里、或者 `systemctl --user disable` 把它关掉，
+/// 而应用不知道。自记一个 bool 会和真实状态分叉，于是菜单上的勾开始说谎。
+/// 这个插件的 `is_enabled()` 问的就是系统本身，所以这里以它为准。
+///
+/// ## 为什么失败只记日志
+///
+/// 托盘菜单没有能弹提示的地方。失败最坏的结果是「勾没变」——用户再点一下就知道了。
+/// 在托盘回调线程里 panic 会直接带崩进程，那比「点了没反应」糟得多。
+fn toggle_autostart<R: Runtime>(app: &AppHandle<R>) {
+    use tauri_plugin_autostart::ManagerExt as _;
+
+    let manager = app.autolaunch();
+    // 先问当前状态，再取反。`is_enabled` 失败时不去猜：猜错就会把
+    // 用户已经打开的自启关掉（或者反过来），那是一次没人要的状态变更。
+    let enabled = match manager.is_enabled() {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            tracing::warn!(%error, "托盘「开机自启」：读不到当前状态，不切换");
+            return;
+        }
+    };
+
+    let result = if enabled {
+        manager.disable()
+    } else {
+        manager.enable()
+    };
+    if let Err(error) = result {
+        tracing::warn!(%error, enabled, "托盘「开机自启」：切换失败");
+        return;
+    }
+    tracing::info!(now_enabled = !enabled, "托盘「开机自启」已切换");
+    refresh_autostart_check(app);
+}
+
+/// 把「开机自启」那一项的勾刷成系统的真实状态。
+///
+/// 建菜单时调一次（用户打开菜单前就该是对的），切换后再调一次。
+/// 读不到状态就把勾**取消**：显示成「没开」比显示成一个可能过期的「开了」诚实，
+/// 猜错方向最多是用户多点一下，不会让用户以为自启是开的、重启后发现没有。
+fn refresh_autostart_check<R: Runtime>(app: &AppHandle<R>) {
+    use tauri_plugin_autostart::ManagerExt as _;
+
+    let enabled = app.autolaunch().is_enabled().unwrap_or(false);
+    // `TrayIcon` 不暴露 `menu()`，所以句柄得自己存着——建菜单时放进
+    // 应用状态里（见 [`install`]）。
+    let Some(state) = app.try_state::<TrayMenuState<R>>() else {
+        return;
+    };
+    let Some(item) = state.menu.get(MENU_AUTOSTART) else {
+        return;
+    };
+    let Some(check) = item.as_check_menuitem() else {
+        return;
+    };
+    if let Err(error) = check.set_checked(enabled) {
+        tracing::warn!(%error, "托盘「开机自启」：更新勾选状态失败");
     }
 }
 
@@ -219,6 +326,10 @@ mod tests {
             Some(TrayAction::SyncNow)
         );
         assert_eq!(TrayAction::from_menu_id(MENU_QUIT), Some(TrayAction::Quit));
+        assert_eq!(
+            TrayAction::from_menu_id(MENU_AUTOSTART),
+            Some(TrayAction::ToggleAutostart)
+        );
     }
 
     #[test]
@@ -237,6 +348,8 @@ mod tests {
         assert!(TrayAction::SyncNow.wakes_sync());
         assert!(!TrayAction::Show.wakes_sync());
         assert!(!TrayAction::Quit.wakes_sync());
+        // 切换开机自启只是改一个系统项，不该顺带开一轮全网同步。
+        assert!(!TrayAction::ToggleAutostart.wakes_sync());
     }
 
     #[test]
