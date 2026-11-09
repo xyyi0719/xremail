@@ -596,8 +596,46 @@ Gmail 将来有需求再开独立决策：授权流程、scope、个人使用与
     `gnome-keyring-daemon`，也无法安装）。等桌面环境或装好守护进程后用
     `XREMAIL_SECRET_SERVICE_PROBE=1 dbus-run-session -- <测试二进制>` 跑一遍即可
 - [ ] 托盘（libayatana-appindicator）、通知（D-Bus）、开机自启（XDG autostart .desktop）
-  - 托盘代码是平台无关的，**编译**过（需要 `libayatana-appindicator3` 才能链上），
-        但 Linux 上 `TrayIconEvent` 不发，左键「显示窗口」不生效；**运行未验证**
+  - [x] **托盘在 Linux 上真的建出来了**（2026-11-09，Xvfb 实测）
+    - 此前这条写的是「运行未验证」。实测后修正：**托盘本身是能工作的**，
+      之所以一直看到「创建托盘图标失败」，是因为
+      `libayatana-appindicator` 要把图标渲染成 PNG 写到
+      **`$XDG_RUNTIME_DIR/tray-icon/`**，而这台机器的 `/run/user/1000`
+      在沙箱下**只读**。给一个可写的 `XDG_RUNTIME_DIR` 之后：
+      目录里出现 `tray-icon-main-0.png`（933 字节，`file` 确认是
+      32×32 RGBA PNG），日志里不再有那条 warn
+    - 已写进 `scripts/verify_linux_runtime.py` 作为断言（**变异测试**：
+      把 `XDG_RUNTIME_DIR` 指回只读路径 → 脚本立刻报「托盘创建失败」）。
+      deb 与 AppImage 两种产物都验过
+    - **仍然成立的限制**：Linux 上 `TrayIconEvent` **不发**（libayatana-appindicator
+      只给菜单，不给左键事件），所以「左键单击显示窗口」在 Linux **确实不生效**，
+      要用菜单里的「显示主窗口」。这是平台能力，不是缺省实现
+    - **未验证**：托盘的**外观与点击行为**（Xvfb 里没有真实输入，也没有
+      面板/任务栏去承载它），以及「关窗口 → 退到托盘 → 从菜单叫回来」这条
+      交互闭环
+  - [ ] **通知（D-Bus）**：`tauri_plugin_notification` 已注册，但
+        **全仓没有任何地方调用它**（Rust 侧只有 `lib.rs:48` 的 `.plugin(...)`，
+        前端也没有）。所以现在应用**从不发通知**——包括「新邮件到了」。
+        要做的不只是接线：还要先定「什么时候该通知」（哪些文件夹、是否只通知
+        INBOX、前台时要不要抑制、点通知做什么），这是产品决策，不是实现细节
+  - [x] **开机自启有了开关**（2026-11-09）：托盘菜单里新增**勾选项**「开机自启」
+    - 之前 `tauri_plugin_autostart` 只注册、**没有任何 UI 去开关它**——等于这个功能不存在
+    - 做成**一个勾选项**而不是「打开/关闭」两项：后者会让菜单长得像状态指示器，
+      用户点哪一个都得先自己判断当前是开还是关
+    - 勾的**状态读系统本身**（`is_enabled()`），不在内存里记 bool：用户可以在
+      启动器设置里、或 `systemctl --user disable` 把它关掉，自记的 bool 会和
+      真实状态分叉，菜单上的勾就开始说谎
+    - `is_enabled()` 读失败时**不切换**（猜错就会把用户已经打开的自启关掉）；
+      只是让勾显示为未勾选（显示成「没开」最多让用户多点一下，比显示一个
+      过期的「开了」诚实）
+    - 菜单项句柄存进 `TrayMenuState<R>`（泛型，不写死 `Wry`——写死的话
+      `MockRuntime` 下永远拿不到，这类「只在 mock 下静默失效」的分支最难发现）
+    - **实测到什么程度**：`TrayAction::from_menu_id` 与 `wakes_sync` 的单测覆盖了
+      新菜单项（切换自启**不该**顺带开一轮全网同步）；托盘在 Xvfb 下能建出来，
+      启动时读 `is_enabled()` 不报错
+    - **未验证**：点菜单项之后 `~/.config/autostart/*.desktop` **真的被写出来**
+      （Xvfb 下点不了菜单；我试过用一个独立探针程序直接调插件，没编过，
+      **没有把"应该能行"写成结论**）
 - [x] **打包链路：deb 与 AppImage**（2026-11-09）
   - `cd apps/shell && npm run tauri build -- --bundles deb` → **7.7 MiB**，
     `--bundles appimage` → **87.2 MiB**（自带依赖；二进制本身 17.4 MiB）

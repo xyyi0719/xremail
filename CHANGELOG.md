@@ -7,6 +7,31 @@
 ## [Unreleased]
 
 ### Added
+- **T10 的最后一块：IMAP 响应解析（服务器 → 客户端）的属性测试 + 变异测试**（2026-11-09）
+  - 新增两个测试文件，与前三个属性测试同一套做法（固定种子 SplitMix64、每条不变量一个 `#[test]`、
+    断言里打印输入与输出）：
+    - `crates/xremail-protocol-imap/tests/imap_parsing_properties.rs` **12 条**（纯函数、跑得快）：
+      `FETCH` 属性一一对应、`BODY[…]` 落到**哪个**字段、`LIST` 属性→角色（属性优先、不认识的属性不认角色）、
+      IDLE 推送只有「有变化 / BYE 报错」两种结论、`COPYUID` 端点与展开上限、`APPENDUID` 闭区间、
+      以及假服务器几个解析器的自洽性（`Command` / `SequenceSet` / `parse_fetch` / `parse_store` / `search`）
+    - `crates/xremail-protocol-imap/tests/response_properties.rs` **12 条**（真 TLS 端到端）：
+      `EXAMINE` 缺 `[UIDVALIDITY]` 时是 `None` 而不是 0、`[HIGHESTMODSEQ]`/`[UNSEEN]`/`[UIDNEXT]` 照收、
+      `COPYUID` 按下标对应 / 长短不一不硬套 / 展开有上限、没有 `COPYUID` 时源集合退回入参（排序去重）、
+      `NO` / `BAD` / 未知状态一律明确报错（`[MODIFIED]` 单独成类）、**没有结局就挂住而不是报成功**
+  - 为了让「服务器说了一句形状不对的话」能在线路上造出来，`xremail-testkit` 新增两个**测试专用**故障：
+    `Fault::RespondWith`（换掉完成响应）与 `Fault::InjectUntagged`（在数据与结局之间插一行原文）。
+    既有故障语义与 `handle_command` 一行未动
+  - 为去掉「每条样本起一台 TLS 服务器」的开销，`command` / `transfer` / `append` / `idle` 里
+    六个私有解析函数改为 `pub`（只加可见性 + 文档，函数体与调用方一字未动）
+  - **变异测试 18 个全部被捕获**（`end-1`、展开少一个、上限放大、去掉长度检查、按值查映射、
+    不认 BYE、不认识的属性认成 trash、见到 untagged 就收工、`BODY[TEXT]` 落错字段、序列集开区间、
+    假服务器放宽 `STORE` / 取件项括号 / 把不认识的搜索键当 `ALL` 等），细节见
+    [ISSUES_AND_RISKS §6](docs/ISSUES_AND_RISKS.md) 与 [TESTING_STRATEGY §5.1.1](docs/TESTING_STRATEGY.md)
+  - **钉住了一处已知残余**（不是新缺陷）：`COPYUID` 的源、目标两侧各自被截到同一个上限时长度**恰好相等**，
+    `has_uid_mapping()` 会把这份被截断的映射当成可用的一对一映射
+  - 顺带坐实：async-imap 的 `APPEND` 在**它自己的响应解析**里读 `[APPENDUID …]`，完成响应形状认不出时
+    `append_message` 会**挂住**——调用方的超时不是可选项
+  - 用例数 **1062 → 1086**（`cargo test --workspace -- --list`，含 1 个 `#[ignore]`）
 - **WebKitGTK 上的 HTML 隔离实测：本地手工验收工具 `scripts/webkit_sandbox_probe.py`**（2026-11-09，R06 / P5-L）
   - 在 `xvfb-run` 起的**真实 WebKitGTK 2.52.6**（`WebKit2.WebView`）里，把 `tauri.conf.json` 的 CSP **原文**
     放进页面，把**真消毒器**（Rust `sanitize_html`，经 `rustc` 编成的小 CLI 调用）的输出与若干
