@@ -7,6 +7,101 @@
 ## [Unreleased]
 
 ### Added
+- **Android PoC 第一轮：应用第一次能以 Android APK 的形式被构建出来**（2026-11-09，P4 / R08）
+  - `npx tauri android init` 生成 `apps/shell/src-tauri/gen/android/`（此前 `gen/` 下只有 `schemas/`）。
+    **整个 `gen/` 目录本来就被根 `.gitignore` 忽略**，构建产物（`app/build`、`.gradle`、`jniLibs`）
+    不会进 `git status`——所以没有提交任何生成物，也没有为此改 `.gitignore`
+  - `npx tauri android build --debug --target aarch64` **真的产出了 APK**：
+    `app/build/outputs/apk/universal/debug/app-universal-debug.apk`（266,388,896 字节，
+    `com.xremail.app`、minSdk 24 / targetSdk 37、`lib/` 只有 `arm64-v8a`）。
+    debug 带完整调试信息所以特别大；作为对照**也量了 release**：
+    `npx tauri android build --target aarch64 --apk` → `app-universal-release-unsigned.apk`
+    **14,869,199 字节 ≈ 14.2 MiB**（未签名，要装得先配签名）
+  - **本仓库 9 个 crate 全部在 `aarch64-linux-android` 上编过**，连带 `sqlx` 的 `sqlite-bundled`
+    （自带的 C 源码走 NDK clang）、`ring`、`async-imap`、`tokio-rustls`、`tauri`/`wry`/`tao`。
+    **但只是编过，没有在任何设备上加载过**
+  - 前端资源是**内嵌进 `.so`** 的（能在 `.so` 里找到 `dist/assets/index-*.css/js`），
+    APK 的 `assets/` 下只有 `tauri.conf.json`
+  - `tauri.conf.json`、`AndroidManifest.xml`、`build.gradle.kts` **一个字没改**——
+    `cargo-ndk` 不需要往配置里塞东西，Tauri 2.12 的默认工程直接就能出包
+- **两条「Android 上会怎样」的事实被坐实**（静态证据，不是运行结论）
+  - **托盘确实不在 Android 构建里**：`tray` 模块是 `#[cfg(desktop)]`，打进 APK 的 `.so` 里
+    `xremail_shell_lib::tray` 的符号**一个都没有**
+  - **平台钥匙串在 Android 上是桩**：`platform_default_store()` 在非 Windows 上是
+    `UnsupportedSecretStore`，产物 `.so` 里查得到它的文案「只有 Windows 凭据管理器已适配」、
+    查不到 `CredWriteW`。后果是**授权码和 DKIM 私钥在 Android 上都写不进去**，每次冷启动要重填
+    （R19 的 Android 侧）。Keystore 的适配**只写了路线**（ROADMAP P4），**没有实现**
+- **CI 的 `Rust (ubuntu-latest)` 重新变绿：DKIM 用例不再依赖真实钥匙串**（2026-11-09）
+  - 自 D1 DKIM 起，ubuntu job 的 `Test` 一步**一直是红的**：6 条用例（`dkim_service.rs`
+    4 条 + `command_ipc.rs` 2 条）要把私钥写进平台钥匙串，而钥匙串只在 Windows 上有实现，
+    其它平台是「如实报错」的桩。Windows job 是绿的，所以问题一直只出现在 ubuntu 上
+  - 钥匙串改为**可注入**（`secrets/mod.rs` 的进程级覆盖槽 + `secrets/test_hooks.rs` 的
+    串行闸与 `Drop` 自动还原）；未注入时行为与原来逐字一致。6 条用例改为装内存钥匙串，
+    **断言没有放宽**，反而更严：钥匙串里存的必须是原样 PEM、`clear` 之后条目必须真的没了、
+    被拒的密钥与非法 selector 一条都不许写进去
+  - 顺带修掉一个此前没人注意的副作用：那 4 条用例在 Windows 上**真的往你的凭据管理器里
+    写了 `xremail:dkim:<随机 uuid>` 条目，而且从不清理**
+- **凭据服务的失败语义有了证据**（2026-11-09，R07 的「仍待定」）
+  - 新增 `apps/shell/src-tauri/tests/credential_service.rs` 13 条：钥匙串里存什么、
+    库里**只有不透明引用**（逐表逐列扫全库证明库里没有授权码明文）、没有引用时
+    **不打扰**钥匙串、钥匙串故障与「没保存过」**分清**、保存失败时 `secret_ref`
+    **不被写脏**、删除幂等、非 Windows 默认实现**不静默降级**
+- **「删除 = 进垃圾箱」不再靠文件夹名猜**（2026-11-09，R04 残余）
+  - 根因是**结论没地方放**：协议层早就按 RFC 6154 认出了 `\Trash`（服务器宣告了就用
+    宣告的），但 `folder` 表没有 role 列，同步一结束那个结论就丢了，删除时只能重新
+    拿文件夹名去比 `Deleted Messages` / `已删除` 之类。服务器把垃圾箱叫 `Rubbish`
+    或「回收站」时猜不出来，删除就退化成**就地标删**（不可撤销）
+  - 新迁移 `crates/xremail-store/migrations/0010_folder_role.sql`：`folder.role TEXT`
+    可空，`CHECK` 限定为 `inbox`/`sent`/`drafts`/`trash`/`junk`/`archive`/`flagged`/`all`
+    （与 `folders.rs` 实际产出的取值一致），外加按账户的部分索引。
+    **不给默认值**：`NULL` 的语义是「**还不知道**」，不是「没有垃圾箱」——
+    老库升级上来的行、以及服务器没宣告属性且名字也认不出的文件夹都是 `NULL`
+  - 同步每轮把 `LIST` 的角色写进库（`xremail-sync/src/sync.rs`），
+    删除时按「库里的 `trash` 角色 → `role` 为 `NULL` 时按文件夹名兜底 → 都不行就地标删」
+    降级（`transfer_push::trash_candidates`）。库里角色**已知且不是** `trash` 时，
+    名字再像垃圾箱也不算；当前文件夹自己永远排除在外
+  - 老库升级后还没同步过一轮的账户**仍然靠名字兜底**，删除不会因为升级突然变成
+    不可撤销的；同步一次之后才完全按角色走
+  - `Folder` 新增 `role: Option<String>` 与 `is_trash()`（`xremail-core`）。
+    构造 `Folder` 的代码需要补 `role: None`（仓库内已全部补齐）
+  - 迁移的已知限制（写进了迁移注释）：SQLite 没有 `ALTER … ADD COLUMN IF NOT EXISTS`，
+    `CASE` 也决定不了语句是否执行，所以「同一段迁移可重复应用」在 SQL 层做不到；
+    正常升级路径由 `_sqlx_migrations` 记账保证只跑一次，手动重放会**明确报
+    `duplicate column name` 且已有数据原样保留**（有用例钉住）
+（2026-11-09，P4 / `apps/shell/src-tauri/src/tray.rs`）
+  - 以前**关掉主窗口就等于退出进程**，后台同步（`Scheduler`）跟着停掉——不盯着
+    界面的那段日子里一封新邮件都不会同步，开机自启也名存实亡；现在**关闭窗口是退到
+    托盘**：窗口隐藏，进程与后台同步继续跑
+  - 托盘菜单三项：**显示主窗口** / **立即同步** / **退出**；左键单击也显示并聚焦
+    主窗口，和「第二次启动」的单实例行为走同一个入口（藏起来的窗口会先被 `show`）
+  - **「立即同步」**对所有已调度账户逐个叫醒一轮（`service::scheduler::wake_all`），
+    复用调度器自己的 `wake`，不自建一套同步
+  - **「退出」是真退出**：`app.exit(0)` → `RunEvent::Exit` → `Scheduler::shutdown()`。
+    刻意不用 `std::process::exit`——它不发 `RunEvent::Exit`，那段收尾会变成死代码，
+    退出时 actor 还在 `IDLE` 或写库，未提交的写操作就停在 `running`
+  - 只开 tauri 自己的 `tray-icon` feature，**没有新增第三方依赖**（`Cargo.lock` 未变）；
+    托盘只在桌面端创建，Android 上不存在；图标直接取 `app.default_window_icon()`
+  - **开机自启仍然弹窗口**（没有按启动参数「只驻留托盘」）：能做，但要在 `setup` 里
+    把默认显示的窗口再关掉，参数一错就是「点了没反应」；自启要的效果（登录后立刻开始
+    后台同步）现在已满足
+  - 已知限制：Linux 上 `TrayIconEvent` 根本不发，左键「显示窗口」不生效（要用菜单）；
+    macOS 左键会先弹菜单。**Windows 真机行为未验证**（本机无显示器）——Linux 上只有
+    编译、clippy、fmt 零警告与 4 条菜单映射单元用例（`cargo test -p xremail-shell --lib tray::`）
+- **假服务器支持「乱序响应」注入（T8 的最后一块）**（2026-11-09）
+  - 163 / QQ 这类 Coremail 体系的服务器会在一条命令**处理过程中**把别的
+    untagged 响应（`* 23 EXISTS`、`* 5 EXPUNGE`、`* 3 FETCH (FLAGS …)`）插到
+    你的命令与它的 tagged 完成响应之间。`xremail-testkit` 新增
+    `Fault::InterleaveUntagged { command, noise, once }`：对指定命令（`UID FETCH`
+    写 `FETCH`），在命令自己的数据之后、tagged 响应之前插一条**别人的**
+    untagged 响应；`noise` 可选当前邮件数的 `EXISTS`（默认）、`* 3 FETCH
+    (FLAGS (\Seen))`、`* OK [ALERT]`、`* BYE`——全部合法、**不改变服务器状态**
+  - 协议层新增 **11 条端到端用例**（`crates/xremail-protocol-imap/tests/interleaved.rs`）：
+    `UID FETCH` 的结果与不注入时**逐字段一致**（`UID STORE` 判定 + 回读的标记、
+    `COPY` 的映射、`UID EXPUNGE` 的真实删除都各自核对过），
+    标了别的 tag 的 `NO` 不会被当成本命令的结局（ARCHITECTURE §2.1），
+    会话收到 `* BYE` 也不会被误判成断开。**结论：客户端没有 bug**——
+    `run_checked` 与 transfer 的读循环本来就按 tag 自证成败；用变异测试确认了
+    「读到第一条 untagged 就收工」会让这些用例变红
 - **附件下载与正文内联图片**（2026-11-06，B2）
   - 邮件里的附件现在可以按需下载：点了才去服务器取对应那一段，64 KiB
     一段流式落盘，超限立即中止并删掉临时文件（不会留下一个被截断的半截
@@ -65,7 +160,9 @@
     `COPY` / `MOVE` / `STORE \Deleted` / `UID EXPUNGE` 全部补上命令超时
     （R27、R38）
   - 无 `UIDPLUS` 的服务器上**不再假装删成功**（邮件不会下一轮又自己回来，
-    R35）；移动成功后按 `COPYUID` 的目标 UID 直接写回本地（R39）
+    R35）。~~移动成功后按 `COPYUID` 的目标 UID 直接写回本地（R39）~~——
+    **这条当时并未实现**（2026-11-09 复核代码：`TransferOutcome` 未绑定即丢弃），
+    R39 已改回待办，见下
   - `IDLE` 的三个边界（能力大小写、25 分钟上限、`EXAMINE` 只有 `NO` 才回退，
     R41/R42）；探测失败的账户**当轮就不再尝试 IDLE**，不再每轮白付一次 TLS
     （R37）；等待期的 panic 也会计数并在达上限后放弃账户（R28）
@@ -385,6 +482,26 @@
   用于测非 UTF-8 编码（GBK 正文）
 
 ### Fixed
+- **构建环境的两个只读 `$HOME` 障碍**（不是产品缺陷，记下来免得下一个人再踩）
+  - Gradle wrapper 连自己的锁文件都建不了：`java.io.FileNotFoundException:
+    /home/xl/.gradle/wrapper/dists/gradle-9.6.1-bin/…/gradle-9.6.1-bin.zip.lck (只读文件系统)`
+    → `GRADLE_USER_HOME` 指到工作区
+  - AGP 建不了 debug keystore：`java.io.IOException: Unable to create debug keystore in /home/xl/.android
+    because it is not writable.` → `ANDROID_USER_HOME` / `ANDROID_SDK_HOME` 指到工作区
+- **整封转发（作为附件）的邮件里，多个附件在库里互相顶掉**（2026-11-09，R45）
+  - 这是 T10 的随机化属性测试撞出来的，不是人工审出来的：一封顶层是
+    `message/rfc822` 的转发件，里面有两个附件时，两个都被记成部件号 `TEXT`
+  - 根因在 `xremail-message` 的 `attachment_meta`：它拿「顶层 `Content-Type`
+    是不是 `multipart/*`」决定要不要保留路径，而顶层 `message/rfc822` 也是容器、
+    却不匹配这个前缀，于是**整条路径被清空**（`collect_leaves` 明明已经为内嵌
+    邮件压了 `0` 占位）
+  - 后果不只是编号难看：附件的 id 是 `{message_id}/{part_number}`，落库靠
+    `ON CONFLICT (message_id, part_key)` 去重——两条同号就是一个 key，
+    两个附件在库里互相顶掉，用户只看到一个
+  - 判据改为「整封是不是只有一个部件」；整封单部件仍记 `TEXT`（`BODY.PEEK[0]`
+    只取结构，不能用 `0`）
+  - 证据：`crates/xremail-message/tests/parser_properties.rs` 的三条用例（最小复现 /
+    随机化唯一性 / 单部件反向保护）
 - **附件部件号与服务器对不上，下载会取错段**（2026-11-06，R44，提交 `6fddd07`）
   - 顶层 `multipart` 自己占 1 号，子部件应是 `1.1`、`1.2`……，此前记成 `1`、`2`，
     `BODY.PEEK[2]` 取回来的不是那个附件
@@ -475,6 +592,14 @@
 - 用例 792 → **797**（`crates/xremail-sync/tests/push_transfers.rs` 新增 3 条：
   重发不多出副本 / 无 `Message-ID` 拒绝重发 / 次数到顶一条命令不发；
   另 2 条为命令超时用例）
+### Known limitations
+- **Android 侧只验证到「能编出 APK」**：阅读 / 发信 / 本地缓存、前台 / 后台 / 息屏 / 进程恢复、
+  通知、Keystore **一条都没有在设备上跑过**。本机没有 Android 设备也没有模拟器
+  （`adb devices` 为空，无 `emulator/` 与 `system-images/`，无 AVD），这些不是能「推断」出来的，
+  所以 R08 **维持「待验证」**，对外仍只能称 Windows alpha
+- `lib.rs` 目前**没有** Android 生命周期接线：只处理 `RunEvent::Exit`，没有
+  `Resumed`/`Suspended` 分支；通知插件的权限已在 manifest 里，但应用从不调用通知 API、
+  也不申请 Android 13+ 的运行时权限
 
 ### Changed
 - **文档与代码对齐**（2026-11-02）：一次全量审计，把文档里**与实际代码不符**的表述改掉。

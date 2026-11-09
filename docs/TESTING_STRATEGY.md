@@ -1,6 +1,6 @@
 # 测试策略
 
-> 状态：规范已定义，测试设施**已部分落地**（Rust 988 个用例 / 前端 95 个用例 / Playwright E2E 5 条，
+> 状态：规范已定义，测试设施**已部分落地**（Rust 1029 个用例 / 前端 95 个用例 / Playwright E2E 5 条，
 > 假 IMAP 与假 SMTP 服务器可用；fuzz 未开始，见 §5）。适用于个人研究项目与 AI 编码工作流。
 > 目标：以可重复证据证明数据正确、安全隔离和失败恢复，不以覆盖率或编译成功代替验收。
 > 维护者：xyyi0719
@@ -101,18 +101,20 @@ Mock 通过不能证明服务商兼容。Playwright 浏览器通过不能证明 
 | **T5** | MIME / charset 解析（含 GBK/GB18030 样本） | 乱码是国内邮箱最直接的用户投诉 | 合成 `.eml` | P1 | ✅ 完成（`xremail-message`；**30 封真实邮件解码零错误**） |
 | **T6** | HTML 清洗攻击样本集（OWASP XSS + 追踪像素） | 安全门槛，且纯函数、CI 友好 | 无 | P2 | ✅ 完成（2026-10-30，`xremail-core::html`：`javascript:` / `data:` / `on*` / `style` 里的 `url(javascript:)` / 整封邮件的 `html`+`body` 壳；**未开始**：真正完备的 OWASP 样本集） |
 | **T7** | 假 IMAP/SMTP 服务器跑完整同步链路 | 覆盖状态机集成，但要先有 T2 | T2 | P2 | ✅ 完成（IMAP：假服务器 + 拉取 + 回写（标记与移动/删除两条通道）端到端；SMTP：假服务器 + 能力协商 + 提交往返，`xremail-testkit`） |
-| **T8** | 故障注入（断线、超时、乱序响应、丢应答） | 验证「不确定结果不盲重发」等语义 | T7 | P2/P3 | 🟡 **部分**：断线/超时/丢应答已覆盖（→ `uncertain`）；**乱序响应**未覆盖 |
+| **T8** | 故障注入（断线、超时、乱序响应、丢应答） | 验证「不确定结果不盲重发」等语义 | T7 | P2/P3 | 🟡 **部分**：断线/超时/丢应答已覆盖（→ `uncertain`）；**乱序响应已覆盖**（2026-11-09）：`Fault::InterleaveUntagged` 把一条**别的** untagged 响应插在命令自己的数据与 tagged 完成响应**之间**，11 条端到端用例证明命令层只认自己的 tag（`crates/xremail-protocol-imap/tests/interleaved.rs`）；仍缺的是「真服务商按随机时机插队」的样本 |
 | **T9** | 前端组件与 E2E | 界面层，先保证后端语义正确再投入 | T5 | P3+ | 🟡 **部分**：前端组件用例 **15 个文件 / 95 个**（Vitest + Testing Library）；**Playwright E2E 已落地**（2026-11-06）：`apps/shell/playwright.config.ts` + `apps/shell/e2e/` 共 **2 个 spec 文件 / 5 条用例**，实测 **5 passed / 0 failed**（本地 12.2s；`CI=true` 模拟 10.8s）。起的是 Vite 开发服务器 + 真实 chromium，**不拉 Tauri 窗口**（CI 上没有 WebView），`window.__TAURI_INTERNALS__` 由 `page.addInitScript` 注入假后端。覆盖：① 文件夹邮件列表按 UID 倒序显示标题与发件人（含 `list_messages` 入参）；② 点开一封看到正文、打开不自动标已读；③ 写信面板没写收件人时前端拦下、不调 `send_message`（含「地址之间有空白」提醒）；④ 改动后 800ms 防抖自动存草稿、草稿箱里出现这一封；⑤ 收件人 + 主题填好后发送显示「已发送」与 `Message-ID`，发完发送按钮停用。已接进 CI 的 `web` job。**未覆盖**：附件与富文本编辑器（组件层在用），以及 `uncertain` 二次确认流 |
-| **T10** | fuzz（MIME / HTML / IMAP 响应解析） | 防御性加固，非功能正确性 | T5/T6 | P2+ | ⬜ 未开始（E 组 2026-11-06 复核：全仓没有 fuzz target、没有 `cargo-fuzz` 配置、CI 里也没有 fuzz 步骤，**这条仍成立**） |
+| **T10** | fuzz（MIME / HTML / IMAP 响应解析） | 防御性加固，非功能正确性 | T5/T6 | P2+ | 🟡 **部分**（2026-11-09）：**没有引入 `cargo-fuzz`**——它要 nightly + `libfuzzer-sys`，且不进 PR CI；改为**固定种子的随机化属性测试**（stable 即可跑、零新依赖、失败可逐字复现）：`crates/xremail-core/tests/sanitizer_properties.rs` **6 条**（不 panic / 幂等 / 输出良构 / 危险构造不残留，按真实属性值位置判定）、`crates/xremail-message/tests/parser_properties.rs` **7 条**（不 panic / 附件数有上限 / 部件号唯一 / 错误不越出契约）。**变异测试**验证过：短路 URL 协议过滤、删掉结束标签输出，对应用例都会立刻红。**它撞出并修掉了一条真缺陷（R45：整封转发的多个附件都记成 `TEXT`、在库里互相顶掉）**。**仍缺**：IMAP 响应解析这一层的属性测试（`xremail-testkit` / `xremail-protocol-imap` 的解析器），以及覆盖率引导的探索式 fuzz |
 
-**Rust 用例总数：4 → 988**（2026-10-30 达 687；2026-11-03 随调度器 700、
+**Rust 用例总数：4 → 1029**（2026-10-30 达 687；2026-11-03 随调度器 700、
 移动/删除写路径 747、崩溃恢复 778、IDLE 客户端侧与调度器接线 790、
 认证失败终态 792、审计修复（重发幂等 / 命令超时 / panic 边界补漏）797、
 认证分类纠偏（R25）802、文档审计补正 803、A 组审计缺陷修复（R26–R42）835、对账时机与租约（R29/R32/R33）842；
 2026-11-06 E 组全量复跑仍是 843，未新增用例；同日断线重连（B1/R43）870；
-同日附件下载（B2）与 DKIM（D1）合并后 **988**）；
+同日附件下载（B2）与 DKIM（D1）合并后 **988**；
+2026-11-09 托盘与退出语义、DKIM 跨平台用例 + 凭据契约测试（R07）、
+T8 乱序响应（11 条）、folder 角色落库（R04）合并后 **1029**）；
 其中 **1 个是 `#[ignore]`**（`apps/shell/src-tauri/tests/real_mail_roundtrip.rs:68`，
-真实邮箱往返、会真的发信），所以 `cargo test` 实际执行 **987** 个
+真实邮箱往返、会真的发信），所以 `cargo test` 实际执行 **1028** 个
 （2026-11-06 实测：`cargo test --workspace -j 4 --no-fail-fast`，
 累加所有 `test result:` 行 = **987 passed / 0 failed / 1 ignored**；
 `--` `--list` 点数同口径 **988**）。
@@ -239,8 +241,8 @@ CI 的 runner 内存更小，必要时同样要限并发。
 
 现有 CI 的具体执行项以 `.github/workflows/ci.yml` 为准；有 workflow 不等于远端已经跑绿。
 Vitest 与假协议服务器已经在跑；**Playwright E2E 于 2026-11-06 落地**并接进 `web` job
-（装 chromium → `npm run test:e2e` → 失败时上传 trace 与截图）。**尚未建设**：fuzz（T10）与更完整的
-故障注入（T8 的乱序响应），不在本文虚构已通过结果。
+（装 chromium → `npm run test:e2e` → 失败时上传 trace 与截图）。**尚未建设**：fuzz（T10），
+不在本文虚构已通过结果。
 新增测试工具时提交安装方式、命令与最小验证用例。真实凭据测试不得进入普通 PR CI。
 
 ## 7. 性能与 Android 验收

@@ -1,7 +1,7 @@
 # 路线图
 
 > 执行范围入口。个人研究项目，AI 编码，允许一年以上探索；不使用未经测量的 AI 耗时系数或固定交付日期。
-> 当前已交付 P0–P3（见 §2 的打勾项）；P4（平台化）/ P5（增值）/ P6（L2 远端同步）未开始。
+> 当前已交付 P0–P3（见 §2 的打勾项）；P4 的 Windows 侧已交付、**Android 侧只做到「能编出 APK」**（真机上的运行时行为一条未验，见 P4 小节）；P5（增值）/ P6（L2 远端同步）未开始。
 > 已确认：国内邮箱优先、Gmail 暂缓、先 L1 且 P0 预留 L2。
 > 维护者：xyyi0719
 
@@ -194,8 +194,8 @@
   - 同时收掉：孤儿操作（文件夹已删 → `folder_missing`；移动目标已删 →
     `destination_missing`）、旧 epoch 操作（→ `epoch_changed`）
   - 幂等：重复执行都不动手（触发点两处：**应用启动**
-    `apps/shell/src-tauri/src/lib.rs:197`，以及 **每轮同步成功后**
-    `crates/xremail-sync/src/actor.rs:437 reconcile_after_tick`，2026-11-06 随 R33 落地；
+    `apps/shell/src-tauri/src/lib.rs:235`，以及 **每轮同步成功后**
+    `crates/xremail-sync/src/actor.rs:865 reconcile_after_tick`，2026-11-06 随 R33 落地；
     actor 的 `Startup` 轮本身不单独对账）
   - 用例：`tests/crash_recovery.rs` 11 个
 - [x] **账户调度器**（2026-11-03）：`crates/xremail-sync/src/actor.rs`。
@@ -245,13 +245,20 @@
   - 落点：`xremail-sync::transfer_push`（`pub use transfer_push::{TransferPushReport, push_transfers}`）；
     路由拆成纯函数 `route_for`，不连服务器就能测；
     服务层 `MessageService::move_intent` / `delete_intent`；命令 `move_messages` / `delete_messages`
-  - **删除 = 进垃圾箱**：有垃圾箱就挪进去（可撤销），没有才就地标删；
-    垃圾箱靠文件夹名推断（本地库还不存 `\Trash` 属性）
+  - **删除 = 进垃圾箱**：有垃圾箱就挪进去（可撤销），没有才就地标删。
+    垃圾箱**按角色认，不按名字猜**（2026-11-09）：`LIST` 认出的 RFC 6154 角色
+    落进 `folder.role`（迁移 `0010_folder_role.sql`），删除时按
+    「库里的 `trash` 角色 → role 为 `NULL` 时按文件夹名兜底 → 都不行就地标删」
+    降级。`NULL` 的含义是「**还不知道**」，所以老库升级后还没同步过的账户
+    仍然靠名字兜底，删除不会突然变成不可撤销的；
+    服务器宣告 `\Trash` 但文件夹叫 `Rubbish` 之类时也能进对的垃圾箱
   - 源文件夹里**已经没有这封邮件** → 算成功（`MOVE` 不幂等，重发会多出一份）
   - 队列在同步轮次里**自动排空**（`flush_pending`），不需要界面开着
-  - 用例：24 个（`crates/xremail-sync/tests/push_transfers.rs` 8 个端到端、
-    `apps/shell/src-tauri/tests/move_delete_intent.rs` 8 个服务层、
-    `transfer_push.rs` 里的 `route_for` 单测 8 个）
+  - 用例：33 个（`crates/xremail-sync/tests/push_transfers.rs` 14 个端到端——
+    其中 6 个是 2026-11-09 补的垃圾箱判定：`\Trash` 但名字叫 `Rubbish`、
+    无属性且名字不像、role 为 `NULL` 时名字兜底、宣告为 `\Archive` 的 `Trash` 不被误用、
+    同步后角色真的落库；`apps/shell/src-tauri/tests/move_delete_intent.rs` 8 个服务层；
+    `transfer_push.rs` 里的 `route_for` 单测 8 个 + `trash_candidates` 5 个）
   - 前置已就位（2026-11-03）：协议层 `COPY` / `MOVE` 与假服务器都已支持
   - 保守路径：有 `MOVE` 就一步 `UID MOVE`；没有则 `UID COPY` → `UID STORE +FLAGS (\Deleted)`
     → **有 `UIDPLUS` 才** `UID EXPUNGE`（163 有 `UIDPLUS` 但没有 `MOVE`，走的是这一行）
@@ -279,16 +286,22 @@
     索引由**触发器**维护（epoch 切换、级联删除这些路径也绕不过触发器）
   - 短词（< 3 字符）退化成 `LIKE` **子串**扫描；查询词按字面匹配（`OR` 不是语法）
   - `rebuild_index`（可重复）+ `check_index_consistency`（查漏索引 / 孤儿行 / 正文过期）
-- [ ] **测试用例扩写 T6–T8 的剩余部分**（T6 与 T7 已完成，见 [TESTING_STRATEGY](TESTING_STRATEGY.md)；
-  先进只卡在两项：**完备的 OWASP 样本集**与**乱序响应**）。
+- [x] **测试用例扩写 T6–T8 的剩余部分**（T6 与 T7 已完成，见 [TESTING_STRATEGY](TESTING_STRATEGY.md)）。
+  原先卡的两项里，**乱序响应已于 2026-11-09 补上**（见下）；剩下的**完备的 OWASP 样本集**
+  归 T6，单独写在 T6 那一行里，不再挡住这一条。
   - T7 的**假服务器已就位**（含故障注入）：IMAP 侧覆盖拉取与回写，
     **SMTP 侧覆盖提交与能力协商**（`xremail-testkit`）
   - **T6（HTML 攻击样本）已补上**（2026-10-30）：core 的消毒器单测
     （`javascript:` 协议、`data:` URL、事件属性、`style` 里的 `url(javascript:)`、
     整封邮件的 `html` / `body` 壳）与 shell 层的「原始 HTML 不出后端」断言
     （**完备的 OWASP 样本集仍缺**）
-  - T8（故障注入矩阵）：**断线 / 超时 / 丢应答已覆盖**（→ `uncertain`），
-    **乱序响应仍缺**
+  - T8（故障注入矩阵）：断线 / 超时 / 丢应答已覆盖（→ `uncertain`）；
+    **乱序响应已覆盖**（2026-11-09）：假服务器新增 `Fault::InterleaveUntagged`
+    （把一条别的 untagged 响应插在命令自己的**数据**与 **tagged 完成响应**之间，
+    可限定命令、可只插一次，插入的响应合法且**不改变服务器状态**），
+    `crates/xremail-protocol-imap/tests/interleaved.rs` 11 条端到端用例证明
+    `run_checked` / transfer 两条读循环都只认自己的 tag。**未覆盖**：真服务商
+    按随机时机插队的样本、`IDLE` 期间的穿插（那本来就是 `IDLE` 的正常语义）
 
 **出口**：两客户端并发、崩溃恢复、恶意邮件与检索一致性测试通过；不承诺任意网络下固定收敛秒数。
 *当前状态（2026-11-03）：同步引擎的**拉取**与**回写**（标记 + 移动/删除）两条链路已在 crate 层完成并有端到端测试；
@@ -351,20 +364,188 @@
 
 ### P4：Windows 与 Android 平台验收
 
-- [ ] Windows **托盘图标**、**退出/恢复语义**（通知与单实例插件已接线，见下）
-  - [x] **安全存储**（2026-10-26）：Windows 凭据管理器适配已落地（`secrets/windows_store.rs`），
-        不静默降级。
-  - **2026-11-03 核实进度**：通知（`tauri_plugin_notification`）、单实例
-        （`tauri_plugin_single_instance`，第二次启动聚焦已有窗口）、开机自启
-        （`tauri_plugin_autostart`）**都已在 `lib.rs:37-53` 接线**；
-        真正还缺的是**托盘图标**（`tauri.conf.json` 无 `trayIcon`）与**退出/恢复语义**
-        （关窗口是否退到托盘、后台同步是否继续）。
+- [x] **托盘图标**与**退出/恢复语义**（2026-11-09，`apps/shell/src-tauri/src/tray.rs`）
+  - **语义**：关闭主窗口 = **退到托盘**（窗口隐藏，进程与后台同步继续跑）；
+        托盘菜单「退出」= **真退出**（`app.exit(0)` → `RunEvent::Exit` →
+        `Scheduler::shutdown()`）；托盘左键单击 = 显示并聚焦主窗口
+  - 托盘菜单：**显示主窗口** / **立即同步** / **退出**。前者与单实例插件的
+        「第二次启动」走同一个入口；「立即同步」对所有**已调度**账户逐个
+        `Scheduler::wake`（新增 `service::scheduler::wake_all`，不复用 `start`，
+        因为它的语义是「确保在调度」）；「退出」用 `app.exit` 而不是
+        `std::process::exit`——后者不会发 `RunEvent::Exit`，那段收尾就成了死代码
+  - 只开 tauri 自己的 `tray-icon` feature（**没有**新增第三方依赖，`Cargo.lock` 未变）；
+        托盘只在桌面端创建（`#[cfg(desktop)]`），Android 上没有；图标取
+        `app.default_window_icon()`，即 `bundle.icon` 里那张 32x32
+  - **开机自启时不特殊处理**（仍然弹窗口）：能做，但 `setup` 里窗口默认已显示，
+        「按参数再关掉」一旦参数解析出错就是「点了没反应」；自启的诉求
+        （登录后后台同步已在跑）当前实现已满足
+  - **实测到什么程度**：Linux 上（无显示器）编译通过、`cargo clippy -p xremail-shell
+        --all-targets -D warnings` 零警告、`cargo fmt` 干净；菜单 id → 动作的映射
+        有 4 个单元用例。**Windows 上的实际行为（图标出不出、左键是否聚焦、
+        退出时 actor 是否真的被停掉）没有真机验证**——本机跑不了 GUI，
+        Linux 上 `TrayIconEvent` 又根本不发（libayatana-appindicator 只给菜单），
+        所以「左键显示窗口」在 Linux 上不生效，要用菜单里的「显示主窗口」
+  - 通知（`tauri_plugin_notification`）、单实例（`tauri_plugin_single_instance`，
+        第二次启动聚焦已有窗口）、开机自启（`tauri_plugin_autostart`）**早已接线**
+        （2026-11-03 核实），这次没有改动它们
+- [x] **安全存储**（2026-10-26）：Windows 凭据管理器适配已落地（`secrets/windows_store.rs`），
+      不静默降级。
 - [ ] **早期可并行** Android PoC：构建、Rust 调用、Keystore 适配路线、前台/后台/息屏/进程恢复。
+  - **已完成的是「构建」这一格**（2026-11-09，见下面的「Android PoC 第一轮」）：
+        工程能生成、APK 能产出、全部 Rust crate 在 `aarch64-linux-android` 上编过、
+        托盘确被排除、**平台钥匙串在 Android 上是桩**这条也在二进制里坐实
+  - **仍未完成的**：前台/后台/息屏/进程恢复、通知、Keystore 适配本身——
+        **一条都没有在 Android 设备或模拟器上跑过**，本机没有真机也没有 AVD
+        （R08 仍是「待验证」）
 - [ ] 根据 PoC 决定移动端前台同步与后台策略；必要时请求用户选择时效/功耗取舍。
+  - **本轮不决策，也不该决策**：判断「前台同步够不够、要不要后台常驻」所需的证据
+        （息屏后进程活多久、Doze 何时冻结、通知是否送达）恰好全是本节唯一验不了的那一类。
+        现在能定的只有下文的**路线**，不是结论
 - [ ] Android 阅读/发信/本地缓存验收，背景任务限制如实展示。
+  - 同上：这条要求的是**运行时**验收。本轮的证据最多落到「数据目录与 SQLite 在 Android
+        目标上能链接成可加载的 `.so`」，**打不开库、读不到一封信、发不出一次 SMTP**——
+        没有设备，这些都不是可以「推断」出来的
+
+#### Android PoC 第一轮（2026-11-09）：只做到「能编出 APK」
+
+> 本节只写**实测**。凡没跑过的一律写「未验证」，不写「应该可以」。
+
+**环境**：Linux x86_64（Ubuntu 26.4）、rustc 1.99.1、Tauri CLI 2.12.3 / `tauri` 2.12.4、
+JDK 17.0.20.1、NDK `27.2.12479018`、platform `android-36` / `android-37.0`、
+Gradle 9.6.1（wrapper 自带）、cargo-ndk。**没有任何 Android 设备或模拟器**
+（`adb devices` 无设备，本机未安装 emulator / system-image，见 R08）。
+
+**怎么跑通的**（命令与结果，可复现）：
+
+1. `npx tauri android init` → `Project generated successfully`，产物在
+   `apps/shell/src-tauri/gen/android/`（Gradle 工程 + Kotlin 入口 + 图标资源 +
+   `tauri.settings.gradle`，后者把 `tauri-2.12.4/mobile/android` 与
+   `tauri-plugin-{dialog,notification,opener}` 的 android 工程 `include` 进来）。
+   生成时用的是默认参数：ABI `arm64-v8a/armeabi-v7a/x86/x86_64`，
+   `minSdk 24`、`compileSdk 37`、`targetSdk 37`。
+2. `npx tauri android build --debug --target aarch64` → **产出 APK**：
+   `apps/shell/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk`
+   （266,388,896 字节 ≈ 254 MiB；同一次构建还顺带产出 `.aab` 72,387,850 字节）。
+   另外单独跑了 `npx tauri android build --target aarch64 --apk`（release）作为对照，
+   得到 `…/apk/universal/release/app-universal-release-unsigned.apk`（**14,869,199 字节 ≈ 14.2 MiB**）。
+   - **体积**：debug 那份大得吓人，但**这不是缺陷**——
+     `lib/arm64-v8a/libxremail_shell_lib.so` 一个就占 258,301,456 字节，因为 debug 构建带
+     完整调试信息，且模板的 `debug` 构建类型显式 `keepDebugSymbols` 四个 ABI
+     （`app/build.gradle.kts:35-38`）。同一份代码 release 出来只有 ≈ 14.2 MiB，
+     两份的差值基本就是调试符号——所以「Android 包大」在本仓库不成立，**别拿 debug 的体积下结论**。
+     注意 release 那份是**未签名**的，`tauri android build` 不给它签名；要装得先配签名，
+     配置怎么放见生成工程根目录的 `settings.gradle` / `app/build.gradle.kts` 与同级
+     `key.properties`（后者已被生成工程的 `.gitignore` 忽略，**本仓库没有、也不该有**签名文件）。
+   - 产物里 `lib/` 只有 `arm64-v8a` 一个 ABI（`--target aarch64` 的结果），
+     `.so` 由 `file` 证实是 `ELF 64-bit LSB ... ARM aarch64, for Android 24, built by NDK r27c`。
+   - **前端确实在里面**：`dist` 是内嵌资源，打进了 `.so` 而不是 APK 的 `assets/`——
+     在 `.so` 里能按名字找到本次 `dist` 产出的那两个文件名：`index-BA6F1NNh.css` 与 `index-LTbQfC79.js`
+     （文件名带内容哈希，**下次前端改动后会变**，别拿这两个名字当常量去 `grep`）。
+     （`assets/` 目录下只有一份 `tauri.conf.json`，别据此以为「前端没打进去」。）
+   - **签名**：debug 构建用 AGP 自动生成的 debug keystore；本仓库**没有**提交任何签名文件，
+     产出的 APK 只能装到个人设备上调试，不能分发。
+3. **Rust 侧编过了哪些东西**（`aarch64-linux-android` 目标）：
+   - 本仓库 **9 个 crate 全部编过**：`xremail-core` / `xremail-store` / `xremail-api` /
+     `xremail-sync` / `xremail-protocol-imap` / `xremail-protocol-smtp` /
+     `xremail-message` / `xremail-dkim` / `xremail-shell`
+     （`xremail-crypto` 与 `xremail-testkit` 不在 shell 的依赖图里，本轮没有单独编译它们）
+   - 关键的第三方：**`sqlx` / `sqlx-sqlite` / `libsqlite3-sys` 编过了**
+     （`sqlite-bundled` 自带的 C 源码走 NDK 的 clang，是本轮最容易炸的一环，它没炸）；
+     `ring`（DKIM 签名）、`async-imap`、`tokio` / `tokio-rustls`、
+     `tauri` / `wry` / `tao` 与 `tauri-plugin-{dialog,notification,opener,single-instance,autostart}`
+     也都编过了
+   - **但「编过」≠「能跑」**：`libxremail_shell_lib.so` 能被链接出来、能放进 APK，
+     没人加载过它
+4. **Rust 调用链路的静态结论**（看代码 + 看打出来的二进制，**不是**运行结论）：
+   - **数据目录**：`init_storage()` 用 `app.path().app_data_dir()`（`apps/shell/src-tauri/src/lib.rs:189`），
+     Tauri 在 Android 上解析为 app 内部存储（`/data/user/0/com.xremail.app/...`）。
+     `com.xremail.app` 这个包名在生成工程里坐实了（`aapt2 dump badging` 的 `package:` 行）。
+     **运行时是否真的创建成功、SQLite 是否真的落在那里——未验证**。
+   - **SQLite**：`sqlx` 的 `sqlite-bundled` 在 Android 上**编得过、链得过**；
+     `llvm-nm` 在打进 APK 的 `.so` 里能找到 `sqlite3_open` 一类符号（3 处）。
+     迁移与 FTS5 在那个目标上**是否行为一致未验证**。
+   - **平台钥匙串在 Android 上是桩（这是硬事实，不是推断）**：
+     `apps/shell/src-tauri/src/secrets/mod.rs` 的 `platform_default_store()` 在
+     `#[cfg(not(windows))]` 分支上返回 `unsupported::UnsupportedSecretStore`
+     ——`set` 恒返回 `Unavailable`、`get` 恒 `None`、`delete` 恒 `false`。
+     这条在**打进 APK 的那个 `.so` 里**被核实：`UnsupportedSecretStore` 的错误文案
+     「只有 Windows 凭据管理器已适配」在里面出现 1 次，而 Windows 实现的符号
+     （`windows_store` / `CredWriteW`）**一个都没有**。
+     直接后果（就是 R19 的 Android 侧）：
+     **Android 上授权码存不进钥匙串 → 每次冷启动都要重新输入**；
+     同期 DKIM 私钥也存不进去（它同样走 `xremail:dkim:<account_id>` 这条钥匙串路径）。
+     这是**如实报错**，不是静默降级成「存到文件里」——那条路本仓库刻意不走（R07）。
+   - **托盘被正确排除**：`tray` 模块在 `lib.rs:25-26` 是 `#[cfg(desktop)]`，
+     打进 APK 的 `.so` 里 `xremail_shell_lib::tray` 的符号**数量为 0**。
+     所以 Android 上不存在「关窗口退到托盘」——**关窗口是什么语义，未验证**。
+   - **后台同步没有任何 Android 生命周期接线**：`lib.rs` 只处理了
+     `RunEvent::Exit`（停调度器），**没有** `RunEvent::Resumed` / `Suspended`
+     或 `WindowEvent::Resumed` / `Suspended` 的分支（全仓 `grep` 无命中）。
+     Tauri 2.12 确实会把这些事件转发到 Rust（`tauri-2.12.4/src/app.rs` 的
+     `RunEvent::Resumed` 与 `WindowEvent::Resumed/Suspended`，后者由
+     `WryActivity.kt` 的 `onPause`/`onResume` → `Rust.onPause/onResume` 驱动），
+     **我们只是还没用**。于是当前形态是：`Scheduler` 在进程活着时照常跑，
+     进程被系统杀掉就什么都没了（下一轮要从「打开应用」开始）。
+     **息屏/后台时进程能活多久、Doze 何时冻结 socket，一个字都没有测过**。
+   - **通知**：`tauri-plugin-notification` 的 android 工程进了构建，
+     其 manifest 带来 `POST_NOTIFICATIONS` / `WAKE_LOCK` / `RECEIVE_BOOT_COMPLETED`
+     三个权限（`aapt2` 在 APK 里都看得到），并注册了
+     `TimedNotificationPublisher` / `LocalNotificationRestoreReceiver` 等接收器。
+     **但应用自己从未调用过通知 API**（`grep` 无 `Notification` 调用点），
+     Android 13+ 的运行时通知权限也从没申请过——**能不能弹、弹出来长什么样，未验证**。
+5. **为跑通构建改了什么**：**Android 工程与 `tauri.conf.json` 一个字都没改**，
+   `AndroidManifest.xml` 与 `build.gradle.kts` 保持 `init` 生成的原样。
+   卡住的是**沙箱环境**（`$HOME` 只读），不是 Tauri 2.12 的配置：
+   - Gradle wrapper 连自己的锁文件都建不了：
+     `java.io.FileNotFoundException: /home/xl/.gradle/wrapper/dists/gradle-9.6.1-bin/…/gradle-9.6.1-bin.zip.lck (只读文件系统)`
+     → 用 `GRADLE_USER_HOME` 指到工作区内（`<工作区>/.devcache/gradle-home`）
+   - AGP 建 debug keystore 时同样撞只读：
+     `java.io.IOException: Unable to create debug keystore in /home/xl/.android because it is not writable.`
+     → 用 `ANDROID_USER_HOME` / `ANDROID_SDK_HOME` 指到工作区内
+   - 另显式设了 `CC_aarch64_linux_android` / `AR_aarch64_linux_android`，
+     让 C 依赖（`ring`、`libsqlite3-sys`）用 NDK 的 clang 编——这两项在
+     `tauri android build` 的默认行为下是否必需，**没有单独做对照实验**，不宣称
+   - **`gen/` 整个目录被根 `.gitignore:22-23` 忽略**，构建产物（`app/build`、
+     `.gradle`、`jniLibs`）不会出现在 `git status` 里；`cargo-ndk` 因此**不需要**
+     也不应该把 `APP_ABI` 塞进 `tauri.conf.json`
+
+**Android Keystore 适配路线**（**只是路线，没有实现任何一行**）：
+- 落点在哪：新增 `apps/shell/src-tauri/src/secrets/android_store.rs`，实现
+  `xremail_api::SecretStore` 的 `get` / `set` / `delete` 三个方法；
+  `secrets/mod.rs` 的 `platform_default_store()` 加一个 `#[cfg(target_os = "android")]`
+  分支指向它。**不改契约**（`unsupported.rs` 的模块注释里已经写死了这条）。
+- 用哪个设施：**Android Keystore 里的 AES-GCM 密钥**（`KeyGenParameterSpec`，
+  `PURPOSE_ENCRYPT | PURPOSE_DECRYPT`，`BLOCK_MODE_GCM`）加密每条凭据，
+  **密文放进本模块自己的 Android SharedPreferences**（`MODE_PRIVATE`），
+  **绝不放进 SQLite**——数据库文件会被备份/拷走，这条理由在 `secrets/mod.rs` 顶部写着。
+  Android Keystore **不直接存任意长度数据**（也不是一个 KeyValue 存容器），
+  所以「密钥在 Keystore、密文在别处」是唯一形状；把它们混成「Keystore 里存授权码」是错的。
+- 为什么值得做：Keystore 的密钥不可导出；`minSdk 24` 已经有 `KeyGenParameterSpec`，不需要降版本。
+  （StrongBox 在 API 28+ 才有、且不是每台机器都有，落地时要按 `isStrongBoxBacked()` 探测并回退。）
+- 跨平台形状：这与将来 Linux 的 Secret Service、macOS 的 Keychain 是**同一种适配器**，
+  不是特例——所以先在 R19 里把「哪些平台已有实现」列清楚再动手。
+- 验收门槛（**必须真机**，模拟器只算一半）：冷启动后不重填授权码、进程被杀后仍在；
+  删除账户后 SharedPreferences 里不留残骸（Keystore 里那把密钥是否随之删除，也要一并断言）；
+  用户改锁屏密码/恢复出厂后的失败路径要**如实报错**而不是静默丢凭据。
+  **以上一条都没做，也没有任何一条被验证过。**
+- **什么时候做**：与「后台策略」一起决策，因为两者都要先有一个能跑的设备环境。
+
+**这一轮到底验证到了什么程度**（照 R08 的复核门槛逐条对）：
+
+| 项 | 本轮状态 | 还差什么 |
+|---|---|---|
+| 工程生成 / APK 产出 | **已验证**（本机可复现） | 无 |
+| Rust 在 Android 目标上编译 | **已验证**（9 个 crate + sqlx/ring/tauri 全过） | 无（但没跑过） |
+| 数据目录 / SQLite 打开 / 迁移 | **未验证** | 真机或 AVD 上启动一次，看 `app_data_dir` 与 `xremail.db` 是否落地 |
+| 阅读 / 发信 / 本地缓存 | **未验证** | 同上，且要能连真实邮箱（163/QQ） |
+| 前台 / 后台 / 息屏 / 进程恢复 | **未验证** | 真机；`adb` 观察进程优先级与 `dumpsys` 的 Doze 状态 |
+| 通知 | **未验证**（权限已在 manifest 里，但从未申请、从未发） | 真机 + Android 13+ 的运行时权限 |
+| Keystore | **未实现**（当前是桩，已在二进制里坐实） | 先写适配器，再按上面的门槛验 |
 
 **出口**：Windows 与 Android 分别记录能力矩阵；若 Android 未验收，只能称 Windows alpha，不能称双端 MVP。
 当前未获授权取消 Android 或承诺始终后台实时同步。
+> 2026-11-09 记：Android **仍未验收**，所以对外仍只能称 Windows alpha。
+> 上表里「未验证」的六项，没有设备就推进不了——这是本轮最该被记住的一句话。
 
 ### P5：本地增值功能（按需求选择）
 
@@ -382,6 +563,8 @@ Gmail 将来有需求再开独立决策：授权流程、scope、个人使用与
       必须重跑 [TESTING_STRATEGY §2.4](TESTING_STRATEGY.md) 的隔离测试，不能直接沿用 Windows 结论
 - [ ] Secret Service 凭据后端（与 Windows Credential Manager / Android Keystore 分离实现）
 - [ ] 托盘（libayatana-appindicator）、通知（D-Bus）、开机自启（XDG autostart .desktop）
+  - 托盘代码是平台无关的，**编译**过（需要 `libayatana-appindicator3` 才能链上），
+        但 Linux 上 `TrayIconEvent` 不发，左键「显示窗口」不生效；**运行未验证**
 - [ ] 打包链路验证（AppImage / deb / rpm）
 - [ ] 至少 2 个主流发行版的真机运行验证（Ubuntu / Fedora 系）
 
@@ -446,7 +629,8 @@ Gmail 将来有需求再开独立决策：授权流程、scope、个人使用与
 均已完工。
 剩下最接近核心可靠度的是**真实邮箱的验收证据**（`docs/ROADMAP.md:75`：
 发信/收信/附件往返至今没有在 CI 里跑过一次真实账户），
-以及**乱序响应**（T8 剩下的一半）与 **fuzz**（T10）。
+以及 **fuzz**（T10）——原列在这里的「**乱序响应**（T8 剩下的一半）」已于 2026-11-09 完工
+（`Fault::InterleaveUntagged` + `tests/interleaved.rs`）。
 
 **已完成（2026-10-23）**：三家测试账号已准备并完成只读实测（凭据仅在本机配置）；
 只读 probe、假服务器、同步纯函数、同步引擎（拉取 + 回写 + 按需正文）、

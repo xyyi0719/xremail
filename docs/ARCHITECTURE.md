@@ -90,6 +90,9 @@ trait 放在使用方或低层契约模块；不因“只有 trait”就允许�
 - SMTP 可独立连接；操作 worker 按账户/文件夹身份顺序执行，不能与 Actor 争用 IMAP 流。
 - SQLite WAL、有界连接池、busy timeout；所有业务写入由 Rust 协调，不等于只有一个连接或一个 task。
 - 退出、账户删除、网络切换均传播取消；后台任务应被监督并回收。
+  （桌面端的「退出」只有一条路：托盘菜单 → `app.exit(0)` → `RunEvent::Exit` →
+  `Scheduler::shutdown()`；**关闭窗口不算退出**，只是把窗口藏起来、同步继续跑。
+  取舍与不能用的写法见 §9 的「窗口生命周期与退出」。）
 
 ## 4. 身份、缓存与同步事务
 
@@ -203,7 +206,7 @@ UIDVALIDITY 不得为 0（RFC 3501），收到 0 视为协议错误。
   对账不能凭空造第二套真相。
 * **同时收掉的残骸**：孤儿操作（文件夹已删 → `folder_missing`；移动目标已删 →
   `destination_missing`）、绑定旧 epoch 的操作（→ `epoch_changed`，与 §4.3 一致）。
-* **幂等**。触发点有两个：应用启动（`apps/shell/src-tauri/src/lib.rs:197`）与
+* **幂等**。触发点有两个：应用启动（`apps/shell/src-tauri/src/lib.rs:235`）与
   **每轮同步成功之后**（2026-11-06 随 R33 新增，`crates/xremail-sync/src/actor.rs:437 reconcile_after_tick`，
   `Synced` 事件前调用）。
   启动时要做的理由：调度器只对「已交给它调度」的账户跑，
@@ -459,6 +462,33 @@ Linux/macOS/iOS 不属于当前验收平台，不因 Tauri 支持就视为产品
 判断标准：凡是跑在 tokio 任务里、会 `await` 且可能 panic 的函数，要么自己就是边界，
 要么**只**被已经包了边界的函数调用。**残余**：Tauri 命令处理线程与前端 Wry IPC
 回调不在这套边界内（见 [ISSUES R13](ISSUES_AND_RISKS.md)）。
+
+**窗口生命周期与退出（2026-11-09，`apps/shell/src-tauri/src/tray.rs`）**：桌面端有托盘，
+语义只有两条——
+
+* **关闭主窗口 = 退到托盘**：`Builder::on_window_event` 里对 `label == "main"` 的
+  `CloseRequested` 直接 `hide()`，进程、窗口与后台同步都留着。不能靠「窗口关掉、
+  让托盘图标把进程留住」：Tauri 2 的 `WindowEvent::CloseRequested` **不暴露** `api`，
+  应用拦不住销毁；窗口一旦销毁，托盘左键只会去聚焦一个不存在的窗口，
+  于是一个**关不掉也回不去**的常驻进程。
+* **真退出只有一条路**：托盘菜单「退出」→ `app.exit(0)` → `RunEvent::Exit` →
+  `Scheduler::shutdown()`。**不能**换成 `std::process::exit`：它不发 `RunEvent::Exit`，
+  上面那条收尾就成了永不执行的代码，退出时 actor 还在 `IDLE` 或写库，
+  未提交的写操作会停在 `running`（下次启动靠对账收拾）。系统发起的退出（注销、关机）
+  同样走 `Exit`，收尾一致。
+
+托盘菜单只有「显示主窗口 / 立即同步 / 退出」三项。左键单击 = 显示并聚焦，
+与 `tauri_plugin_single_instance` 的「第二次启动」走同一个函数（藏起来的窗口必须先
+`show`）。「立即同步」对**已调度**账户逐个 `Scheduler::wake`（`service::scheduler::wake_all`），
+**不**用 `start`——后者的语义是「确保在调度」，读起来像新增了一份调度。
+开机自启时**仍然弹窗口**：按启动参数「只驻留托盘」能做，但那要在 `setup` 里
+把默认显示的窗口再关掉，参数一错就是「点了没反应」，而自启的诉求
+（登录后后台同步已在跑）当前实现已满足。
+
+托盘是 tauri 的核心 API（`tauri::tray`），只需要开 tauri 自己的 `tray-icon` feature，
+不引入新依赖；托盘只在桌面端创建（`#[cfg(desktop)]`）。
+**验证程度**：Linux 上编译与 clippy、fmt 通过，菜单 id → 动作有单元用例；
+**Windows 真机行为（图标、左键聚焦、退出收尾）未验证**——本机无显示器。
 
 错误按可恢复原因分类：传输临时失败退避；认证需用户动作；磁盘满/迁移失败不能当普通 Storage 错误无限重试；协议错误不原样输出可能含凭据/正文的响应。
 事件枚举以 `xremail-core/src/event.rs` 为准，flag 更新使用 MessageUpserted，当前没有 FlagsChanged。
