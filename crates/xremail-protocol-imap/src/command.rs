@@ -249,13 +249,13 @@ pub async fn run_checked(
 
         match response.parsed() {
             Response::Fetch(seq, attributes) => {
-                fetches.push(parse_fetch(*seq, attributes));
+                fetches.push(fetched_message(*seq, attributes));
             }
             Response::MailboxData(imap_proto::MailboxDatum::Search(ids)) => {
                 search.extend(ids.iter().copied());
             }
             Response::MailboxData(imap_proto::MailboxDatum::List(data)) => {
-                list.push(parse_listed_mailbox(data));
+                list.push(listed_mailbox(data));
             }
             Response::Done {
                 tag,
@@ -336,7 +336,10 @@ pub(crate) fn outcome_information(outcome: &imap_proto::Outcome<'_>) -> String {
 }
 
 /// 解析一条 `LIST` 响应。
-fn parse_listed_mailbox(data: &imap_proto::MailboxListData<'_>) -> ListedMailbox {
+///
+/// 对测试公开（`tests/imap_parsing_properties.rs`）：这是「哪个文件夹是已发送」
+/// 的唯一入口，随机化属性测试要直接喂它随机的属性与名字，而不是每次都起服务器。
+pub fn listed_mailbox(data: &imap_proto::MailboxListData<'_>) -> ListedMailbox {
     let raw_name = data.name.to_string();
     let attributes: Vec<String> = data
         .name_attributes
@@ -363,7 +366,9 @@ fn parse_listed_mailbox(data: &imap_proto::MailboxListData<'_>) -> ListedMailbox
 }
 
 /// 解析一条 FETCH 响应。
-fn parse_fetch(seq: u32, attributes: &[AttributeValue<'_>]) -> FetchedMessage {
+///
+/// 对测试公开，理由同 [`listed_mailbox`]。
+pub fn fetched_message(seq: u32, attributes: &[AttributeValue<'_>]) -> FetchedMessage {
     let mut message = FetchedMessage {
         seq,
         ..Default::default()
@@ -445,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_fetch_extracts_common_attributes() {
+    fn fetched_message_extracts_common_attributes() {
         let attributes = vec![
             AttributeValue::Uid(42),
             AttributeValue::Flags(vec![std::borrow::Cow::Borrowed("\\Seen")]),
@@ -453,7 +458,7 @@ mod tests {
             AttributeValue::ModSeq(7),
         ];
 
-        let message = parse_fetch(3, &attributes);
+        let message = fetched_message(3, &attributes);
 
         assert_eq!(message.seq, 3);
         assert_eq!(message.uid, Some(42));
@@ -464,14 +469,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_fetch_extracts_body_section() {
+    fn fetched_message_extracts_body_section() {
         let attributes = vec![AttributeValue::BodySection {
             section: None,
             index: None,
             data: Some(std::borrow::Cow::Borrowed(b"body bytes")),
         }];
 
-        let message = parse_fetch(1, &attributes);
+        let message = fetched_message(1, &attributes);
 
         assert_eq!(message.body.as_deref(), Some(&b"body bytes"[..]));
     }

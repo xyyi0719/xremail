@@ -436,7 +436,11 @@ async fn handle_connection(
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
             }
             // 噪音在下面 `handle_command_with_interleave` 里插。
-            FaultAction::None | FaultAction::Interleaved(_) => {}
+            // 换完成响应也是「写完了再改」：命令本身照样执行，效果要落到服务器上。
+            FaultAction::None
+            | FaultAction::Interleaved(_)
+            | FaultAction::ReplaceCompletion(_)
+            | FaultAction::InjectLine(_) => {}
         }
 
         let ctx = ServerCtx {
@@ -457,6 +461,32 @@ async fn handle_connection(
                 }
                 handle_command_with_interleave(&mut writer, &mut reader, &ctx, &mut state, &command)
                     .await
+            }
+            FaultAction::ReplaceCompletion(lines) => {
+                let mut writer = &mut write_half;
+                handle_captured_command(
+                    &mut writer,
+                    &mut reader,
+                    &ctx,
+                    &mut state,
+                    &command,
+                    None,
+                    Some(&lines),
+                )
+                .await
+            }
+            FaultAction::InjectLine(line) => {
+                let mut writer = &mut write_half;
+                handle_captured_command(
+                    &mut writer,
+                    &mut reader,
+                    &ctx,
+                    &mut state,
+                    &command,
+                    Some(&line),
+                    None,
+                )
+                .await
             }
             _ => handle_command(&mut write_half, &mut reader, &ctx, &mut state, &command).await,
         };
@@ -520,6 +550,92 @@ where
     // 噪音放在已写出的内容之后——它依旧是 untagged，冒充不了任何结局。
     if !wrote_noise {
         reply!(writer, "{}", noise);
+    }
+
+    result
+}
+
+/// 以「改写这一轮的输出」的方式处理一条命令
+/// （`Fault::RespondWith` 与 `Fault::InjectUntagged` 共用）。
+///
+/// 做法是先让 [`handle_command`] 把这一轮要写的字节写进内存，再按行重放：
+///
+/// * `injected`：在**第一条 tagged 行之前**插一行原文——那里正好是
+///   「我的数据」与「我的结局」之间；
+/// * `replacement`：把**第一条 tagged 行**换掉，并丢弃它**之后**的字节
+///   （`LOGOUT` / `IDLE` 这类在结局之后还会再读或再写，换掉结局之后那些
+///   都不该再出现，否则用例读到的就不是「服务器只说了这些」）；
+///   一条 tagged 都没出现时，按给定原文补在后面。
+///
+/// 哪些行算 tagged 按**格式**判（与 `handle_command_with_interleave` 同一个判据）：
+/// `<tag> <命令名> …`——`* OK …` / `+ text` / 裸字面量都不符合。
+/// 命令本身**照常执行**：效果要真的落到服务器上，否则测的就是「没执行」。
+async fn handle_captured_command<W, R>(
+    mut writer: &mut W,
+    reader: &mut R,
+    ctx: &ServerCtx<'_>,
+    state: &mut SessionState,
+    command: &Command,
+    injected: Option<&str>,
+    replacement: Option<&[String]>,
+) -> std::io::Result<Continue>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncBufRead + Unpin,
+{
+    let mut captured: Vec<u8> = Vec::new();
+    let result = {
+        let mut sink = &mut captured;
+        handle_command(&mut sink, reader, ctx, state, command).await
+    };
+
+    let text = String::from_utf8_lossy(&captured);
+    let mut saw_tagged = false;
+    let mut stopped = false;
+    for line in text.split_inclusive("\r\n") {
+        let body = line.trim_end_matches("\r\n");
+        let tagged = Command::parse(body).is_some();
+
+        if tagged && !saw_tagged {
+            saw_tagged = true;
+            if let Some(line) = injected {
+                reply!(writer, "{}", line);
+            }
+            if let Some(lines) = replacement {
+                for replacement_line in lines {
+                    reply!(
+                        writer,
+                        "{}",
+                        replacement_line.replace("{tag}", &command.tag)
+                    );
+                }
+                stopped = true;
+                continue;
+            }
+        }
+
+        if stopped {
+            continue;
+        }
+        reply!(writer, "{}", body);
+    }
+
+    if !saw_tagged {
+        // 这一轮本来就没写 tagged（`IDLE` 只回续行之类）：插的行与替换的行
+        // 都补在已写出的内容之后——既保持「数据在前、结局在后」的顺序，
+        // 也不会让客户端一直等一个永远不会来的结局。
+        if let Some(line) = injected {
+            reply!(writer, "{}", line);
+        }
+        if let Some(lines) = replacement {
+            for replacement_line in lines {
+                reply!(
+                    writer,
+                    "{}",
+                    replacement_line.replace("{tag}", &command.tag)
+                );
+            }
+        }
     }
 
     result
@@ -742,6 +858,16 @@ enum FaultAction {
     /// 命令的结果一条不少；这个改的是**顺序**——把一条别人的通知塞进
     /// 「我的数据」与「我的完成响应」之间。
     Interleaved(String),
+    /// 命令照常执行，但**完成响应换成给定的一行原文**（`Fault::RespondWith`）。
+    ///
+    /// 命令自己的 untagged 数据照发；被换掉的是那条 `<tag> OK …`。
+    ReplaceCompletion(Vec<String>),
+    /// 命令照常执行，但**在 untagged 数据与完成响应之间**插一条给定的原文
+    /// （`Fault::InjectUntagged`）。
+    ///
+    /// 与 [`Interleaved(String)`](Self::Interleaved) 的区别：那个插的是
+    /// `Fault::InterleaveUntagged` 的**预置形态**，这个插的是调用方给的任意一行。
+    InjectLine(String),
 }
 
 /// 命令名是否命中（`UID FETCH` 要写子命令名 `FETCH`）。
@@ -791,7 +917,9 @@ fn command_fault(
             | Fault::DropOnOnce { command: name }
             | Fault::SlowResponse { command: name, .. }
             | Fault::DropAfterLoginOn { command: name }
-            | Fault::DropAfterApply { command: name, .. } => command_matches(command, name),
+            | Fault::DropAfterApply { command: name, .. }
+            | Fault::RespondWith { command: name, .. }
+            | Fault::InjectUntagged { command: name, .. } => command_matches(command, name),
             _ => false,
         };
         if !name_match {
@@ -823,6 +951,16 @@ fn command_fault(
             // [`ServerCtx::interleave_line`] 里，免得被别的分支白白用掉。
             Fault::InterleaveUntagged { command: name, .. } => {
                 return FaultAction::Interleaved(name.clone());
+            }
+            // 换掉完成响应：命令照常执行，只有「结局」那一行是给定的原文。
+            Fault::RespondWith { response, .. } => {
+                return FaultAction::ReplaceCompletion(response.clone());
+            }
+            // 插一条给定原文：`once` 只在真的要插时记账，理由同 `InterleaveUntagged`。
+            Fault::InjectUntagged { line, once, .. }
+                if !*once || faults.claim_once("inject-untagged") =>
+            {
+                return FaultAction::InjectLine(line.clone());
             }
             _ => {}
         }

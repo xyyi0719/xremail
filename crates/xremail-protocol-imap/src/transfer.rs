@@ -284,35 +284,14 @@ async fn run_transfer_with_timeout(
 ) -> Result<TransferOutcome, ProtocolError> {
     match run_until_tagged(session, command, timeout).await? {
         TaggedOutcome::Ok(details) => {
-            let (source_uid_validity, source_uids, destination_uids) = match details.copy_uid {
-                Some(code) => (
-                    Some(code.source_validity),
-                    code.source_uids,
-                    code.destination_uids,
-                ),
-                None => (None, Vec::new(), Vec::new()),
-            };
-
             // 服务器没给 COPYUID 时，源集合就是我们自己发出去的那些
             // ——这个信息不需要服务器确认。
-            let source_uids = if source_uids.is_empty() {
-                let mut requested = requested.to_vec();
-                requested.sort_unstable();
-                requested.dedup();
-                requested
-            } else {
-                source_uids
+            let mut outcome = match details.copy_uid {
+                Some(code) => code.into_outcome(requested),
+                None => CopyUid::absent_outcome(requested),
             };
-
-            Ok(TransferOutcome {
-                source_uid_validity,
-                // RFC 4315 的 COPYUID 只带**源**文件夹的 UIDVALIDITY，
-                // 目标文件夹的一律不告诉客户端。
-                destination_uid_validity: None,
-                source_uids,
-                destination_uids,
-                message: details.information,
-            })
+            outcome.message = details.information;
+            Ok(outcome)
         }
         TaggedOutcome::Failed(detail) => Err(ProtocolError::Imap(detail)),
     }
@@ -336,14 +315,79 @@ struct OkDetails {
 }
 
 /// `COPYUID` 的已解析形态。
+///
+/// 对测试公开（`tests/imap_parsing_properties.rs`）：`COPYUID` 是服务器给的
+/// 「源 ↔ 目标」对应关系，错一位就会去核对另一封邮件，值得用随机的集合去撞。
+/// 字段刻意保持私有——构造只能用 [`expand_uid_set`] 与 [`CopyUid::state`]
+/// 这两个「服务器怎么说就怎么读」的入口。
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CopyUid {
-    /// 源文件夹的 UIDVALIDITY。
+pub struct CopyUid {
     source_validity: u32,
-    /// 源集合（线上顺序）。
     source_uids: Vec<u32>,
-    /// 目标集合（与 `source_uids` **按下标**对应）。
     destination_uids: Vec<u32>,
+}
+
+impl CopyUid {
+    /// 从 `COPYUID` 的组成部分建一份。
+    ///
+    /// 生产路径只有 [`copy_uid_of`] 一个调用点；单独露出来是为了让测试能
+    /// **在不起服务器**的情况下喂随机集合（否则每条随机样本都要一次 TLS 握手）。
+    pub fn new(source_validity: u32, source_uids: Vec<u32>, destination_uids: Vec<u32>) -> Self {
+        Self {
+            source_validity,
+            source_uids,
+            destination_uids,
+        }
+    }
+
+    /// 服务器的原话：`(源 UIDVALIDITY, 源集合, 目标集合)`。
+    pub fn state(&self) -> (u32, &[u32], &[u32]) {
+        (
+            self.source_validity,
+            &self.source_uids,
+            &self.destination_uids,
+        )
+    }
+
+    /// 按服务器给的映射组装 [`TransferOutcome`]。
+    ///
+    /// `requested` 是调用方原本要求处理的 UID：源集合为空时（服务器给了
+    /// `COPYUID` 却一个 UID 都没解析出来）就用它——与
+    /// [`run_transfer_with_timeout`] 对「没有 `COPYUID`」的处理**同一套规则**。
+    pub fn into_outcome(self, requested: &[u32]) -> TransferOutcome {
+        let source_uids = if self.source_uids.is_empty() {
+            let mut requested = requested.to_vec();
+            requested.sort_unstable();
+            requested.dedup();
+            requested
+        } else {
+            self.source_uids
+        };
+
+        TransferOutcome {
+            source_uid_validity: Some(self.source_validity),
+            // RFC 4315 的 COPYUID 只带**源**文件夹的 UIDVALIDITY。
+            destination_uid_validity: None,
+            source_uids,
+            destination_uids: self.destination_uids,
+            message: None,
+        }
+    }
+
+    /// 「服务器没给 `COPYUID`」时的结果：源集合退回调用方要求处理的那几个。
+    pub fn absent_outcome(requested: &[u32]) -> TransferOutcome {
+        let mut requested = requested.to_vec();
+        requested.sort_unstable();
+        requested.dedup();
+
+        TransferOutcome {
+            source_uid_validity: None,
+            destination_uid_validity: None,
+            source_uids: requested,
+            destination_uids: Vec::new(),
+            message: None,
+        }
+    }
 }
 
 /// 发一条命令并读到**属于它的**那个 tagged 响应为止。
@@ -437,17 +481,20 @@ async fn read_until_tagged(
 /// **只有一个** UIDVALIDITY，目标文件夹的它不告诉客户端。
 fn copy_uid_of(outcome: &imap_proto::Outcome<'_>) -> Option<CopyUid> {
     match &outcome.code {
-        Some(ResponseCode::CopyUid(validity, source, destination)) => Some(CopyUid {
-            source_validity: *validity,
-            source_uids: expand_uid_set(source),
-            destination_uids: expand_uid_set(destination),
-        }),
+        Some(ResponseCode::CopyUid(validity, source, destination)) => Some(CopyUid::new(
+            *validity,
+            expand_uid_set(source),
+            expand_uid_set(destination),
+        )),
         _ => None,
     }
 }
 
 /// 把 `UID SET` 展开成具体 UID 列表（有上限，见 [`UID_EXPANSION_LIMIT`]）。
-fn expand_uid_set(members: &[UidSetMember]) -> Vec<u32> {
+///
+/// 对测试公开（`tests/imap_parsing_properties.rs`）：这里的每一个端点
+/// 都来自服务器，差一位就会去核对另一封邮件。
+pub fn expand_uid_set(members: &[UidSetMember]) -> Vec<u32> {
     let mut out: Vec<u32> = Vec::new();
 
     for member in members {

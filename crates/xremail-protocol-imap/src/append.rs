@@ -249,7 +249,10 @@ async fn read_append_result(
 }
 
 /// 从响应里取出 `APPENDUID` 里的 UID。
-fn appended_uid(outcome: &imap_proto::Outcome<'_>) -> Option<u32> {
+///
+/// 对测试公开（`tests/imap_parsing_properties.rs`）：闭区间的端点差一位，
+/// 发信副本的 UID 就会全记错。
+pub fn appended_uid(outcome: &imap_proto::Outcome<'_>) -> Option<u32> {
     let Some(ResponseCode::AppendUid(_, members)) = &outcome.code else {
         return None;
     };

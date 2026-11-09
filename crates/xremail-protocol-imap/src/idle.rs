@@ -274,26 +274,34 @@ fn is_server_rejection(error: &async_imap::error::Error) -> bool {
 fn classify(response: IdleResponse) -> Result<IdleEvent, ProtocolError> {
     match response {
         IdleResponse::Timeout => Ok(IdleEvent::Timeout),
-        IdleResponse::NewData(data) => match data.parsed() {
-            // 服务器要断开。`done()` 之后也拿不回连接了，直接报错让上游重连。
-            // 单独判出来是为了让错误信息说清楚是**服务器主动断开**，
-            // 而不是含糊的「IDLE 结束失败」。
-            Response::Data {
-                status: Status::Bye,
-                ..
-            } => Err(ProtocolError::Imap("IDLE 期间服务器主动断开（BYE）".into())),
-            // 其余一律「有变化」：
-            // `MailboxData::Exists` / `Recent`（新邮件）、
-            // `Response::Expunge`（被删）、
-            // `Response::Fetch`（别的客户端改了标记）、
-            // `Response::Vanished`（QRESYNC）……
-            _ => Ok(IdleEvent::MailboxChanged),
-        },
+        IdleResponse::NewData(data) => classify_response(data.parsed()),
         // 我们从不主动中断（没有把 stop token 停下来），
         // 所以拿到这个只可能是底层流结束了——当作连接失效。
         IdleResponse::ManualInterrupt => {
             Err(ProtocolError::Imap("IDLE 被中断（连接可能已失效）".into()))
         }
+    }
+}
+
+/// [`classify`]（模块私有）里「判一条服务器推来的响应」那部分，单独拎出来给测试用。
+///
+/// 函数体与原来内联的那段**逐字相同**，只是多了一个名字：`tests/imap_parsing_properties.rs`
+/// 要喂它几千条随机的 untagged 响应，而不是每次都做一次真的 IDLE。
+pub fn classify_response(response: &Response<'_>) -> Result<IdleEvent, ProtocolError> {
+    match response {
+        // 服务器要断开。`done()` 之后也拿不回连接了，直接报错让上游重连。
+        // 单独判出来是为了让错误信息说清楚是**服务器主动断开**，
+        // 而不是含糊的「IDLE 结束失败」。
+        Response::Data {
+            status: Status::Bye,
+            ..
+        } => Err(ProtocolError::Imap("IDLE 期间服务器主动断开（BYE）".into())),
+        // 其余一律「有变化」：
+        // `MailboxData::Exists` / `Recent`（新邮件）、
+        // `Response::Expunge`（被删）、
+        // `Response::Fetch`（别的客户端改了标记）、
+        // `Response::Vanished`（QRESYNC）……
+        _ => Ok(IdleEvent::MailboxChanged),
     }
 }
 

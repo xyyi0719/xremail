@@ -468,6 +468,59 @@ pub enum Fault {
         /// 是否只插一次（之后恢复正常）。
         once: bool,
     },
+    /// 用**给定的几行原文**替换某条命令的**完成响应**（`<tag> OK …`），
+    /// 命令自己的 untagged 数据照常发出。
+    ///
+    /// 模拟「服务器回了东西，但那一行不是我们以为的形状」：
+    /// 状态词写成 `BAD`/`NO`/未知、`[APPENDUID …]` 残缺、`[COPYUID …]` 的集合
+    /// 长短对不上……这些都不是本仓库的 bug，而是**对端**的行为，
+    /// 客户端那一侧的解析必须对它们有明确的立场。
+    ///
+    /// 与 [`Fault::InterleaveUntagged`] 的分工：那个证明「客户端只认自己的 tag、
+    /// 能吞掉别人的噪音」，这个证明「客户端自己的结局换了形状之后，
+    /// 它不会把缺的信息补成默认值、也不会去替服务器圆场」。
+    ///
+    /// `response` 按**行**给出（不含 CRLF），`{tag}` 会替换成这条命令的 tag
+    /// ——tag 由客户端生成，写死就对不上了。给空列表等于「一个字都不回」。
+    ///
+    /// ## 换不掉的「信息类」完成响应
+    ///
+    /// 有些数据只出现在完成响应里：`EXAMINE` 的 `[UIDVALIDITY …]`、
+    /// `APPEND` 的 `[APPENDUID …]`。**async-imap 的 `select` / `examine` /
+    /// `append` 走的是它自己的解析**，`[UIDVALIDITY]` 与 `[APPENDUID]`
+    /// 都会被它从那一行里读出来；本故障只换「线路上的一行」，换完它的解析
+    /// 就认为对方什么都没给，于是不会再有后面的 `OK`——调用方会**挂到超时**。
+    ///
+    /// 这不是故障注入的缺陷，而是那些路径的真实行为（改动要动第三方 crate）。
+    /// 所以这类「缺字段」的用例要走服务器**自己组织**的响应（假服务器的
+    /// untagged 行）或者直接测纯函数，别用它硬造。
+    ///
+    /// 匹配规则与 [`Fault::SlowResponse`] 一致：命令名大写，`UID FETCH` 写子命令名
+    /// `"FETCH"`。
+    RespondWith {
+        /// 命令名。
+        command: String,
+        /// 替换成哪几行（不含 CRLF，`{tag}` 由服务器替换）。
+        response: Vec<String>,
+    },
+    /// 在某条命令的 untagged 数据**之后**、完成响应**之前**，插入一条**原文**行。
+    ///
+    /// 与 [`Fault::InterleaveUntagged`] 的区别：那个只能从 [`InterleavedUntagged`]
+    /// 预置的四种「合法且无害」形态里挑（它们是给「吞噪音」用的既有用例）；
+    /// 这个可以塞**任意**一行——包括不合法的、或者本仓库要专门检验的形态。
+    ///
+    /// 和 [`Fault::RespondWith`] 的分工：`RespondWith` 换的是「结局」，
+    /// 这条加的是「数据」。async-imap 读到 unknown / bad 的响应会直接报
+    /// `io::Error`，所以这里插入的原文正是用来验证**坏数据到了本层手里**
+    /// 会发生什么，而不是被 `Fault::RespondWith` 换掉留下一个永远不来的结局。
+    InjectUntagged {
+        /// 命令名（匹配规则同上）。
+        command: String,
+        /// 要插入的原文（不含 CRLF）。
+        line: String,
+        /// 是否只插一次（之后恢复正常）。
+        once: bool,
+    },
 }
 
 /// [`Fault::InterleaveUntagged`] 插进去的那条 untagged 响应是什么。
@@ -626,7 +679,9 @@ impl ServerConfig {
             | Fault::DropAfterLoginOn { command }
             | Fault::DropOnOnce { command }
             | Fault::DropAfterApply { command, .. }
-            | Fault::InterleaveUntagged { command, .. } => command.eq_ignore_ascii_case(&upper),
+            | Fault::InterleaveUntagged { command, .. }
+            | Fault::RespondWith { command, .. }
+            | Fault::InjectUntagged { command, .. } => command.eq_ignore_ascii_case(&upper),
             _ => false,
         })
     }
