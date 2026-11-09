@@ -192,10 +192,15 @@ T8 乱序响应（11 条）、folder 角色落库（R04）合并后 **1050**；
 其中 **1 个是 `#[ignore]`**（`apps/shell/src-tauri/tests/real_mail_roundtrip.rs` 的
 `real_round_trip_between_two_mailboxes`，真实邮箱往返、会真的发信；旧版引用的 `:68` 已失效，按用例名检索），
 所以 `cargo test` 实际执行 **1144** 个
-（2026-11-09 本轮实测：`cargo test --workspace -- --list 2>/dev/null | grep -c ': test$'` = **1096**，
-逐包相加同为 1113：core 127 / store 113 / crypto 40 / api 38 / sync 216 / protocol-imap 161 /
+（2026-11-09 那一批：`--list` = **1096**，
+逐包相加同为 1096：core 127 / store 113 / crypto 40 / api 38 / sync 216 / protocol-imap 161 /
 protocol-smtp 37 / testkit 69 / message 105 / dkim 40 / diagnostics 3 / shell 147；
-同口径全量跑累加 `test result:` = **1112 passed / 0 failed / 1 ignored**）；
+那次全量跑 = **1095 passed / 0 failed / 1 ignored**）。
+> 这一行此前写成「1113」——**明细相加是 1096**，两个数对不上，2026-11-10 按明细改正。
+**最新一次（2026-11-10）**：`--list` = **1147**，逐包相加同为 1147：
+core 127 / store 125 / crypto 40 / api 38 / sync 220 / protocol-imap 178 /
+protocol-smtp 37 / testkit 69 / message 123 / dkim 40 / diagnostics 3 / shell 147；
+全量跑 = **1144 passed / 0 failed / 3 ignored**。
 上一条记录（同日较早，1088 那一批）实测为 `env -u DBUS_SESSION_BUS_ADDRESS cargo test --workspace -j 4 --no-fail-fast`，
 累加所有 `test result:` 行 = **1085 passed / 0 failed / 1 ignored**（`--list` 1086）
 （2026-11-06 实测：`cargo test --workspace -j 4 --no-fail-fast`，
@@ -292,7 +297,7 @@ npm run build --prefix apps/shell
 
 ### 6.1 本地改一行就跑全量是浪费：用 `scripts/test_changed.py`
 
-全量是 **1113 个用例**，改一段注释也跑一遍，等于把最贵的一步做成最高频的一步。
+全量是 **1147 个用例**（2026-11-10 实测；纯执行约 18 秒，改一行源码触发重编译约 29 秒），改一段注释也跑一遍，等于把最贵的一步做成最高频的一步。
 本地日常改成：
 
 ```bash

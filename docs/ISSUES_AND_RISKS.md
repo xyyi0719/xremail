@@ -26,14 +26,16 @@
   通知 / 开机自启 / WebKitGTK 沙箱验证已落地并实测到本机能力上限（残余见 R06 / R19 / R08）。
 - **外部未知**：并发连接限制、Android 后台行为——
   必须用注明环境的实测建立证据。
-- `cargo test` 现在有 **1147 个用例**（2026-11-09 本机实测，`cargo test --workspace -- --list 2>/dev/null | grep -c ': test$'`；
-  逐包点数相加同为 1147：core 127 / store 113 / crypto 40 / api 38 / sync 216 / protocol-imap 161 /
-  protocol-smtp 37 / testkit 69 / message 105 / dkim 40 / diagnostics 3 / shell 147；
-  同口径 `cargo test --workspace -j 4 --no-fail-fast` 累加 `test result:` = **1095 passed / 0 failed / 1 ignored**）。
-  上一节点是 CI 上的 **1056**（`Rust (ubuntu-latest)` 的「Report test case count」一步，本机同口径 1055 passed + 1 ignored）。
-  被忽略的那条是真实邮箱往返用例 `apps/shell/src-tauri/tests/real_mail_roundtrip.rs:68`，
-  所以**实际执行 1144 条**；前端另有 **95 个用例**（15 个文件）、Playwright **5 条**。
-  **CI 四个 job 全绿**（Rust ubuntu / Rust windows / Frontend / Docs sanity，`e0af98b`）。
+- `cargo test` 现在有 **1147 个用例**（2026-11-10 本机实测，`cargo test --workspace -- --list 2>/dev/null | grep -c ': test$'`）；
+  逐包点数相加**同为 1147**：core 127 / store 125 / crypto 40 / api 38 / sync 220 / protocol-imap 178 /
+  protocol-smtp 37 / testkit 69 / message 123 / dkim 40 / diagnostics 3 / shell 147；
+  同口径 `cargo test --workspace -j 4 --no-fail-fast` 累加 `test result:` = **1144 passed / 0 failed / 3 ignored**。
+  （这一行此前把三个数写岔了：总数 1147、逐包明细却是 1096 那一批、执行数又写成 1095——2026-11-10 重算并统一。）
+  3 条 `#[ignore]`：真实邮箱往返（`apps/shell/src-tauri/tests/real_mail_roundtrip.rs`）、
+  R59 的 `the_default_append_entry_times_out_on_a_silent_server`（要真等 30 秒）、R65 的已知残余。
+  前端另有 **95 个用例**（15 个文件）、Playwright **5 条**。
+  **CI 四个 job 全绿**（Rust ubuntu / Rust windows / Frontend / Docs sanity），最近多次推送都绿，
+  最后一次核到的是 `ca151c3`。
   这一段曾经是错的：自 D1 DKIM 起 ubuntu job 一直红（6 条 DKIM 用例撞上「钥匙串在非
   Windows 上是桩」），而文档写的是「六关本地全绿」——两个平台都没说谎，错在把
   **平台相关的用例当成了全局结论**。2026-11-09 修好并推送，Windows 那边还顺带暴露

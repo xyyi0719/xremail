@@ -13,25 +13,20 @@
 > **v0.3.0 · P0–P3 已出关；P4 的 Windows 侧已交付、Android 侧只验到「能编出 APK」；P5-L（Linux）主要工作已落地；P5 增值功能 / P6 未开始**（2026-11-09）
 >
 > 架构持续复核。当前设计见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
-> 2026-10-30 验证（当时的数字）：`cargo fmt` / `cargo clippy -D warnings` / `cargo test`（**687 个 Rust 用例**）/
-> `npm typecheck` / `npm test`（**67 个前端用例**）/ `npm build` / `cargo sqlx prepare --check` 均通过，
-> CI 四个 job 全绿。
-> 2026-11-06 复跑：`cargo test --workspace` **987 passed / 0 failed / 1 ignored**（`--list` 988）、
-> `npm test` **15 个文件 / 95 条**、`npm run test:e2e`（Playwright）**2 个文件 / 5 条**全绿。
-> 2026-11-09 复跑（托盘 + T8 乱序响应 + folder 角色 + DKIM 跨平台用例合并后）：
-> `cargo fmt --all --check` / `cargo clippy --workspace --all-targets -D warnings` /
-> `cargo test --workspace` **1061 passed / 0 failed / 1 ignored**（`--list` 1062）/
-> `npm typecheck` / `npm test` 95 条 / Playwright 5 条 / `cargo sqlx prepare --check` /
-> `check_doc_links.py` 全绿。
-> 2026-11-09 再复跑（T10 补上 IMAP 响应解析的 24 条属性测试后）：
-> `cargo test --workspace` **1144 passed / 0 failed / 3 ignored**（`--list` 1147）、
-> `cargo clippy --workspace --all-targets -D warnings` 零警告、`cargo fmt --all -- --check` 干净。
-> 2026-11-09 本轮复核（只改文档）：`cargo test --workspace -- --list` 点数 **1147**（逐包相加同为 1147），
-> 其中 1 条 `#[ignore]`（真实邮箱往返 `real_round_trip_between_two_mailboxes`）→ 实际执行 **1144**（3 条 `#[ignore]`：真实邮箱往返 1 条 + R59 的 30 秒超时验证 1 条 + R65 的已知残余 1 条）；
-> `npx vitest run` 实测 **15 个文件 / 95 条**；Playwright **2 个 spec / 5 条**。
-> **CI 口径要说清**：`.github/workflows/ci.yml` 有 **4 个 job**（`Rust (ubuntu-latest)` / `Rust (windows-latest)` /
-> `Frontend` / `Docs sanity`），它们上一次的绿是 **2026-11-09 的 `e0af98b`**（当时 CI 计数 1056）；
-> 其后的 `R46` / `R47` / 新邮件通知等提交**本地全绿，但 CI 是否已经跑绿没有核**——本机连不上 GitHub Actions。
+> **验证口径**：`cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -D warnings` /
+> `cargo test --workspace` **1144 passed / 0 failed / 3 ignored**（`--list` 1147）/
+> `npm run typecheck` / `npm test`（**15 个文件 / 95 条**）/ `npm run test:e2e`（Playwright **5 条**）/
+> `cargo sqlx prepare --check` / `scripts/check_doc_links.py` —— 2026-11-10 本机实测全绿。
+> 那 3 条 `#[ignore]`：真实邮箱往返 1 条、R59 的 30 秒超时验证 1 条、R65 的已知残余 1 条。
+>
+> **CI**：`.github/workflows/ci.yml` 有 **4 个 job**（`Rust (ubuntu-latest)` / `Rust (windows-latest)` /
+> `Frontend` / `Docs sanity`）；本仓库当前的 `main` **最近多次推送都是四个 job 全绿**，
+> 最后一次核到的是 `ca151c3`。
+>
+> 这里**只写当前那一份数字**。早先这里堆过五个不同时期的快照（687 → 987 → 1061 → 1144），
+> 读者很容易把其中一个当成「现在是多少」——其中一个快照的同一行里还同时写着
+> 「1 条 `#[ignore]`」和「3 条 `#[ignore]`」（2026-11-10 清理）。按批次的历史数字
+> 只在 [CHANGELOG.md](CHANGELOG.md) 里保留。
 >
 > **已落地**：存储层（`xremail-store`，含 FTS5 全文索引）、密文封装（`xremail-crypto`）、
 > L2 契约（`xremail-api`）、同步引擎（`xremail-sync`，含 `Scheduler` actor、IDLE 与崩溃对账）、
