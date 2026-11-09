@@ -118,6 +118,31 @@ const FRAGMENTS: &[&str] = &[
     "\u{0}", "<>", "</>", "< =", "<<<", ">>>", "<a", "a>", "<a href=", "===", "--", "--!>",
 ];
 
+/// 每个用例跑多少轮。
+///
+/// ## 为什么是这个数，而不是"越大越好"
+///
+/// 整组 6 条用例原先固定 1000–2000 轮，**全部跑完只要 0.07 秒**——
+/// 成本低得几乎没有理由跑这么少。默认提到 20 000 轮之后整组约 0.2 秒，
+/// 仍然远低于一次 `cargo test` 的编译时间。
+///
+/// 想更狠地跑一次（比如改了消毒器之后）：设 `XREMAIL_PROPERTY_ROUNDS`。
+///
+/// ```bash
+/// XREMAIL_PROPERTY_ROUNDS=2000000 cargo test -p xremail-core --test sanitizer_properties
+/// ```
+///
+/// 实测 200 万轮约 30 秒——那是**专项验证**的用法，不是日常 CI 的用法。
+fn rounds() -> usize {
+    std::env::var("XREMAIL_PROPERTY_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_ROUNDS)
+}
+
+/// 默认轮数：平衡「能在 CI 里默认跑」与「真的能撞到东西」。
+const DEFAULT_ROUNDS: usize = 20_000;
+
 /// 拼一串随机 HTML。
 fn random_html(rng: &mut Rng, atoms: usize) -> String {
     let mut out = String::new();
@@ -158,7 +183,7 @@ fn sanitizing_never_panics_on_random_input() {
     // 2000 组输入，每组最多 40 个原子（约 8 万个片段）。
     // 本机实测这一条不到 1 秒，进 CI 不会拖慢。
     let mut rng = Rng::new(0x5EED_0001);
-    for _ in 0..2000 {
+    for _ in 0..rounds() {
         let atoms = rng.below(40) + 1;
         let input = random_html(&mut rng, atoms);
         let _ = sanitize_html(&input); // 不 panic 就是通过
@@ -169,7 +194,7 @@ fn sanitizing_never_panics_on_random_input() {
 fn dangerous_constructs_never_survive() {
     // 这是**安全承诺**，优先级最高：无论输入怎么拼，输出里都不许有这些东西。
     let mut rng = Rng::new(0x5EED_0002);
-    for round in 0..2000 {
+    for round in 0..rounds() {
         let atoms = rng.below(40) + 1;
         let input = random_html(&mut rng, atoms);
         let output = sanitize_html(&input).to_ascii_lowercase();
@@ -289,7 +314,7 @@ fn tag_attribute_values(html: &str) -> Vec<(String, String)> {
 fn no_event_handler_attribute_survives() {
     // 单独查 `on*=`：上面的黑名单按标签查，这里按属性查，两者互为补集。
     let mut rng = Rng::new(0x5EED_0003);
-    for round in 0..2000 {
+    for round in 0..rounds() {
         let atoms = rng.below(40) + 1;
         let input = random_html(&mut rng, atoms);
         let output = sanitize_html(&input).to_ascii_lowercase();
@@ -307,7 +332,7 @@ fn sanitizing_is_idempotent() {
     // 二次消毒必须不变。这不是洁癖：邮件正文会被「消毒 → 存库 → 再读出来显示」，
     // 若第二步会改变内容，就会出现「存的和显示的不是同一段」。
     let mut rng = Rng::new(0x5EED_0004);
-    for round in 0..1500 {
+    for round in 0..rounds() {
         let atoms = rng.below(30) + 1;
         let input = random_html(&mut rng, atoms);
         let once = sanitize_html(&input);
@@ -329,7 +354,7 @@ fn output_is_always_well_formed() {
     // 这依赖「输出总是良构」这条实现承诺，但**不依赖**它是怎么实现的。
     const VOID: &[&str] = &["br", "hr"];
     let mut rng = Rng::new(0x5EED_0005);
-    for round in 0..1500 {
+    for round in 0..rounds() {
         let atoms = rng.below(30) + 1;
         let input = random_html(&mut rng, atoms);
         let output = sanitize_html(&input);

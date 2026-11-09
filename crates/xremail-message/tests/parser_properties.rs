@@ -59,6 +59,23 @@ impl Rng {
     }
 }
 
+/// 每个用例跑多少轮（`XREMAIL_PROPERTY_ROUNDS` 可覆盖）。
+///
+/// 默认值是按「整组跑完仍远快于编译时间」选的。要更狠地扫一遍：
+///
+/// ```bash
+/// XREMAIL_PROPERTY_ROUNDS=2000000 cargo test -p xremail-message --test parser_properties --release
+/// ```
+fn rounds() -> usize {
+    std::env::var("XREMAIL_PROPERTY_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_ROUNDS)
+}
+
+/// 默认轮数：能在 CI 里默认跑，又真能撞到东西。
+const DEFAULT_ROUNDS: usize = 20_000;
+
 /// 结构正确的 multipart 片段，用来当「骨架」。
 const SKELETON: &[&str] = &[
     "Content-Type: text/plain; charset=utf-8\r\n\r\nhello\r\n",
@@ -123,7 +140,7 @@ fn random_message(rng: &mut Rng, atoms: usize) -> Vec<u8> {
 #[test]
 fn parsing_never_panics_on_random_bytes() {
     let mut rng = Rng::new(0xB16_0001);
-    for _ in 0..2000 {
+    for _ in 0..rounds() {
         let atoms = rng.below(40) + 1;
         let raw = random_message(&mut rng, atoms);
         // 不 panic 就是通过；结果本身（Ok/Err）两种都合法。
@@ -138,7 +155,12 @@ fn attachments_never_exceed_the_cap() {
     // `MAX_ATTACHMENT_PARTS` 明写了这是防内存吃满的硬上限）。
     let mut rng = Rng::new(0xB16_0002);
     let mut worst = 0;
-    for _ in 0..300 {
+    // **这一条不跟 `rounds()`**：它每轮要生成最多 3000 个原子（模拟「一封塞了几千个
+    // part 的邮件」），单轮成本是别的用例的上百倍。按统一轮数跑 20 000 轮要 34 秒，
+    // 而它要证明的东西（「解析侧会不会在超限时刹车」）几百轮就能撞出来。
+    // 想加大只需 `XREMAIL_PROPERTY_ROUNDS`——这个值会跟着放大，但跑之前先想清楚时间。
+    let heavy_rounds = (rounds() / 50).max(200);
+    for _ in 0..heavy_rounds {
         let atoms = rng.below(3000) + 1;
         let raw = random_message(&mut rng, atoms);
         if let Ok(parsed) = parse_message(&raw) {
@@ -159,7 +181,7 @@ fn attachment_part_numbers_are_unique() {
     // 部件号是下载附件时的寻址依据（R44 的教训：口径错一位就取错段）。
     // 同一封信里出现两个相同的部件号，说明编号逻辑在某个边界上重了。
     let mut rng = Rng::new(0xB16_0003);
-    for round in 0..1500 {
+    for round in 0..rounds() {
         let atoms = rng.below(60) + 1;
         let raw = random_message(&mut rng, atoms);
         let Ok(parsed) = parse_message(&raw) else {
@@ -184,7 +206,7 @@ fn errors_stay_within_the_contract() {
     // 往 `MessageError` 里加了会「泄漏内部状态」的变体，这里会提醒他先想清楚
     // 上层（同步引擎）能不能处理。
     let mut rng = Rng::new(0xB16_0004);
-    for _ in 0..1000 {
+    for _ in 0..rounds() {
         let atoms = rng.below(30) + 1;
         let raw = random_message(&mut rng, atoms);
         if let Err(error) = parse_message(&raw) {
@@ -214,7 +236,7 @@ fn base64_style_mimetype_labels_round_trip_without_panic() {
         "charset=\"\"",
     ];
     let mut rng = Rng::new(0xB16_0005);
-    for _ in 0..500 {
+    for _ in 0..rounds() {
         let label = rng.pick(&labels);
         let raw = format!(
             "Subject: {label}\r\nContent-Type: text/plain; charset={label}\r\n\r\nbody {label}"

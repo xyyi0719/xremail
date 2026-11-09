@@ -68,6 +68,24 @@ impl Rng {
     }
 }
 
+/// 每个用例跑多少轮（`XREMAIL_PROPERTY_ROUNDS` 可覆盖）。
+///
+/// 默认值是按「整组跑完仍远快于编译时间」选的——这些用例的成本几乎只在
+/// 启动上，轮数提高十倍也只要几百毫秒。要更狠地扫一遍（改了被测解析器之后）：
+///
+/// ```bash
+/// XREMAIL_PROPERTY_ROUNDS=2000000 cargo test -p <crate> --test <file> --release
+/// ```
+fn rounds() -> usize {
+    std::env::var("XREMAIL_PROPERTY_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_ROUNDS)
+}
+
+/// 默认轮数：能在 CI 里默认跑，又真能撞到东西。
+const DEFAULT_ROUNDS: usize = 20_000;
+
 /// 会在编解码里走不同分支的固定样本。
 const SAMPLES: &[&str] = &[
     "",
@@ -93,7 +111,7 @@ const SAMPLES: &[&str] = &[
 #[test]
 fn decoding_never_panics_on_random_input() {
     let mut rng = Rng::new(0x007F_0001);
-    for _ in 0..3000 {
+    for _ in 0..rounds() {
         // 一半是「看起来像 modified UTF-7」的随机串，一半是完全随机的字符。
         let input = if rng.below(2) == 0 {
             let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+,-&";
@@ -146,7 +164,7 @@ fn error_never_contains_the_replacement_character() {
     // 反方向的守门：就算某天有人把实现改成「能解就解、解不了兜底」，
     // 也不许用 U+FFFD 糊过去——那正是文档禁止的做法。
     let mut rng = Rng::new(0x007F_0002);
-    for _ in 0..2000 {
+    for _ in 0..rounds() {
         let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+,-&xyz";
         let len = rng.below(20) + 1;
         let input: String = (0..len)
@@ -171,7 +189,7 @@ fn encode_then_decode_round_trips_for_any_valid_text() {
     // 往返性质。对任意合法 UTF-8 字符串（含中文、emoji、控制字符）都必须成立。
     let mut rng = Rng::new(0x007F_0003);
     let mut cases: Vec<String> = SAMPLES.iter().map(|s| s.to_string()).collect();
-    for _ in 0..2000 {
+    for _ in 0..rounds() {
         cases.push({
             let n = rng.below(24);
             rng.string(n)
@@ -196,7 +214,7 @@ fn encoding_never_leaves_a_bare_ampersand() {
     // 裸 `&` 会让服务器把后面的字符当成移位段的开头。
     let mut rng = Rng::new(0x007F_0004);
     let mut cases: Vec<String> = SAMPLES.iter().map(|s| s.to_string()).collect();
-    for _ in 0..1500 {
+    for _ in 0..rounds() {
         cases.push({
             let n = rng.below(20);
             rng.string(n)
@@ -234,7 +252,7 @@ fn encoding_is_pure_ascii() {
     // 否则服务器那边会按 modified UTF-7 再解一次，得到别的东西。
     let mut rng = Rng::new(0x007F_0005);
     let mut cases: Vec<String> = SAMPLES.iter().map(|s| s.to_string()).collect();
-    for _ in 0..1500 {
+    for _ in 0..rounds() {
         cases.push({
             let n = rng.below(20);
             rng.string(n)
