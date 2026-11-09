@@ -656,8 +656,23 @@ fn trim_one_trailing_crlf(payload: &[u8]) -> &[u8] {
 /// 只有超过 RFC 5322 §2.1 的 998 字节硬上限时才折行；
 /// 正常长度的标题不会被折，接收端拿到的仍是原样的一段。
 fn write_header(out: &mut Vec<u8>, name: &str, value: &str) {
-    let limit = MAX_HEADER_LINE.saturating_sub(name.len() + 2);
-    let lines = fold_value(value, limit);
+    // **先去掉值两端的空白**（R66 的根治）。
+    //
+    // RFC 5322 §2.2.2 / §2.8 明确说：头字段值的前导与尾随 FWS 在语义上无意义，
+    // 解析时要丢掉。留着它只会带来麻烦——最典型的是「主题恰好是一长串空格」：
+    // 折行层无论怎么折，都必然产生「只有空白」的续行（内容本身就是空白，
+    // 减一格还是空白），而接收端把这种续行折叠成空行后，邮件头就提前结束了。
+    //
+    // 在折行**之前** trim，问题从根上消失，而且不损失任何信息（那些空白
+    // 本来就不会被对端保留）。这一步放在 `write_header` 里而不是各个调用点：
+    // 它是所有头字段的统一出口，漏掉任何一个调用点就等于留一个口子。
+    let value = value.trim();
+
+    // 每行的前缀长度**不一样**：第一行是 `Name: `（名字 + 冒号 + 空格），
+    // 续行只有那个前导空格。以前只把「第一行的剩余宽度」传下去，
+    // 于是 `fold_value` 只能按最窄的那一行省着用。
+    let first_prefix = name.len() + 2;
+    let lines = fold_value(value, first_prefix, MAX_HEADER_LINE);
     for (index, line) in lines.iter().enumerate() {
         if index == 0 {
             out.extend_from_slice(name.as_bytes());
@@ -701,20 +716,26 @@ fn write_header(out: &mut Vec<u8>, name: &str, value: &str) {
 ///   见 `tests/decoding_regressions.rs` 里钉住现状的那条用例；
 /// * 没有可切的空白就在字符边界上硬切（**不能**按字节切：切在汉字中间，
 ///   单独看是合法 UTF-8，但接收端按字节拼回来就成了乱码）。
-fn fold_value(value: &str, limit: usize) -> Vec<String> {
-    // 一行**总共**能放多少字符（含续行前面那个前导空格）。
-    let row_width = limit.max(2);
-    // 去掉前导空格之后还能放多少内容。
-    let content_width = row_width - 1;
-    // 纯空白段再少放一个（理由见函数文档最后一条）。
-    let space_width = content_width.saturating_sub(1).max(1);
+fn fold_value(value: &str, first_prefix: usize, max_line: usize) -> Vec<String> {
+    // 第一行能放多少字符：整行预算扣掉 `Name: ` 那一段。
+    let first_width = max_line.saturating_sub(first_prefix).max(2);
+    // 续行能放多少字符：**只有**前面那个前导空格。
+    let cont_width = max_line.saturating_sub(1).max(2);
 
     let mut lines: Vec<String> = Vec::new();
     let mut rest = value;
 
     while !rest.is_empty() {
+        // 本行用哪个宽度：第一行要扣 `Name: `，续行只扣一个前导空格。
+        // 这个「逐行不同」正是 R66 的根因——以前统一用最窄的那个宽度，
+        // 结果续行明明还有余量却用不上，纯空白主题就折出了只有空白的一行。
+        let content_width = if lines.is_empty() {
+            first_width
+        } else {
+            cont_width
+        };
         // 本行能放下的前缀：**字符数**不超过 `content_width`，返回字节长度。
-        // 用 `take_chars` 而不是切片下标，是因为 `limit` 的口径一直是字符数，
+        // 用 `take_chars` 而不是切片下标，是因为宽度口径是字符数，
         // 而 `str` 的下标是字节——两者只在纯 ASCII 时才一致。
         let prefix_bytes = take_chars(rest, content_width);
         if prefix_bytes == rest.len() {
@@ -746,7 +767,11 @@ fn fold_value(value: &str, limit: usize) -> Vec<String> {
         let only_spaces = rest.chars().all(|ch| ch == ' ' || ch == '\t');
         let cut = match preferred {
             Some(byte) => byte,
-            None if rest.starts_with(' ') && only_spaces => take_chars(rest, space_width),
+            None if rest.starts_with(' ') && only_spaces => {
+                // 纯空白段再少放一个：收端会 trim 行尾空白，某个续行剩下的
+                // 内容如果恰好紧贴下一行，trim + 折叠前导空格之后就成空行。
+                take_chars(rest, content_width.saturating_sub(1).max(1))
+            }
             None if rest.starts_with(' ') => take_chars(rest, content_width),
             // 一个比整行还长的「词」：在字符边界上硬切。
             None => prefix_bytes,

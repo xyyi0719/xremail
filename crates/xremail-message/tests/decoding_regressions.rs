@@ -212,39 +212,36 @@ fn header_lines(text: &str) -> Vec<String> {
 }
 
 #[test]
-fn a_subject_that_is_one_long_run_of_spaces_ends_the_header_early() {
-    // **钉住现状（已知未修，R62 的残余）**：这条断言的是「现在的错误行为」，
-    // 不是「正确行为」。修好之后它会变红——那时把它改成 `assert_eq!(len, 6)`。
+fn a_subject_that_is_one_long_run_of_spaces_does_not_end_the_header_early() {
+    // R66：`fold_value` 拿不到「本行实际前缀」，纯空白主题会折出「只有空白」的一行——
+    // 接收端 trim 行尾空白后就是空行，`Date:` / `MIME-Version:` / `Content-Type:`
+    // / `CTE:` 全掉进正文。
     //
-    // 现场：`fold_value` 对「整段全是空格」的输入按宽度硬切，两行恰好用光
-    // 一行 998 的预算：第一行 988 个空格（拼着 `Subject:` 正好 998），第二行
-    // 是续行的前导空格 + 剩下的 9 个空格。接收端把行尾空白 trim 掉之后，
-    // 第一行剩下的非空白内容就只剩 `Subject:`，第二行整行空白——
-    // 它和折叠出来的前导空格一起构成了空行，邮件头到此结束，
-    // `Date:` / `MIME-Version:` / `Content-Type:` / `Content-Transfer-Encoding:`
-    // 全掉进正文，收件方看到乱码加一串头字段。
-    //
-    // 为什么先不修：可用的折行空间是逐行变化的（第一行要扣掉 `Subject: `，
-    // 续行只扣一个空格），而「这一轮该用多少」由 `write_header` 决定；所有
-    // 能放进 `fold_value` 的保守方案（每行再少放一格）都会让正常长标题
-    // （`Quarterly report …`）的往返解出多一个空格。正确修法是让
-    // `fold_value` 接收「本行的实际前缀长度」——那是一处跨函数的改动，
-    // 本轮先如实登记，见报告。
+    // 修法：给 `fold_value` 传「第一行前缀长度」与「续行前缀长度」两个值
+    // （第一行扣 `Subject: `、续行只扣一个前导空格），不再统一按最窄的那一行省着用。
     let built =
         build_message(&message_with_subject(" ".repeat(995)), &options()).expect("应当构建成功");
 
     let lines = header_lines(&String::from_utf8_lossy(&built.bytes));
-    assert_eq!(
-        lines.len(),
-        9,
-        "现状：邮件头拖到第 9 行才结束（第 4 行是只剩空白的续行）"
+    // 顺着这条用例原来的思路数：修好之后邮件头**不会提前结束**，
+    // 而且**没有任何一行是空的或只有空白**。
+    assert!(
+        !lines.iter().any(|line| line.trim().is_empty()),
+        "邮件头里不能有空行或只有空白的一行，实际：{lines:#?}"
     );
-    assert_eq!(
-        lines[3].len(),
-        9,
-        "现状：第 4 行是续行的前导空格 + 9 个空格，整行没有可见内容"
-    );
-    // 正确的断言在这个长度下是 `lines.len() == 8` 且 `!lines[..].any(|l| l.trim().is_empty())`。
+    // 关键字段必须仍留在头里（这一条才是「头提前结束」的直接证据）。
+    let header = lines.join("\n");
+    for required in [
+        "Date:",
+        "MIME-Version:",
+        "Content-Type:",
+        "Content-Transfer-Encoding:",
+    ] {
+        assert!(
+            header.contains(required),
+            "{required} 掉进了正文——邮件头提前结束了：\n{header}"
+        );
+    }
 }
 
 #[test]

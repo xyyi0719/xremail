@@ -133,7 +133,16 @@ pub fn is_session_recoverable(error: &AppError) -> bool {
 pub(crate) fn is_dead_session_text(message: &str) -> bool {
     const EVIDENCE: &[&str] = &[
         // `ProtocolError::Io` 的 `Display` 前缀：连上了、读写时传输层失败。
-        "io error",
+        //
+        // **写的是 `IO 失败`（大写的 IO）**：`ProtocolError::Io` 的 `#[error]`
+        // 是中文的 `"IO 失败: {0}"`，不是英文的 `io error`。这里曾经写成
+        // `"io error"`——那条**永远匹配不上**任何东西（2026-11-09 协议层审计发现，
+        // R62 的附带项）。目前不影响结论：`ProtocolError::Io` 在
+        // `pull::map_protocol_error` 里直接翻成 `AppError::Network`，
+        // `is_session_recoverable` 对 `Network` 返回真，不经过这条文字判据。
+        // 保留正确的前缀是为了让这条证据表在**将来**有人把 `Io` 改成
+        // 走 `Protocol` 分支时仍然有效。
+        "IO 失败",
         "timed out",
         // TLS 的另一头把连接关了。rustls 的措辞是
         // `peer closed connection without sending TLS close_notify`，
@@ -142,6 +151,7 @@ pub(crate) fn is_dead_session_text(message: &str) -> bool {
         "closed connection",
         "unexpected eof",
         "connection reset",
+        "connection lost",
         "broken pipe",
         // 对面**不发 FIN 也不发 `close_notify`** 直接消失了（NAT 老化、机器休眠、
         // 中间设备丢状态）。读端什么都收不到，于是我们自己的 `read_line` 超时先响：
@@ -258,11 +268,16 @@ mod tests {
 
     #[test]
     fn unclassified_errors_fall_back_to_the_text() {
-        // 没人打标记的手工拼串路径：`ProtocolError::Io` 的 `Display` 是 `io error: …`。
+        // 没人打标记的手工拼串路径：`ProtocolError::Io` 的 `Display` 是
+        // `IO 失败: …`（中文的「IO 失败」，不是英文的 `io error`——这里曾经
+        // 写成 `io error`，那条证据**永远匹配不上**，是协议层审计查出来的）。
         for detail in [
-            "列文件夹失败: io error: connection reset by peer",
-            "以可写方式打开文件夹失败: io error: connection lost",
+            "列文件夹失败: IO 失败: connection reset by peer",
+            "以可写方式打开文件夹失败: IO 失败: connection lost",
             "IDLE 期间服务器主动断开（BYE）",
+            // 英文的 `io error` 也留着：真实掉线可能是 rustls / OpenSSL 的
+            // 英文措辞原样漏下来，两种都要认。
+            "列文件夹失败: io error: connection reset by peer",
         ] {
             assert!(
                 is_session_recoverable(&AppError::Protocol(detail.to_string())),
