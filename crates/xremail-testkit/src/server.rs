@@ -27,7 +27,7 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 
 use crate::certificate::{CertError, ServerCertificate};
-use crate::config::{Fault, MailboxFixture, MessageFixture, ServerConfig};
+use crate::config::{Fault, InterleavedUntagged, MailboxFixture, MessageFixture, ServerConfig};
 use crate::fetch::{FetchItem, StoreOperation, build_fetch_response, parse_fetch, parse_store};
 use crate::parser::{Command, quote};
 use crate::search;
@@ -435,7 +435,8 @@ async fn handle_connection(
                 // 慢：命令收到后过一会儿才回。
                 tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
             }
-            FaultAction::None => {}
+            // 噪音在下面 `handle_command_with_interleave` 里插。
+            FaultAction::None | FaultAction::Interleaved(_) => {}
         }
 
         let ctx = ServerCtx {
@@ -444,7 +445,22 @@ async fn handle_connection(
             faults: &faults,
             pushes: &pushes,
         };
-        match handle_command(&mut write_half, &mut reader, &ctx, &mut state, &command).await {
+        let write_result = match action {
+            FaultAction::Interleaved(noise) => {
+                // `reply!` 要拿一个可变的 `writer` 名字；这里要写两次（噪音 + 命令），
+                // 传 `&mut write_half` 会让绑定本身不可变，所以先重借一次。
+                let mut writer = &mut write_half;
+                // 噪音写不出去就照常处理：这条故障只是在**正常的**会话里加干扰，
+                // 不该让连接因为「多写一条」而表现得更糟——所以这里**不用 `?`**。
+                if write_line(&mut writer, noise.as_str()).await.is_err() {
+                    break;
+                }
+                handle_command_with_interleave(&mut writer, &mut reader, &ctx, &mut state, &command)
+                    .await
+            }
+            _ => handle_command(&mut write_half, &mut reader, &ctx, &mut state, &command).await,
+        };
+        match write_result {
             Ok(Continue::Continue) => {}
             Ok(Continue::Close) => break,
             Err(_) => break,
@@ -452,6 +468,61 @@ async fn handle_connection(
     }
 
     Ok(())
+}
+
+/// 以「中间穿插一条 untagged」的方式处理一条命令。
+///
+/// 顺序是：`命令自己的 untagged 数据` → `噪音` → `命令自己的 tagged 完成响应`。
+/// 这就是 163 / QQ 在一条命令处理过程中插进别的变更通知时，客户端**真正看到**
+/// 的字节顺序——噪音卡在「我的数据」与「我的结局」之间，而不是跟在结局后面。
+///
+/// 做法是让 `handle_command` 把这一轮要写的字节先写进内存，再按行把噪音插到
+/// 第一个 tagged 行之前。不去改十几条命令分支各自写 tagged 的地方。
+/// 哪些行算「tagged 完成响应」按**格式**判：[`Command::parse`] 只认
+/// `<tag> <命令名> …`，`* OK …` / `+ text` / 裸字面量都不符合，
+/// 所以不会把 untagged 行误判成 tagged。`LOGOUT` 的 `* BYE` 与它的 `OK`、
+/// `IDLE` 的推送与 `OK IDLE terminated` 也都在缓冲区里、相对顺序不变。
+async fn handle_command_with_interleave<W, R>(
+    mut writer: &mut W,
+    reader: &mut R,
+    ctx: &ServerCtx<'_>,
+    state: &mut SessionState,
+    command: &Command,
+) -> std::io::Result<Continue>
+where
+    W: AsyncWrite + Unpin,
+    R: AsyncBufRead + Unpin,
+{
+    let Some(noise) = ctx.interleave_line(command, state.selected) else {
+        // 不该走到这里（发出 `Interleaved` 就说明刚判过命中）；万一走到，
+        // 退化成正常处理，而不是把命令吞掉。
+        return handle_command(&mut writer, reader, ctx, state, command).await;
+    };
+
+    let mut captured: Vec<u8> = Vec::new();
+    let result = {
+        let mut sink = &mut captured;
+        handle_command(&mut sink, reader, ctx, state, command).await
+    };
+
+    let text = String::from_utf8_lossy(&captured);
+    let mut wrote_noise = false;
+    for line in text.split_inclusive("\r\n") {
+        let body = line.trim_end_matches("\r\n");
+        if !wrote_noise && Command::parse(body).is_some() {
+            reply!(writer, "{}", noise);
+            wrote_noise = true;
+        }
+        reply!(writer, "{}", body);
+    }
+
+    // 一条 tagged 都没出现（本轮还没收尾，例如 `IDLE` 只回了续行）：
+    // 噪音放在已写出的内容之后——它依旧是 untagged，冒充不了任何结局。
+    if !wrote_noise {
+        reply!(writer, "{}", noise);
+    }
+
+    result
 }
 
 /// 会话状态。
@@ -572,6 +643,68 @@ impl ServerCtx<'_> {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         guard.claim_once("ignore-store")
     }
+
+    /// 这条命令要不要在 tagged 响应之前插一条 untagged 噪音（`Fault::InterleaveUntagged`）。
+    ///
+    /// 返回要写的那一行。`once` 的记账**只在真的要插时**才算数——
+    /// 与 [`Self::truncate_body_bytes`] 同样的理由：命令名被别的分支先截走了
+    /// （比如 `UID MOVE` 在能力不足时回 `BAD`），不该白白用掉这次故障。
+    fn interleave_line(&self, command: &Command, selected: Option<usize>) -> Option<String> {
+        let fault = self
+            .config
+            .find_fault(|f| matches!(f, Fault::InterleaveUntagged { .. }))?;
+        let Fault::InterleaveUntagged {
+            command: name,
+            noise,
+            once,
+        } = fault
+        else {
+            return None;
+        };
+        let (name, noise, once) = (name.clone(), *noise, *once);
+
+        if !command_matches(command, &name) {
+            return None;
+        }
+
+        if once {
+            let mut guard = self
+                .faults
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !guard.claim_once(&format!("interleave:{name}")) {
+                return None;
+            }
+        }
+
+        // `EXISTS` / `FETCH` 都只对**选中的**邮箱成立（RFC 3501 §7.1 / §7.3）：
+        // 没选中邮箱时插它们就是插一条非法响应，那测的就不是「吞噪音」了。
+        let noise = match noise {
+            _ if selected.is_none() => InterleavedUntagged::Bye,
+            other => other,
+        };
+
+        // 邮件数取**插入这一刻**的真实值。
+        //
+        // 只有 `EXISTS` / `FETCH` 这两种形态用得上它；写命令（`STORE` 等）此时
+        // 可能正锁着邮箱表，所以用 `try_lock`：拿不到就用 0 —— `* 0 EXISTS`
+        // 只是「报了个旧的空快照」，依旧合法、依旧不引用任何邮件，
+        // 不会让用例验到错的东西。
+        let exists = match noise {
+            InterleavedUntagged::Exists | InterleavedUntagged::FetchFlags => self
+                .mailboxes
+                .try_lock()
+                .map(|mailboxes| {
+                    mailboxes
+                        .get(selected.unwrap_or_default())
+                        .map_or(0, |mailbox| mailbox.messages.len() as u32)
+                })
+                .unwrap_or(0),
+            _ => 0,
+        };
+
+        Some(noise.line(exists))
+    }
 }
 
 /// 一条命令在日志里的样子（**不含** tag）。
@@ -602,6 +735,25 @@ enum FaultAction {
     DropAfterApply,
     /// 延迟这么久再处理。
     Delay(u64),
+    /// 正常处理命令，但**在 tagged 响应之前**多插一条 untagged 噪音
+    /// （`Fault::InterleaveUntagged`）。
+    ///
+    /// 与 [`FaultAction::Delay`] 的区别：`Delay` 改的是**时间**，
+    /// 命令的结果一条不少；这个改的是**顺序**——把一条别人的通知塞进
+    /// 「我的数据」与「我的完成响应」之间。
+    Interleaved(String),
+}
+
+/// 命令名是否命中（`UID FETCH` 要写子命令名 `FETCH`）。
+///
+/// 按命令名匹配的故障都走这里，免得每种故障各写一遍、各自漏掉 `UID` 前缀。
+fn command_matches(command: &Command, name: &str) -> bool {
+    if command.name.eq_ignore_ascii_case(name) {
+        return true;
+    }
+    command
+        .uid_subcommand()
+        .is_some_and(|(sub, _)| sub.eq_ignore_ascii_case(name))
 }
 
 /// 判定一条命令要触发哪个故障。
@@ -631,23 +783,15 @@ fn command_fault(
         }
     }
 
-    // 按命令名匹配：命令名本身 + `UID` 的子命令名。
-    let mut names = vec![command.name.clone()];
-    if let Some((sub, _)) = command.uid_subcommand() {
-        names.push(sub);
-    }
-
     for fault in &config.faults {
         let name_match = match fault {
-            Fault::HangOn(command)
-            | Fault::Reject(command)
-            | Fault::DropOn(command)
-            | Fault::DropOnOnce { command }
-            | Fault::SlowResponse { command, .. }
-            | Fault::DropAfterLoginOn { command }
-            | Fault::DropAfterApply { command, .. } => {
-                names.iter().any(|name| name.eq_ignore_ascii_case(command))
-            }
+            Fault::HangOn(name)
+            | Fault::Reject(name)
+            | Fault::DropOn(name)
+            | Fault::DropOnOnce { command: name }
+            | Fault::SlowResponse { command: name, .. }
+            | Fault::DropAfterLoginOn { command: name }
+            | Fault::DropAfterApply { command: name, .. } => command_matches(command, name),
             _ => false,
         };
         if !name_match {
@@ -671,6 +815,14 @@ fn command_fault(
                 if !*once || faults.claim_once(&format!("drop-after-apply:{command}")) =>
             {
                 return FaultAction::DropAfterApply;
+            }
+            // 乱序：命令照常执行，只是把噪音插在它的 tagged 响应之前。
+            //
+            // 这里**不**记 `once`：噪音要等真的写出去之前才可知形态
+            // （没选中邮箱时得换成 `BYE`），记账放在
+            // [`ServerCtx::interleave_line`] 里，免得被别的分支白白用掉。
+            Fault::InterleaveUntagged { command: name, .. } => {
+                return FaultAction::Interleaved(name.clone());
             }
             _ => {}
         }

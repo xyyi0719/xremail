@@ -35,7 +35,7 @@ pub mod server;
 pub mod smtp;
 
 pub use certificate::{CertError, ServerCertificate};
-pub use config::{Fault, MailboxFixture, MessageFixture, ServerConfig};
+pub use config::{Fault, InterleavedUntagged, MailboxFixture, MessageFixture, ServerConfig};
 pub use fetch::{BodySection, FetchItem, StoreOperation, StoreRequest, parse_fetch, parse_store};
 pub use parser::Command;
 pub use search::SearchKey;

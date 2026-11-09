@@ -435,6 +435,105 @@ pub enum Fault {
         /// 是否只断第一次。
         once: bool,
     },
+    /// 某条命令的**正常响应之间**（untagged 数据之后、tagged 完成响应之前）
+    /// 插入一条**别的** untagged 响应；发完继续正常处理这条命令。
+    ///
+    /// 模拟什么：Coremail 体系（163 / QQ）在处理一条命令的过程中，会**顺带**
+    /// 把另一个变更通知插进来——`* 5 EXPUNGE`、`* 3 FETCH (FLAGS (\Seen))`——
+    /// 这样客户端收到的顺序就是「我的响应 → 别人的通知 → 我的完成响应」，
+    /// 而不是「我的响应 → 我的完成响应」。
+    ///
+    /// 为什么需要它：客户端的读循环若用「每读到一条 untagged 就攒起来」的写法，
+    /// 攒下的东西会**混进下一条命令的结果**。只有把噪音塞在**别人的**命令
+    /// 还没发出去之前，才能证明命令层是**按 tag 自证成败**的
+    /// （见 ARCHITECTURE §2.1），而不是「收到的都是我的」。
+    ///
+    /// 和相邻变体的区别：[`Fault::SlowResponse`] 是「晚回」，
+    /// [`Fault::DropOn`] 是「不回」，本条是**顺序**问题——响应一条不少、
+    /// 值也都对，只是**插了队**。所以验证的重点在「读到的内容对不对」，
+    /// 而不是「成没成功」。
+    ///
+    /// 匹配规则与 [`Fault::SlowResponse`] 一致：命令名大写，`UID FETCH` 写子命令名
+    /// `"FETCH"`。
+    ///
+    /// 插入的响应**不改变服务器状态**：它只是线路上的一条「假」通知，
+    /// 服务器自己并不认为有过一次删除或一次标记变更——否则用例验到的就是
+    /// 「服务器真的变了」，而不是「客户端能吞掉噪音」。
+    /// 具体插什么由 [`InterleavedUntagged`] 决定。
+    InterleaveUntagged {
+        /// 命令名。
+        command: String,
+        /// 插什么。
+        noise: InterleavedUntagged,
+        /// 是否只插一次（之后恢复正常）。
+        once: bool,
+    },
+}
+
+/// [`Fault::InterleaveUntagged`] 插进去的那条 untagged 响应是什么。
+///
+/// 所有形态都必须是**合法且无害**的：客户端把它当噪音丢掉时，
+/// **不能**因此误判「邮件被删了」「状态变了」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterleavedUntagged {
+    /// `* <n> EXISTS`，n 取**当前文件夹的真实邮件数**。
+    ///
+    /// 为什么选它当默认：`EXISTS` 是「到这一刻为止共有几封」的**快照**，
+    /// 报当前值等于报了个空操作——客户端即便照着它更新计数，也只会得到
+    /// 本来就知道的数。它**不引用任何具体邮件**（没有序号、没有 UID），
+    /// 所以既不会让客户端以为某封邮件没了，也不会让它去拉一封不存在的邮件。
+    ///
+    /// 对比：`EXPUNGE` 会告诉客户端「序号 1 没了」，客户端若当真会把本地
+    /// 邮件删掉，还会让其后所有序号左移——那是改状态，不是噪音；
+    /// `FETCH` 只对「碰巧在等 `FETCH`」的命令是噪音，对 `STORE` / `SEARCH`
+    /// 这种用别的形态。
+    ///
+    /// 服务器必须处于**已选中文件夹**的状态才会插；未选中时
+    /// （RFC 3501 下 `EXISTS` 只对选中的邮箱有意义）改插 [`Self::Bye`]。
+    Exists,
+    /// `* 3 FETCH (FLAGS (\Seen))`。
+    ///
+    /// 模拟「别的客户端刚把第 3 封标成已读」。用**固定的序号 3 + 固定标记**
+    /// 而不是真实邮件：它不携带 UID，也不携带任何内容，
+    /// 即便客户端把它当成本次 `FETCH` 的结果收下，也只会得到一条
+    /// 「第 3 封带 `\Seen`」的空记录——用例一断言 UID / 正文就会露馅。
+    /// 文件夹里不足 3 封时退回 [`Self::Exists`]：序号越界的 `FETCH`
+    /// 是非法响应，不能拿来当噪音。
+    FetchFlags,
+    /// `* OK [ALERT] …`。
+    ///
+    /// 服务器主动发的告警，RFC 3501 允许它出现在任何时刻。
+    /// 用来验证客户端**不会**把一条「像完成响应」的 `OK` 当成自己那条的结局
+    /// ——它没有 tag。
+    OkAlert,
+    /// `* BYE …`。
+    ///
+    /// 模拟「服务器宣布要关机」。它**不会**真的断开连接，所以对继续跑命令的
+    /// 客户端只是噪音；但它是 untagged 响应里最「吓人」的一种
+    /// （RFC 3501 说收到 `BYE` 就该准备断线），拿它验证客户端不会因此
+    /// 把会话判死。
+    Bye,
+}
+
+impl InterleavedUntagged {
+    /// 在线路上要写的那一行。
+    ///
+    /// `exists` 是插这条响应时文件夹里的**真实**邮件数，`messages` 是同一时刻的
+    /// 邮件数——`FetchFlags` 靠它判断序号 3 是否合法。
+    pub fn line(self, exists: u32) -> String {
+        match self {
+            // `EXISTS` 只在选中邮箱时有意义；没选中的场景由调用方退回 `Bye`。
+            InterleavedUntagged::Exists => format!("* {exists} EXISTS"),
+            // 序号 3 越界时退回 `EXISTS`：非法响应会让客户端解析失败，
+            // 那测的就不是「能吞噪音」，而是「能扛住非法输入」了。
+            InterleavedUntagged::FetchFlags if exists < 3 => format!("* {exists} EXISTS"),
+            InterleavedUntagged::FetchFlags => "* 3 FETCH (FLAGS (\\Seen))".to_string(),
+            InterleavedUntagged::OkAlert => {
+                "* OK [ALERT] Fake IMAP: interleaved untagged response".to_string()
+            }
+            InterleavedUntagged::Bye => "* BYE Fake IMAP says goodbye (but stays)".to_string(),
+        }
+    }
 }
 
 /// 假服务器的配置。
@@ -526,7 +625,8 @@ impl ServerConfig {
             Fault::SlowResponse { command, .. }
             | Fault::DropAfterLoginOn { command }
             | Fault::DropOnOnce { command }
-            | Fault::DropAfterApply { command, .. } => command.eq_ignore_ascii_case(&upper),
+            | Fault::DropAfterApply { command, .. }
+            | Fault::InterleaveUntagged { command, .. } => command.eq_ignore_ascii_case(&upper),
             _ => false,
         })
     }
@@ -686,5 +786,57 @@ mod tests {
                 .find_fault(|f| matches!(f, Fault::DropOnContains { .. }))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn interleave_fault_is_matched_by_command_name() {
+        let mut config = ServerConfig::default();
+        config.faults.push(Fault::InterleaveUntagged {
+            command: "FETCH".to_string(),
+            noise: InterleavedUntagged::Exists,
+            once: true,
+        });
+
+        // `UID FETCH` 的子命令名就是 `FETCH`：匹配规则要与 `SlowResponse` 一致。
+        assert!(matches!(
+            config.fault_for("fetch"),
+            Some(Fault::InterleaveUntagged {
+                noise: InterleavedUntagged::Exists,
+                ..
+            })
+        ));
+        assert!(config.fault_for("STORE").is_none());
+    }
+
+    /// 选择噪音形态的约束：**合法**且**不改变任何状态**。
+    #[test]
+    fn interleaved_untagged_lines_are_legal_and_harmless() {
+        // 默认形态报的是当前真实邮件数：等于一个空操作。
+        assert_eq!(InterleavedUntagged::Exists.line(7), "* 7 EXISTS");
+        // 空文件夹也合法。
+        assert_eq!(InterleavedUntagged::Exists.line(0), "* 0 EXISTS");
+
+        // 序号 3 存在时才发 `FETCH`。
+        assert_eq!(
+            InterleavedUntagged::FetchFlags.line(5),
+            "* 3 FETCH (FLAGS (\\Seen))"
+        );
+        // 不足 3 封时不能发越界的 `FETCH`（非法响应），退回 `EXISTS`。
+        assert_eq!(InterleavedUntagged::FetchFlags.line(2), "* 2 EXISTS");
+        assert_eq!(InterleavedUntagged::FetchFlags.line(0), "* 0 EXISTS");
+
+        // 这两条是 untagged 的 `OK` / `BYE`：没有 tag，不能被当成任何命令的完成响应。
+        assert!(InterleavedUntagged::OkAlert.line(1).starts_with("* OK "));
+        assert!(InterleavedUntagged::Bye.line(1).starts_with("* BYE "));
+
+        // 任何形态都**不**是 tagged 响应。
+        for noise in [
+            InterleavedUntagged::Exists,
+            InterleavedUntagged::FetchFlags,
+            InterleavedUntagged::OkAlert,
+            InterleavedUntagged::Bye,
+        ] {
+            assert!(noise.line(5).starts_with("* "), "{noise:?} 必须是 untagged");
+        }
     }
 }
