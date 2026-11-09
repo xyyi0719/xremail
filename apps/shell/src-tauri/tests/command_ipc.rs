@@ -9,6 +9,15 @@
 //!
 //! 参考 Tauri 官方的 `tauri::test` 用法。
 
+//! ## 关于串行闸与 `await`
+//!
+//! 会碰钥匙串的用例用一把静态 `Mutex` 串行化（原因见
+//! `secrets/test_hooks.rs`），并且**故意**把守卫带过 `await`：整条用例就是一个单元，
+//! 而它几乎每一步都是 `await`，只在同步片段里拿闸等于没串行化。
+//! 多线程 `#[tokio::test]` 运行时下阻塞式 `Mutex` 不会自锁，这一点在这里是有意为之，
+//! 不是漏网之鱼。
+#![allow(clippy::await_holding_lock)]
+
 use std::sync::Arc;
 
 use serde_json::json;
@@ -22,6 +31,7 @@ use tauri::webview::InvokeRequest;
 use xremail_core::AppError;
 use xremail_core::model::{Account, Folder, Message, MessageFlags};
 use xremail_shell_lib::cmd;
+use xremail_shell_lib::secrets::test_hooks::{Injection, install, serial_guard};
 use xremail_shell_lib::service::{
     AccountService, AttachmentService, ComposeService, MessageService, SyncService,
 };
@@ -754,6 +764,27 @@ fn resend_uncertain_reports_camel_case_fields_and_a_missing_entry() {
 const DKIM_TEST_KEY: &str =
     include_str!("../../../../crates/xremail-dkim/tests/fixtures/test_private_key.pem");
 
+/// 给会走钥匙串的那几条用例装一把**内存**钥匙串。
+///
+/// `set_dkim_config` 要把私钥写进平台钥匙串。真的写进系统钥匙串不行：
+/// 钥匙串是机器级设施、用例是并行跑的、账户 id 是随机 uuid（等于在跑测试的机器上留垃圾），
+/// 而 Linux 上根本没有实现。所以这里注入一份内存实现（见
+/// [`xremail_shell_lib::secrets::set_platform_store_for_test`]）。
+///
+/// 调用方**必须已经**持有 [`serial_guard`]：覆盖是进程级的，
+/// 同一个二进制里别的用例在同一刻也可能在用钥匙串。
+///
+/// 返回值里的守卫 drop 时还原成平台默认实现——断言失败 panic 也照样还原，
+/// 免得把注入漏给后面跑的用例。
+fn memory_keychain() -> Injection {
+    // 用例要核对条目时通过 `platform_store()` 拿——注入生效后它返回的就是这一份。
+    // 这里的 `Arc` 不另存：覆盖槽里那份在守卫 drop 之前一直活着。
+    install(
+        Arc::new(xremail_api::mock::InMemorySecretStore::new()),
+        "command_ipc 的内存钥匙串",
+    )
+}
+
 /// 建一个账户并返回它的 id（`create_account` 的返回值就是 `Account`）。
 fn create_account_id(webview: &tauri::WebviewWindow<MockRuntime>) -> String {
     let body = get_ipc_response(
@@ -789,6 +820,8 @@ fn get_dkim_config_is_null_before_anything_is_configured() {
 /// 一旦有人给 DTO 加了「顺手把私钥带上」的字段，这条用例会立刻红。
 #[test]
 fn dkim_config_round_trips_without_the_private_key() {
+    let _guard = serial_guard();
+    let _keychain = memory_keychain();
     let (_app, webview) = app();
     let account_id = create_account_id(&webview);
 
@@ -851,6 +884,8 @@ fn dkim_config_round_trips_without_the_private_key() {
 
 #[test]
 fn clear_dkim_config_removes_the_configuration() {
+    let _guard = serial_guard();
+    let _keychain = memory_keychain();
     let (_app, webview) = app();
     let account_id = create_account_id(&webview);
 
@@ -885,6 +920,16 @@ fn clear_dkim_config_removes_the_configuration() {
     .deserialize()
     .expect("反序列化失败");
     assert_eq!(gone, serde_json::Value::Null);
+
+    // 表里那行没了不算完：钥匙串里那把钥也得跟着没——否则账户删掉之后，
+    // 私钥还留在跑测试的这台机器的钥匙串里。
+    // 这是条同步用例，所以用 Tauri 的运行时驱动一次（与本文件里建连接池的那个
+    // `block_on` 同一个运行时，原因见 `app()` 的说明）。
+    let orphan = tauri::async_runtime::block_on(
+        xremail_shell_lib::secrets::platform_store().get(&format!("xremail:dkim:{account_id}")),
+    )
+    .expect("读钥匙串失败");
+    assert!(orphan.is_none(), "清掉配置之后钥匙串里不该还有私钥");
 }
 
 #[test]

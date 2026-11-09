@@ -11,19 +11,62 @@
 //!
 //! 私钥从 `crates/xremail-dkim/tests/fixtures/` 借（那是 crate 自己测试用的
 //! 那把 2048 位钥，公钥也在同一个目录里）——本文件里不出现任何密钥材料。
+//!
+//! ## 钥匙串用内存实现，**每个平台**都一样
+//!
+//! 这些承诺与平台无关，所以不能靠「Linux 上跳过」来装绿。处理器里有一条真实的
+//! 钥匙串，但测试**不**去碰它：
+//!
+//! * 钥匙串是机器级设施，多条用例并行跑，会抢同一个 `xremail:dkim:<account_id>`；
+//! * 用例建的账户 id 是随机 uuid，真写进去等于在跑测试的人机器上留一堆垃圾条目；
+//! * Linux 上压根没有实现，那四条用例此前就是因为这个红的。
+//!
+//! 所以每条用例先经 [`serial_guard`] 拿闸、再 [`install`] 一份内存实现——
+//! 注入是**进程级**的，必须串行，原因见 `secrets/test_hooks.rs`。
+//! 真实凭据管理器的往返见 `tests/windows_credential_manager.rs`：它专门验系统设施，
+//! **不**走这个口子。
+
+//! ## 关于串行闸与 `await`
+//!
+//! 会碰钥匙串的用例用一把静态 `Mutex` 串行化（原因见
+//! `secrets/test_hooks.rs`），并且**故意**把守卫带过 `await`：整条用例就是一个单元，
+//! 而它几乎每一步都是 `await`，只在同步片段里拿闸等于没串行化。
+//! 多线程 `#[tokio::test]` 运行时下阻塞式 `Mutex` 不会自锁，这一点在这里是有意为之，
+//! 不是漏网之鱼。
+#![allow(clippy::await_holding_lock)]
+
+use std::sync::Arc;
 
 use sqlx::SqlitePool;
-use xremail_api::{NewAccountRequest, SecretValue};
+use xremail_api::mock::InMemorySecretStore;
+use xremail_api::{NewAccountRequest, SecretStore, SecretValue};
 use xremail_core::model::{ProviderKind, SendState, SmtpAuth, SyncMode, TlsMode};
 use xremail_dkim::{PublicComponents, SigningKey, canonicalize, key, sign};
 use xremail_protocol_imap::TlsTrust as ImapTlsTrust;
 use xremail_protocol_smtp::TlsTrust;
+use xremail_shell_lib::secrets::test_hooks::{Injection, assert_installed, install, serial_guard};
 use xremail_shell_lib::service::account::AccountService;
 use xremail_shell_lib::service::compose::{ComposeService, DraftInput, SendResultState};
 use xremail_shell_lib::service::dkim::{DkimConfigInput, DkimService};
 use xremail_store::dao::send_queue as send_queue_dao;
 use xremail_testkit::smtp::{FakeSmtpServer, SmtpServerConfig};
 use xremail_testkit::{FakeImapServer, MailboxFixture, ServerConfig};
+
+/// 装一把**空的**内存钥匙串，并把它交给调用方（用例要拿它核对条目）。
+///
+/// 返回值里同时带着 [`Injection`] 守卫：调用方把它按 `_injection` 绑住就行，
+/// 用例结束（含断言失败 unwind）时自动还原成平台默认实现。
+fn memory_keychain() -> (Arc<dyn SecretStore>, Injection) {
+    let store: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::new());
+    let injection = install(store.clone(), "dkim_service 的内存钥匙串");
+    assert_installed(&store);
+    (store, injection)
+}
+
+/// 内存钥匙串里那条条目（`None` = 没存过）。
+async fn stored_secret(store: &Arc<dyn SecretStore>, secret_ref: &str) -> Option<SecretValue> {
+    store.get(secret_ref).await.expect("读内存钥匙串不该失败")
+}
 
 /// 假服务器的登录凭据。
 const USER: &str = "user@163.com";
@@ -233,6 +276,8 @@ fn base64_decode(text: &str) -> Vec<u8> {
 
 #[tokio::test]
 async fn a_signed_message_carries_a_dkim_signature_that_verifies() {
+    let _guard = serial_guard();
+    let (_store, _injection) = memory_keychain();
     let (fixture, server) = Fixture::start().await;
     fixture.configure_dkim("sel", "example.com").await;
 
@@ -277,6 +322,8 @@ async fn a_signed_message_carries_a_dkim_signature_that_verifies() {
 
 #[tokio::test]
 async fn an_account_without_dkim_sends_exactly_the_bytes_it_used_to() {
+    let _guard = serial_guard();
+    let (_store, _injection) = memory_keychain();
     let (fixture, server) = Fixture::start().await;
 
     let result = fixture
@@ -298,6 +345,8 @@ async fn an_account_without_dkim_sends_exactly_the_bytes_it_used_to() {
 
 #[tokio::test]
 async fn the_private_key_stays_in_the_keychain_and_never_comes_back() {
+    let _guard = serial_guard();
+    let (store, _injection) = memory_keychain();
     let (fixture, _server) = Fixture::start().await;
     fixture.configure_dkim("sel", "Example.COM.").await;
 
@@ -345,6 +394,18 @@ async fn the_private_key_stays_in_the_keychain_and_never_comes_back() {
         format!("xremail:dkim:{}", fixture.account_id)
     );
 
+    // 私钥**确实**在钥匙串里（否则上面那些「没出门」的断言可能只是因为根本没存）：
+    // 条目名对得上，内容逐字节就是贴进去的那份 PEM。
+    let secret_ref = DkimService::secret_ref_for(&fixture.account_id);
+    let stored = stored_secret(&store, &secret_ref)
+        .await
+        .expect("配置之后钥匙串里应当有这把私钥");
+    assert_eq!(
+        stored.as_bytes(),
+        PRIVATE_KEY_PEM.as_bytes(),
+        "钥匙串里存的应当就是原样贴进去的 PEM"
+    );
+
     // 清掉之后：配置没了，发信的字节也不再带签名。
     assert!(
         service
@@ -359,6 +420,11 @@ async fn the_private_key_stays_in_the_keychain_and_never_comes_back() {
             .unwrap()
             .is_none()
     );
+    // 钥匙串那条也得一起没：引用留着、条目还在，下次会有别的信拿它去签。
+    assert!(
+        stored_secret(&store, &secret_ref).await.is_none(),
+        "清掉配置之后私钥不能还留在钥匙串里"
+    );
 }
 
 #[tokio::test]
@@ -371,6 +437,11 @@ async fn a_resend_after_an_uncertain_send_sends_the_frozen_bytes_even_if_the_dki
     // 用户改了 DKIM 配置之后，改动的效果体现在**下一封新信**上。
     //
     // 服务器收下 DATA 却不回应答 → 这封信是「不确定」。
+    //
+    // 闸要从建假服务器之前拿到用例结束：这条用例两次经过「配置 DKIM → 写钥匙串」，
+    // 中途还要发信、重发，任何一刻被别的用例顶掉注入，验的就不是自己的钥了。
+    let _guard = serial_guard();
+    let (_store, _injection) = memory_keychain();
     let server = FakeSmtpServer::start(
         SmtpServerConfig::implicit_tls()
             .with_auth(&["PLAIN", "LOGIN"], USER, PASSWORD)
@@ -423,17 +494,17 @@ async fn a_resend_after_an_uncertain_send_sends_the_frozen_bytes_even_if_the_dki
 
 #[tokio::test]
 async fn clearing_the_dkim_config_removes_the_key_from_the_keychain() {
+    let _guard = serial_guard();
+    let (_store, _injection) = memory_keychain();
     let (fixture, _server) = Fixture::start().await;
     fixture.configure_dkim("sel", "example.com").await;
 
     let secret_ref = DkimService::secret_ref_for(&fixture.account_id);
+    // 用 `platform_store()` 读、而不直接用注入进去的那个：验的是**应用真正会走的**
+    // 取值路径（服务里就是调它），顺便证明注入已经生效。
     let store = xremail_shell_lib::secrets::platform_store();
     assert!(
-        store
-            .get(&secret_ref)
-            .await
-            .expect("读钥匙串失败")
-            .is_some(),
+        stored_secret(&store, &secret_ref).await.is_some(),
         "配置之后钥匙串里应当有这把钥"
     );
 
@@ -447,17 +518,17 @@ async fn clearing_the_dkim_config_removes_the_key_from_the_keychain() {
     );
 
     assert!(
-        store
-            .get(&secret_ref)
-            .await
-            .expect("读钥匙串失败")
-            .is_none(),
+        stored_secret(&store, &secret_ref).await.is_none(),
         "账户删掉之后 DKIM 钥不能留在钥匙串里"
     );
 }
 
 #[tokio::test]
 async fn a_key_that_ring_cannot_use_is_refused_before_it_reaches_the_keychain() {
+    // 私钥在原处就被拒了，本不该走到钥匙串；但「不该走到」正是要验的东西——
+    // 装上内存实现，才证明得了它确实没被写进去（而不是「写不进去所以没写」）。
+    let _guard = serial_guard();
+    let (store, _injection) = memory_keychain();
     let (fixture, _server) = Fixture::start().await;
     let service = DkimService::new(AccountService::new(fixture.pool.clone()));
 
@@ -487,10 +558,19 @@ async fn a_key_that_ring_cannot_use_is_refused_before_it_reaches_the_keychain() 
             .unwrap()
             .is_none()
     );
+    // 钥匙串里也没有：校验必须在**写钥匙串之前**，否则一把坏钥会顶掉原来那把好的。
+    assert!(
+        stored_secret(&store, &DkimService::secret_ref_for(&fixture.account_id))
+            .await
+            .is_none(),
+        "被拒的私钥不该被写进钥匙串"
+    );
 }
 
 #[tokio::test]
 async fn a_selector_that_is_not_a_dns_label_is_refused() {
+    let _guard = serial_guard();
+    let (store, _injection) = memory_keychain();
     let (fixture, _server) = Fixture::start().await;
     let service = DkimService::new(AccountService::new(fixture.pool.clone()));
 
@@ -518,6 +598,13 @@ async fn a_selector_that_is_not_a_dns_label_is_refused() {
             "错误信息应当指出是哪一项：{error}"
         );
     }
+    // 选择器不合法就在写钥匙串之前打回：钥匙串里一条都不该多出来。
+    assert!(
+        stored_secret(&store, &DkimService::secret_ref_for(&fixture.account_id))
+            .await
+            .is_none(),
+        "非法选择器不该留下钥匙串条目"
+    );
 }
 
 #[tokio::test]
