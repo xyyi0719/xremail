@@ -24,6 +24,28 @@ use xremail_sync::{AccountConnector, AccountEvent, ConnectFuture, EventSink};
 use crate::service::{AccountService, CredentialService, SyncService};
 use crate::state::Credentials;
 
+/// 叫醒**所有**正在调度的账户，立刻同步一轮（托盘菜单「立即同步」用）。
+///
+/// 这是对所有在调度账户的一次性「醒一下」，所以逐账户走 [`Scheduler::wake`]，
+/// 而**不是**逐个 `start`——`start` 对已在跑的账户也会叫醒，但它做的是
+/// 「确保在调度」，调用方读起来像被加了一份新调度。
+///
+/// 单个账户叫醒失败**不打断其余账户**（某个 actor 刚自己退出是正常情形，
+/// `wake` 那时会报错），只记日志。返回真正叫醒了的账户数：
+/// 托盘那边不弹窗，一条日志就是全部反馈，调用方不该假装「都醒了」。
+pub fn wake_all(scheduler: &xremail_sync::Scheduler) -> usize {
+    let mut woken = 0;
+    for account_id in scheduler.running() {
+        match scheduler.wake(&account_id) {
+            Ok(()) => woken += 1,
+            Err(error) => {
+                tracing::debug!(account_id = %account_id, %error, "叫醒账户失败（跳过）");
+            }
+        }
+    }
+    woken
+}
+
 /// 按账户取凭据的连接器。
 ///
 /// 取不到凭据就返回错误——**不**返回一个空 Session 让后续命令去撞墙。

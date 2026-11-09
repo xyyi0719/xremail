@@ -18,6 +18,12 @@ pub mod cmd;
 pub mod secrets;
 pub mod service;
 pub mod state;
+/// 托盘图标与「关闭窗口 = 退到托盘 / 菜单退出 = 真退出」的语义。
+///
+/// 只有桌面端有托盘，Android 上这个模块不存在（`cfg` 写在这里而不是模块内部，
+/// 免得整个文件都要被 `#[cfg]` 包起来）。
+#[cfg(desktop)]
+pub mod tray;
 
 use std::sync::Arc;
 
@@ -43,20 +49,24 @@ pub fn run() {
         // 选附件用的系统对话框（选路径，字节由后端读）。
         .plugin(tauri_plugin_dialog::init());
 
-    // 单实例与开机自启只有桌面端实现，这两个插件在 Android 上不提供 API。
+    // 单实例、开机自启与托盘只有桌面端实现，这些插件在 Android 上不提供 API。
     #[cfg(desktop)]
     let builder = builder
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             // 第二次启动时聚焦已有窗口，避免多开导致服务端连接数超限。
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.set_focus();
-            }
+            //
+            // 走 `tray::show_main_window` 而不是自己 `unminimize + set_focus`：
+            // 窗口可能正藏在托盘里（关闭窗口 ≠ 退出，见 `tray` 模块），
+            // 那时必须先 `show`，否则「再点一次图标」什么都不会发生。
+            crate::tray::show_main_window(app);
         }))
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
-        ));
+        ))
+        // 窗口事件钩子只有 builder 级（`App::on_window_event` 不存在），
+        // 所以「关闭窗口 = 退到托盘」在这里挂上，托盘本身在 `setup` 里才建。
+        .on_window_event(crate::tray::handle_window_event);
 
     builder
         .setup(|app| {
@@ -68,6 +78,21 @@ pub fn run() {
             // 这样 actor 一上来发的事件就能找到窗口。
             app.manage(state);
             start_background_sync(app.handle());
+
+            // 托盘在**后台同步起来之后**建：托盘菜单的「立即同步」要拿
+            // `AppState` 里的调度器，先 `manage` 再建托盘，事件回调里
+            // `app.state::<AppState>()` 才不会 panic。
+            //
+            // 托盘建失败**不拦启动**：应用照常可用，比为了托盘把整个应用
+            // 拒之门外要好。
+            // 代价要写清楚：托盘没建出来时，关闭主窗口照样会把窗口藏起来
+            // （窗口事件钩子管不着托盘建没建成），却没有那只图标能把它叫回来——
+            // 只能靠「再次启动程序」（单实例会把藏起来的窗口 `show` 出来）。
+            // 这是「关窗口 = 退到托盘」的固有形态，不值得为它在两条路径上各写一套。
+            #[cfg(desktop)]
+            if let Err(error) = tray::install(app.handle()) {
+                tracing::warn!(%error, "创建托盘图标失败，本次运行没有托盘");
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -109,6 +134,12 @@ pub fn run() {
             // 那条连接会被服务器当成「客户端消失」，未提交的写操作
             // 就会以 `running` 的状态留在库里（下次启动靠对账收拾，
             // 但那本来是可以避免的一次）。
+            //
+            // 「关闭窗口」**不走这里**：桌面上关窗口只是把窗口藏起来
+            // （见 `tray` 模块），进程与后台同步继续跑。走到 `Exit` 的
+            // 只有「托盘菜单 → 退出」与系统发起的退出（注销/关机），
+            // 而前者的 `app.exit(0)` 正是为了让这条收尾能跑到——
+            // 换成 `std::process::exit` 就收不到了。
             if let tauri::RunEvent::Exit = event {
                 app.state::<AppState>().scheduler.shutdown();
             }

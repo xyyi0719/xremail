@@ -17,7 +17,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `tray-icon` 是 tauri **自己的** Cargo feature（打开核心 `tauri::tray` API），
+# 不是新依赖：底层的 `tray-icon` crate 本来就在 tauri 的依赖图里，这个 feature
+# 只是把它打开。必须显式写上——`tauri.conf.json` 里有 `trayIcon` 时，
+# `tauri dev/build` 会顺手把它加进命令行，但 `cargo check` / `cargo test`
+# 不经过那一步（tauri-build 的清单校验刻意把 `tray-icon` 排除在外）。
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-autostart = "2"
@@ -66,4 +71,4 @@ xremail-testkit = { workspace = true }
 xremail-protocol-smtp = { workspace = true }
 # tauri 的 test 特性：提供 mock_builder / get_ipc_response，
 # 用来测 Command 层的 IPC 序列化（见 tests/command_ipc.rs）。
-tauri = { version = "2", features = ["test"] }
+tauri = { version = "2", features = ["test", "tray-icon"] }
