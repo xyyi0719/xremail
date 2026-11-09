@@ -66,6 +66,71 @@ Mock 通过不能证明服务商兼容。Playwright 浏览器通过不能证明 
 - SecretStore 读取/写入/删除失败、锁定、用户取消；不得明文降级，日志与诊断包不得包含测试 canary secret。
 - 账户归属校验与附件路径穿越；扩展名、Content-Type 不可信。
 
+#### 2.4.1 在 WebKitGTK 上的实测结果（2026-11-09）
+
+上面「默认阅读恶意邮件」那几条原先只在 Chromium（Playwright）上量过。Linux 的 WebView 是 **WebKitGTK**，
+结论不能直接沿用，所以新增了一个**本地手工验收工具** `scripts/webkit_sandbox_probe.py`
+（跑法与局限写在脚本头注释里；**不接 CI**——CI 上没有 WebKitGTK 的图形环境，接进去只会让 CI 变红）：
+
+```bash
+# 一次性准备：把真消毒器包成 stdin → stdout 的小 CLI（不加 Rust 目标、不加依赖），细节见脚本头注释
+export PATH="$HOME/.cargo/bin:$PATH" CARGO_HOME="$PWD/.devcache/cargo-home" \
+       CARGO_TARGET_DIR="$PWD/.devcache/cargo-target" SQLX_OFFLINE=true
+cargo build -p xremail-core
+mkdir -p "$CARGO_TARGET_DIR/htmlcli"
+python3 scripts/webkit_sandbox_probe.py --write-cli-rs > "$CARGO_TARGET_DIR/htmlcli/main.rs"
+rustc --edition 2021 -L "$CARGO_TARGET_DIR/debug/deps" \
+      --extern xremail_core="$CARGO_TARGET_DIR/debug/libxremail_core.rlib" \
+      "$CARGO_TARGET_DIR/htmlcli/main.rs" -o "$CARGO_TARGET_DIR/htmlcli/sanitize"
+
+# 跑
+xvfb-run -a python3 scripts/webkit_sandbox_probe.py                    # WebKitGTK，CSP 走 <meta>
+xvfb-run -a python3 scripts/webkit_sandbox_probe.py --csp=header       # CSP 走响应头（更接近 Tauri）
+PLAYWRIGHT_BROWSERS_PATH="$PWD/.devcache/pw-browsers" \
+  xvfb-run -a python3 scripts/webkit_sandbox_probe.py --engine=both    # 与 Chromium 逐条对照
+```
+
+**环境**：WebKitGTK **2.52.6**（`webkit2gtk-4.1`，`WebKit2 4.1`），GTK3 `WebKit2.WebView` 放在 `Gtk.OffscreenWindow` 里，
+整个进程跑在 `xvfb-run` 的 Xvfb 上（无 GPU，WebGL 关掉）。页面源：WebKitGTK 侧 `about:blank`
+（`--csp=header` 时是 `http://127.0.0.1:<临时端口>`），Chromium 侧 `http://127.0.0.1:1`（文档由 `page.route` mock）。
+CSP 取 `apps/shell/src-tauri/tauri.conf.json` 的 `app.security.csp` **原文**。
+
+| 用例 | 断言 | WebKitGTK | Chromium | 一致？ |
+|---|---|---|---|---|
+| A1 | 真消毒器的输出喂进 DOM：script / iframe / svg / form / base / meta / style / `on*` / `style` 属性 / `javascript:` / `data:` 链接**一个都没有**（实测链接属性 `[null, 'https://example.com/a', null]`） | 10/10 PASS | 10/10 PASS | 是 |
+| B0 | 阳性对照：同一页面去掉 CSP，图片请求真的打到监听端（TCP ≥ 1） | 2/2 PASS | 2/2 PASS | 是 |
+| B1 | CSP `img-src` 不含 http/https：`http://` / `https://` / 协议相对 / `srcset` / CSS 背景 / 表格背景**监听端 0 个 TCP 连接**；同页 `data:` 图片 `complete/naturalWidth = true/1`（**能**显示） | 8/8 PASS | 8/8 PASS | 是 |
+| C1 | 绕过消毒器直接塞进 DOM：内联 `<script>`（解析期与 `innerHTML` 注入两种）、事件属性、`javascript:`、`srcdoc` 里的内联脚本都**不执行**（心跳数组为空、`window.__pwned` 未定义） | 6/6 PASS | 6/6 PASS | 是 |
+| J1 / J0 | 合成点击 `javascript:` 链接：CSP 下不执行、不导航；**无 CSP 的对照页点击后会执行**（证明是 CSP 起作用，不是点击没生效） | 3/3 + 3/3 PASS | 同 | 是 |
+| S1 | `<iframe sandbox>` 里脚本**不执行**；`sandbox=allow-scripts` 时脚本执行但访问父窗口抛 `SecurityError`；**不带 sandbox 的 `srcdoc` iframe 能读并改掉父窗口的全局变量**（父页读回 `FORKED`）；`srcdoc` 子文档继承父页面的 CSP，无 nonce 的载荷脚本被拦 | 9/9 PASS | 9/9 PASS | 是 |
+| F1 | CSP `frame-src` 不含 http：远程 iframe 0 请求；`srcdoc` iframe 里的内联脚本不执行，内容照样渲染 | 3/3 PASS | 3/3 PASS | 是 |
+| N-file / N-data | `location.href` 强导航到 `file:///etc/passwd` / `data:`：被拦，主文档仍是原来的 DOM（引擎给出「The URL can't be shown」错误页） | 各 2/2 PASS | 同 | 是 |
+| N-http | `location.href` 强导航到远程 http 页面：**主文档被换掉了**（WebKitGTK 的 `get_uri()` 变成目标地址、监听端收到 `/nav-target.html`；Chromium 执行上下文被销毁） | 2/2 PASS（如实记录为「会导航」） | 同 | 是 |
+
+**总计**：WebKitGTK 49/49、Chromium 49/49；`--engine=both` 合计 **98/98 PASS，逐条结论差异 0 项**。
+把 WebKitGTK 侧的 CSP 改成**响应头**下发（`--csp=header`）再跑：**49/49 PASS**；引擎控制台原话是
+`Refused to load http://127.0.0.1:PORT/img-http.gif because it does not appear in the img-src directive of the Content Security Policy.`
+
+**结论**：
+
+1. §2.4「默认阅读恶意邮件」四条里，**「网络请求为零、脚本不执行、不能访问父页面」在 WebKitGTK 上同样成立**；
+   **「不能自行导航」只对 `file:` / `data:` 成立**——CSP 不管导航，强导航到远程 http 会把主文档换掉。
+   产品里靠 `MessageView.tsx` 的 `preventDefault` + `/^(https?:|mailto:)/i` 白名单兜；
+   消毒器只保证 `href` 是 http(s)/mailto，**不能**保证「点了不会进 webview」。
+2. 文档原先说「WebKitGTK 与 Chromium 行为不同」，**在这组用例上没有看到证据**（差异 0 项）。
+   差异可能存在，但需要能区分两者的用例（例如 `allow-popups` 系、`blob:` 在不透明源里的可用性），
+   本工具没覆盖，**不写结论**。
+
+**这套工具量不到的东西（如实列出）**：
+
+- **IPC / Capability**：探针页面里没有 `__TAURI_INTERNALS__`、没有 `tauri://` 自定义协议，
+  「不能访问 IPC」只能间接看「iframe 碰不到父窗口」，Tauri 的 ACL 层没验。
+- **真实源**：`tauri://localhost`（Linux 上实际是 `http://tauri.localhost`）没被模拟，依赖 `'self'` 的结论要打折扣。
+- **macOS / WKWebView**：本机没有。
+- **真 GPU / 合成器**下的 WebKitGTK：本机只有 Xvfb + 软件渲染（启动时 `libEGL warning: DRI3 error`）。
+- **链接交给系统浏览器**：`opener` 插件的端到端行为没验（探针里没有系统浏览器、没有插件）。
+- **原生对话框 / 系统协议处理器**：`mailto:`、`confirm()` 这类需要真人点击并交给系统处理的路径，探针没有替身，没有出结论。
+
 ## 3. 测试数据与可重复性
 
 - 优先合成 `.eml` 与脚本响应，真实样本先脱敏再入库；去掉邮箱、地址、token、追踪 URL 与个人附件。

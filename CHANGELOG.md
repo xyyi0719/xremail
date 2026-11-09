@@ -7,6 +7,31 @@
 ## [Unreleased]
 
 ### Added
+- **WebKitGTK 上的 HTML 隔离实测：本地手工验收工具 `scripts/webkit_sandbox_probe.py`**（2026-11-09，R06 / P5-L）
+  - 在 `xvfb-run` 起的**真实 WebKitGTK 2.52.6**（`WebKit2.WebView`）里，把 `tauri.conf.json` 的 CSP **原文**
+    放进页面，把**真消毒器**（Rust `sanitize_html`，经 `rustc` 编成的小 CLI 调用）的输出与若干
+    **绕过消毒器**的样本塞进 DOM，逐条断言运行时行为并打印 PASS/FAIL + 实际观测值
+  - 覆盖：远程图片（http / https / 协议相对 / `srcset` / CSS 背景 / 表格背景）**零请求**、`data:` 图片**能**显示、
+    内联脚本 / 事件属性 / `javascript:`（含点击）不执行、sandbox iframe 碰不到父窗口、
+    无 sandbox 的 `srcdoc` **读写得到父窗口**、`frame-src` 拦远程 iframe、`file:` / `data:` 强导航被拦
+  - **结果**：WebKitGTK 49/49 PASS；同一组用例在 Playwright Chromium 上逐条结论一致
+    （`--engine=both` 98/98 PASS，差异 0 项）；CSP 改成响应头下发（更接近 Tauri）再跑同样 49/49 PASS
+  - **顺带量到的**：强导航到远程 http **会**把主文档换掉（两个引擎都一样）——隔离靠
+    `MessageView.tsx` 的 `preventDefault` + 协议白名单，消毒器只保证 `href` 是 http(s)/mailto
+  - **没验的**：Tauri 真实源与 IPC/ACL、macOS WKWebView、真 GPU 环境、链接交给系统浏览器的端到端行为
+  - **不接 CI**：CI 上没有 WebKitGTK 的图形环境。跑法见脚本头注释与 [TESTING_STRATEGY §2.4.1](docs/TESTING_STRATEGY.md)
+- **Linux 打包链路打通：deb 与 AppImage**（2026-11-09，P5-L）
+  - `npm run tauri build -- --bundles deb` → **7.7 MiB**；`--bundles appimage` →
+    **87.2 MiB**（自带依赖）。二进制本身 17.4 MiB
+  - 新增 `scripts/verify_linux_runtime.py`：**在 Xvfb 虚拟显示里真跑打包产物**，
+    断言动态库齐全、启动不 panic、建出数据库、**10 条迁移全部成功且条数与
+    `migrations/*.sql` 一致**、20 张表齐全。deb 与 AppImage 两种格式都验过
+  - 脚本做了变异测试：把期望的迁移条数改错，它会立刻报「对不上」
+  - 一个容易误判的点（实测澄清）：deb 声明 `libgtk-3-0`，而 Ubuntu 24.04+ 装的是
+    `libgtk-3-0t64`。看着像依赖缺陷，但 t64 包 `Provides: libgtk-3-0`，
+    `apt-get -s install` 能正常解析——**不是**问题
+  - **未做**：rpm（本机无 `rpmbuild`）。**未验证**：真实桌面会话里双击启动、
+    Fedora 等非 Debian 系发行版
 - **Linux 上用系统钥匙串存授权码**（2026-11-09，P5-L）
   - 之前 Linux 上钥匙串是「如实报错」的桩：**每次冷启动都要重填授权码**。
     现在有了 Secret Service 适配（`apps/shell/src-tauri/src/secrets/linux_store.rs`）

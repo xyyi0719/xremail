@@ -559,8 +559,27 @@ Gmail 将来有需求再开独立决策：授权流程、scope、个人使用与
 
 若要支持 Linux，需额外完成：
 
-- [ ] WebKitGTK 沙箱验证：sandbox iframe、CSP、`srcdoc`、远程图片阻断的行为与 Chromium 有差异，
-      必须重跑 [TESTING_STRATEGY §2.4](TESTING_STRATEGY.md) 的隔离测试，不能直接沿用 Windows 结论
+- [x] **WebKitGTK 沙箱验证**（2026-11-09，`scripts/webkit_sandbox_probe.py`）
+  - **验了什么**：在 `xvfb-run` 起的**真实 WebKitGTK 2.52.6**（`WebKit2.WebView`，GTK3）里，把
+    `apps/shell/src-tauri/tauri.conf.json` 的 CSP **原文**放进页面、把**真消毒器**
+    （`xremail-core::html::sanitize_html`，经 `rustc` 编成的小 CLI 调用）的输出与若干
+    **绕过消毒器**的样本塞进 DOM，逐条断言运行时行为——远程图片零请求、内联脚本 / 事件属性 /
+    `javascript:`（含点击）不执行、`data:` 图片能显示、sandbox iframe 碰不到父窗口、
+    无 sandbox 的 `srcdoc` 读写得到父窗口、`frame-src` 拦远程 iframe、`file:` / `data:` 强导航被拦。
+    明细与逐条观测值见 [TESTING_STRATEGY §2.4](TESTING_STRATEGY.md) 的「在 WebKitGTK 上的实测结果」
+  - **结论**：本组用例 WebKitGTK **49/49 PASS**（CSP 走 `<meta>`；改成响应头下发再跑一遍同样 49/49 PASS）；
+    同一组用例、同一份 CSP、同一份断言在 Playwright Chromium 上**逐条结论一致**
+    （`--engine=both`：98/98 PASS，差异项 0）——**「行为与 Chromium 有差异」这句话在本组用例上不成立**，
+    原句的写法是把推测当成了结论，已改
+  - **顺带量到的一条（不是新漏洞，是既有设计的前提）**：CSP 管不到导航。`location.href` 强导航到远程
+    http 页面会把主文档换掉（WebKitGTK 与 Chromium 都一样）；隔离完全靠 `MessageView.tsx` 对点击的
+    `preventDefault` + `/^(https?:|mailto:)/i` 白名单。消毒器只保证 `href` 是 http(s)/mailto，
+    **不保证用户点了一定不进 webview**——「点链接交给系统浏览器」这一环在宿主上的端到端行为**未验证**
+  - **没验成的**：Tauri 的真实源（`tauri://localhost` / `http://tauri.localhost` + 自定义协议 + IPC/ACL）、
+    macOS 的 WKWebView、有真实 GPU/合成器的 WebKitGTK（本机只有 Xvfb + 软件渲染）、
+    原生 `confirm()`/`mailto:` 那类需要真人点击并交给系统处理器的路径（探针没有替身，没有断言）
+  - **为什么不接 CI**：CI（ubuntu runner）上没有 WebKitGTK 的图形环境，接进去只会让 CI 变红；
+    这是**本地手工验收工具**，动了消毒器 / CSP / 正文渲染之后在有桌面的 Linux 上手工跑一遍
 - [x] **Secret Service 凭据后端**（2026-11-09，`apps/shell/src-tauri/src/secrets/linux_store.rs`）
   - 走 **D-Bus**（`keyring` 3.x + `sync-secret-service`），**不链 `libsecret`**：
     直接链会把可执行文件钉在某个发行版的 SONAME 上，而 D-Bus 只要求
@@ -579,7 +598,23 @@ Gmail 将来有需求再开独立决策：授权流程、scope、个人使用与
 - [ ] 托盘（libayatana-appindicator）、通知（D-Bus）、开机自启（XDG autostart .desktop）
   - 托盘代码是平台无关的，**编译**过（需要 `libayatana-appindicator3` 才能链上），
         但 Linux 上 `TrayIconEvent` 不发，左键「显示窗口」不生效；**运行未验证**
-- [ ] 打包链路验证（AppImage / deb / rpm）
+- [x] **打包链路：deb 与 AppImage**（2026-11-09）
+  - `cd apps/shell && npm run tauri build -- --bundles deb` → **7.7 MiB**，
+    `--bundles appimage` → **87.2 MiB**（自带依赖；二进制本身 17.4 MiB）
+  - deb 的依赖由 Tauri 生成：`libayatana-appindicator3-1` / `libwebkit2gtk-4.1-0` /
+    `libgtk-3-0`。**`libgtk-3-0` 在本机（Ubuntu 24.04+）是 t64 变体**
+    （`libgtk-3-0t64`，它 `Provides: libgtk-3-0`），`apt-get -s install` 解析通过，
+    **不是**依赖缺陷——这一条是实测得出的，不是推断
+  - **不只是「能打包」，还验了「装上去能跑」**：新增
+    `scripts/verify_linux_runtime.py`，在 **Xvfb 虚拟显示**里真跑打包产物，
+    断言：`ldd` 无 `not found`、启动不 panic、建出 `xremail.db`、
+    `_sqlx_migrations` 的条数与 `migrations/*.sql` 一致且全部 `success`、
+    关键表齐全。deb 与 AppImage 两种格式都跑通（10 条迁移 / 20 张表）
+  - 脚本本身做了变异测试：把期望迁移数改错，它会立刻报「对不上」
+  - **未做**：**rpm**（本机没有 `rpmbuild`）；`tauri build` 不带 `--bundles`
+    时 `targets: "all"` 在 Linux 上会同时试 deb 与 appimage，两者都快，可以照常跑
+  - **未验证**：在**真正的桌面会话**里双击启动（Xvfb 下托盘起不来，见下一条）；
+    以及 Fedora 等非 Debian 系发行版
 - [ ] 至少 2 个主流发行版的真机运行验证（Ubuntu / Fedora 系）
 
 > 优先级低于 P4 的 Windows/Android 验收。**在用户明确提出需求前不投入。**

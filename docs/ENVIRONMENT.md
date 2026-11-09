@@ -1,7 +1,7 @@
 # 环境特性与平台差异
 
 > 用途：记录**本机与各目标平台**的实测特性，避免在脚本、CI、命令和文档中重复踩坑。
-> 维护者：xyyi0719 · 最后实测：2026-10-21
+> 维护者：xyyi0719 · 最后实测：2026-11-09（§2.3.1 WebKitGTK 探针）
 > 原则：**只写实测过的**。未验证的写「未验证」，不写推测。
 > **本机手动设置的值（代理地址、凭据、密钥路径等）不写进本文档**，只写读取方法。
 
@@ -470,6 +470,33 @@ sandbox iframe + CSP + `srcdoc`。这些行为在 **WebKitGTK 上与 Chromium �
 → **结论**：Windows/Android 上验证过的沙箱行为，**不能直接推断到 Linux/macOS**。
 在 WebKit 系平台上线前，必须重跑 [TESTING_STRATEGY §2.4](TESTING_STRATEGY.md) 的
 网络请求计数、脚本执行、导航与 IPC 隔离测试。
+
+#### 2.3.1 WebKitGTK 上的隔离测试怎么跑（2026-11-09 实测）
+
+2.3 表里「Linux 与 Chromium 行为不同」这句话，2026-11-09 用**真实 WebKitGTK 2.52.6** 量了一遍
+（详见 [TESTING_STRATEGY §2.4.1](TESTING_STRATEGY.md)）：本组用例（CSP 远程图片、内联脚本、
+`javascript:`、`data:` 图片、sandbox iframe、`srcdoc`、`frame-src`、导航到 file/data/http）
+**WebKitGTK 与 Chromium 逐条一致**。工具是 `scripts/webkit_sandbox_probe.py`，**本地手工跑，不接 CI**：
+
+```bash
+# 本机无物理显示器 → 用 Xvfb
+xvfb-run -a python3 scripts/webkit_sandbox_probe.py            # WebKitGTK，CSP 走 <meta>
+xvfb-run -a python3 scripts/webkit_sandbox_probe.py --csp=header  # CSP 走响应头（更接近 Tauri）
+PLAYWRIGHT_BROWSERS_PATH="$PWD/.devcache/pw-browsers" \
+  xvfb-run -a python3 scripts/webkit_sandbox_probe.py --engine=both  # 与 Chromium 对照
+```
+
+实测到的几个本机环境事实：
+
+| 事实 | 说明 |
+|---|---|
+| `python3-gi` + `WebKit2 4.1` 可用 | `gi.require_version('WebKit2','4.1')`；`pkg-config --modversion webkit2gtk-4.1` = `2.52.6` |
+| 必须有虚拟显示 | `Gtk.init_check([])` 在没有 `DISPLAY` 时失败；`xvfb-run -a` 即可 |
+| 只能软件渲染 | 启动时打印 `libEGL warning: DRI3 error: Could not get DRI3 device`，与结论无关；脚本会把 WebGL 关掉 |
+| `dconf` 报只读 | 本机 `$HOME`/`/run/user` 只读，`dconf-CRITICAL … Read-only file system` 是噪音，不影响 WebView |
+| `load_html` 的主文档源是 `about:blank` | 与 Chromium 的 `setContent` 一致；Tauri 的真实源是 `http://tauri.localhost`，**没被模拟** |
+| WebKit 的远程检查器绑不上 | `WEBKIT_INSPECTOR_SERVER=127.0.0.1:<port>` 在 `xvfb-run` 下报「地址已在使用」（即便先占了端口）；所以探针用白名单 UCM 脚本 + `MessageChannel` 回传，不用检查器 |
+| 只回传**基本类型** | `evaluate_javascript` 返回 Promise / 对象会 `Unsupported result type (601)`；探针把结果串成字符串再读回 |
 
 ### 2.4 平台相关 API 差异
 
