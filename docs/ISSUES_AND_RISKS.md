@@ -17,14 +17,16 @@
 - **规划**：平台适配（P4）、标签/规则（P5）、L2 远端同步（P6）**都不是已交付功能**。
 - **外部未知**：并发连接限制、Android 后台行为——
   必须用注明环境的实测建立证据。
-- `cargo test` 现在有 **1029 个用例**（2026-11-09 实测，Linux：`cargo test --workspace -j 4 --no-fail-fast`
-  累加所有 `test result:` 行 = **1028 passed / 0 failed / 1 ignored**；`--list` 点数 **1029**）。
+- `cargo test` 现在有 **1056 个用例**（2026-11-09 CI 实测，`Rust (ubuntu-latest)` 的
+  「Report test case count」一步：**Rust test cases: 1056**；本机同口径
+  `cargo test --workspace -j 4 --no-fail-fast` = **1055 passed / 0 failed / 1 ignored**）。
   被忽略的那条是真实邮箱往返用例 `apps/shell/src-tauri/tests/real_mail_roundtrip.rs:68`，
-  所以**实际执行 1028 条**），六关本地全绿；
-  前端另有 **95 个用例**（15 个文件；`npx vitest run`）。端到端另有 Playwright **5 条**（2 个文件，
-  真实 chromium + Vite 开发服务器，见 [TESTING_STRATEGY §5.1](TESTING_STRATEGY.md) 的 T9）。
-  **Rust (ubuntu-latest) 自 D1 DKIM 起一直是红的**（6 条 DKIM 用例在非 Windows 上撞上「钥匙串是桩」），
-  2026-11-09 改为可注入的钥匙串后本地全绿；**Windows 与 ubuntu 的 CI 结论要等推送后复核**，不预先宣称。
+  所以**实际执行 1055 条**；前端另有 **95 个用例**（15 个文件）、Playwright **5 条**。
+  **CI 四个 job 全绿**（Rust ubuntu / Rust windows / Frontend / Docs sanity，`e0af98b`）。
+  这一段曾经是错的：自 D1 DKIM 起 ubuntu job 一直红（6 条 DKIM 用例撞上「钥匙串在非
+  Windows 上是桩」），而文档写的是「六关本地全绿」——两个平台都没说谎，错在把
+  **平台相关的用例当成了全局结论**。2026-11-09 修好并推送，Windows 那边还顺带暴露
+  了一个本机验不到的 `unused import`（cfg 分支不同），见 §6。
 - 2026-10-20 复核：Rust 1.99.1 / Node 22.21.0 / 本机仅 JDK 8 且无 Android SDK → **Android 构建在本机暂不可行**（P4 需先装 JDK 17 + SDK/NDK）。
   **2026-11-09 更新（这条已过时，仅作历史）**：本机已具备 JDK 17、SDK（platform `android-36`/`android-37.0`）、
   NDK `27.2.12479018`、四个 android target 与 `cargo-ndk`，**APK 已能构建**（见 ROADMAP「Android PoC 第一轮」）。
@@ -150,5 +152,6 @@
 
 | 2026-11-09 | T10「随机化」半边落地，**撞出并修掉一条真缺陷（R45）** | ① **做法**：本仓库不宜引入 `cargo-fuzz`（需 nightly + `libfuzzer-sys`，且不进 PR CI），于是把 T10 落成**固定种子**的属性测试——`crates/xremail-core/tests/sanitizer_properties.rs`（6 条）与 `crates/xremail-message/tests/parser_properties.rs`（7 条），零新依赖、stable 即可跑、失败可逐字复现。钉住的不变量：不 panic、幂等、输出良构、危险构造不残留（按**真实属性值位置**判定，而不是整段字符串找子串——第一版按子串判会把正文里的 `javascript:alert(1)` 误报成漏洞）；MIME 侧是不 panic、附件数不超 `MAX_ATTACHMENT_PARTS`、部件号不重复、错误不越出契约。② **变异测试证明它们不是空转**：把 `is_allowed_url` 短路（放行 `javascript:` href）→ 2 条立刻红；把结束标签输出删掉 → 良构性与幂等性立刻红；均已还原，`git diff` 确认 `src/` 无残留。③ **撞出 R45**：顶层 `message/rfc822`（整封转发）且内嵌两个附件时，两者都记成 `TEXT`，在 `ON CONFLICT (message_id, part_key)` 上互相顶掉。已修（判据由「顶层是否 multipart」改为「整封是否只有一个部件」），并补最小复现与反向保护两条用例。④ 教训：**属性测试的价值就在这类「结构合法、只是组合少见」的输入上**——人工审代码时`top_is_multipart` 看起来是对的，因为绝大多数邮件确实是顶层 multipart |
 | 2026-11-09 | P4 Android PoC 第一轮：**只验到「能编出 APK」，运行时一格没验** | ① **产出了什么**：`npx tauri android init` 生成 `apps/shell/src-tauri/gen/android/`（此前 `gen/` 下只有 `schemas/`）；`npx tauri android build --debug --target aarch64` 产出 `app/build/outputs/apk/universal/debug/app-universal-debug.apk`（**266,388,896 字节**）+ `.aab`（72,387,850 字节）；对照跑了一次 release，`app-universal-release-unsigned.apk` **14,869,199 字节 ≈ 14.2 MiB**（未签名，要装得先配签名）。`package=com.xremail.app`、`minSdk 24`、`targetSdk 37`；`lib/` 只有 `arm64-v8a`，`.so` 被 `file` 认成 `ARM aarch64, for Android 24, built by NDK r27c`。**前端在 `.so` 里**（能按名字找到 `dist/assets/index-*.css/js`），不在 APK 的 `assets/` 下——这一点差点被误读成「前端没打进去」。② **编过了哪些**：本仓库 9 个 crate（core/store/api/sync/protocol-imap/protocol-smtp/message/dkim/shell）+ `sqlx`/`sqlx-sqlite`/`libsqlite3-sys`（`sqlite-bundled` 的 C 源码过 NDK clang）+ `ring`/`async-imap`/`tokio-rustls`/`tauri`/`wry`/`tao`。`xremail-crypto` 与 `xremail-testkit` 不在 shell 的依赖图里，**没编**。③ **静态坐实的两条事实**：托盘 `#[cfg(desktop)]` 生效（产物 `.so` 里 `xremail_shell_lib::tray` 符号 0 个）；钥匙串在 Android 上走 `UnsupportedSecretStore` 桩（`.so` 里查得到它的文案「只有 Windows 凭据管理器已适配」、查不到 `CredWriteW`/`windows_store`）→ **授权码与 DKIM 私钥在 Android 上都存不进去**（R19 的 Android 侧）。④ **卡在环境、不卡在配置**：`tauri.conf.json` 与生成的 Gradle/Kotlin **一个字没改**；两次失败都出在 `$HOME` 只读——Gradle wrapper 建不了 `…gradle-9.6.1-bin.zip.lck`（`只读文件系统`），AGP 建不了 `~/.android` 下的 debug keystore（`Unable to create debug keystore ... because it is not writable`）；分别用 `GRADLE_USER_HOME`、`ANDROID_USER_HOME` 指向工作区解决。中途还遇过一次**别的并行工作**造成的编译错误（`crates/xremail-sync/src/transfer_push.rs` 缺 `use … Message`，`error[E0422]/[E0425]`），对方修好后重跑即过——那是别人的改动，不是 Android 的问题。⑤ **R08 维持「待验证」**：本机 `adb devices` 为空、`$ANDROID_HOME` 下无 `emulator/` 与 `system-images/`、无 AVD，前台/后台/息屏/进程恢复、通知、Keystore 一条都验不了；`lib.rs` 也确实**没有** `Resumed`/`Suspended` 分支，通知 API 一次都没被调用过。Keystore 适配**只写了路线**（ROADMAP P4），**没有实现**，不在任何地方声称已适配 |
+| 2026-11-09 | 推送并修复 CI：**四个 job 全绿**（`e0af98b`） | ① **Rust (ubuntu) 自 D1 起一直红**，本次取日志坐实是 6 条 DKIM 用例撞上「钥匙串只有 Windows 有实现」；钥匙串改为可注入后 ubuntu 转绿。② **Windows job 在 Clippy 一步红了**——`credential_service.rs` 里 `use xremail_shell_lib::secrets::{self, secret_ref_for};` 的 `self` 只在 `#[cfg(not(windows))]` 的用例里用到，Windows 上就是 `unused import` 撞上 `-D warnings`。**这是本机（Linux）物理上验不到的一类问题**：同一份代码在不同平台走不同 cfg 分支，未使用项也随之不同。已给该导入加同样的 `cfg(not(windows))`。③ **提交历史清理**：7 个逻辑提交逐条用**独立 target 目录**的 `cargo check --workspace --all-targets` 验证过（共享 target 会因缓存污染给出假阴性——第一次就是这么误判的），过程中确实抓到两处「中间提交编译不过」（`Folder.role` 字段与其字面量补全被拆到了不同提交），已修正。④ **CI 实测用例数 1056**（Report test case count），与本地 1055 passed + 1 ignored 对得上 |
 
 相关：[架构](ARCHITECTURE.md) · [路线图](ROADMAP.md) · [测试策略](TESTING_STRATEGY.md)

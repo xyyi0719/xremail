@@ -20,7 +20,7 @@
 > `npm test` **15 个文件 / 95 条**、`npm run test:e2e`（Playwright）**2 个文件 / 5 条**全绿。
 > 2026-11-09 复跑（托盘 + T8 乱序响应 + folder 角色 + DKIM 跨平台用例合并后）：
 > `cargo fmt --all --check` / `cargo clippy --workspace --all-targets -D warnings` /
-> `cargo test --workspace` **1028 passed / 0 failed / 1 ignored**（`--list` 1029）/
+> `cargo test --workspace` **1055 passed / 0 failed / 1 ignored**（`--list` 1056；CI 同口径实测 1056）/
 > `npm typecheck` / `npm test` 95 条 / Playwright 5 条 / `cargo sqlx prepare --check` /
 > `check_doc_links.py` 全绿。
 >
