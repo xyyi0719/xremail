@@ -100,17 +100,47 @@ impl AccountConnector for AppConnector {
 /// 卡住就等于卡住那个账户的同步循环。
 pub struct TauriSink<R: Runtime> {
     app: AppHandle<R>,
+    /// 账户服务：通知标题里要写**哪个邮箱**收到了新邮件。
+    ///
+    /// 与 [`AppConnector`] 同一个理由——**显式传入**，不回头查 `AppState`：
+    /// 状态 → 调度器 → sink → 状态会成环，而且让「sink 需要什么」变得不可见。
+    accounts: AccountService,
 }
 
 impl<R: Runtime> TauriSink<R> {
     /// 构造。
-    pub fn new(app: AppHandle<R>) -> Self {
-        Self { app }
+    pub fn new(app: AppHandle<R>, accounts: AccountService) -> Self {
+        Self { app, accounts }
     }
 
     fn send(&self, event: AppEvent) {
         // 前端可能已经退出（窗口关了但进程还在收尾），失败就丢掉。
         let _ = self.app.emit(event.name(), &event);
+    }
+
+    /// 有新邮件就弹一条通知（判据写在 [`crate::notify`] 的模块文档里）。
+    ///
+    /// 失败全部吞掉并降级成日志：通知发不出去不该让一轮同步变成失败。
+    fn notify(&self, account_id: &str, reports: &[xremail_sync::pull::FolderSyncReport]) {
+        // 先做**最便宜的**判断：没有新邮件就不必去查账户。
+        if crate::notify::inbox_added(reports).is_none() {
+            return;
+        }
+
+        let accounts = self.accounts.clone();
+        let account_id = account_id.to_string();
+        let app = self.app.clone();
+        let reports = reports.to_vec();
+
+        // 这里在 `emit` 里，而 `emit` 是**同步**回调、不是异步上下文——
+        // 但账户查询是异步的。用一个短任务去做，**不阻塞**这条 sink 链路：
+        // sink 里卡住就等于卡住那个账户的同步循环（见本文件的模块文档）。
+        tauri::async_runtime::spawn(async move {
+            let Ok(Some(account)) = accounts.get(&account_id).await else {
+                return;
+            };
+            crate::notify::notify_new_mail(&app, &account.email, &reports);
+        });
     }
 
     fn state(&self, account_id: &str, state: SyncState) {
@@ -131,6 +161,7 @@ impl<R: Runtime> EventSink for TauriSink<R> {
             AccountEvent::Synced {
                 account_id,
                 reconcile,
+                summary,
                 ..
             } => {
                 // 同步完就是「连上了且在等下一轮」（`IDLE` 或轮询）。
@@ -144,6 +175,10 @@ impl<R: Runtime> EventSink for TauriSink<R> {
                         account_id: account_id.clone(),
                     });
                 }
+                // 新邮件通知（P5-L）。**尽力而为**：查账户失败或没有值得通知的
+                // 东西都不影响这一轮同步。它是同步路径上唯一的「额外一次查库」，
+                // 但只在大约每 `poll_interval`（默认 300 秒）一次，代价可忽略。
+                self.notify(&account_id, &summary.reports);
             }
             AccountEvent::Failed {
                 account_id,

@@ -24,7 +24,7 @@
 > `npm typecheck` / `npm test` 95 条 / Playwright 5 条 / `cargo sqlx prepare --check` /
 > `check_doc_links.py` 全绿。
 > 2026-11-09 再复跑（T10 补上 IMAP 响应解析的 24 条属性测试后）：
-> `cargo test --workspace` **1087 passed / 0 failed / 1 ignored**（`--list` 1088）、
+> `cargo test --workspace` **1095 passed / 0 failed / 1 ignored**（`--list` 1096）、
 > `cargo clippy --workspace --all-targets -D warnings` 零警告、`cargo fmt --all -- --check` 干净。
 >
 > **已落地**：存储层（`xremail-store`，含 FTS5 全文索引）、密文封装（`xremail-crypto`）、

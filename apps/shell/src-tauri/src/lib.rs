@@ -15,6 +15,7 @@
 //! 静默降级会让人以为数据还在，实际却是另一份（ARCHITECTURE §9）。
 
 pub mod cmd;
+pub mod notify;
 pub mod secrets;
 pub mod service;
 pub mod state;
@@ -279,7 +280,7 @@ fn init_storage(app: &tauri::AppHandle) -> Result<AppState, Box<dyn std::error::
             accounts.clone(),
             sync.clone(),
         )),
-        Arc::new(TauriSink::new(app.clone())),
+        Arc::new(TauriSink::new(app.clone(), accounts.clone())),
         xremail_sync::RetryPolicy::default(),
         Arc::new(crate::service::current_time_ms),
     );
