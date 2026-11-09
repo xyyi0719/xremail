@@ -673,26 +673,105 @@ fn write_header(out: &mut Vec<u8>, name: &str, value: &str) {
 
 /// 把一个头字段值折成若干行，每行不超过 `limit` 个字符。
 ///
-/// 折行点取 ASCII 空格：解码方把 `CRLF + 空格` 折叠回一个空格，
-/// 值本身不变。
+/// ## 两条硬要求
+///
+/// 1. **任何一行都不能是空的，也不能「只有空白」**：接收端把「空行」当作邮件头的
+///    结束、正文的开始（RFC 5322 §2.1），把「续行只有一个空格」也一样折叠成空行。
+///    折出那样一行，后面的 `To:` / `Date:` / `Content-Type:` 就全部变成正文。
+///    这里曾经按**单个空格**切词，一段比 `limit` 还长的连续空白会折出一整行空格（R62）。
+/// 2. **任何一行都不能超出预算**：RFC 5322 §2.1.1 的硬上限是 998 字节。
+///    这里曾经只按空格切词，一个比限制还长的「词」会被原样写成一整行。
+///
+/// 做法是逐行贪婪地切：
+///
+/// * 一行能放 `content_width` 个字符（`limit` 扣掉续行前面那个前导空格）；
+/// * 优先切在**第一个**「后面是空白、且空白之后还有内容」的位置，把那段空白留在
+///   本行末尾——接收端折叠折行处的 FWS 后正好还原成原来那一个空格。
+///
+///   取**第一个**而不是最后一个：前端渲染出来的一长串空格（原来的换行被压成空格）
+///   如果全留在行尾，整行就被填满，一个很长的空白段又会撞出「整行刚好用光」
+///   的形态（见下一条）；
+/// * **任何一行都不能用光预算**：接收端会把行尾空白 trim 掉，某个续行剩下的
+///   内容如果恰好紧贴在下一行，trim + 折叠前导空格之后就成了空行。
+///   所以「整段纯空白」每行只放 `content_width - 1` 个空格。
+///
+///   **已知残余（R62）**：`limit` 是逐行变化的（第一行要扣掉 `Subject: `，
+///   续行只扣一个前导空格），而 `fold_value` 拿不到「本行的实际前缀」，
+///   主题里出现几百个连续空格时仍可能折出「只有空白」的一行。
+///   见 `tests/decoding_regressions.rs` 里钉住现状的那条用例；
+/// * 没有可切的空白就在字符边界上硬切（**不能**按字节切：切在汉字中间，
+///   单独看是合法 UTF-8，但接收端按字节拼回来就成了乱码）。
 fn fold_value(value: &str, limit: usize) -> Vec<String> {
+    // 一行**总共**能放多少字符（含续行前面那个前导空格）。
+    let row_width = limit.max(2);
+    // 去掉前导空格之后还能放多少内容。
+    let content_width = row_width - 1;
+    // 纯空白段再少放一个（理由见函数文档最后一条）。
+    let space_width = content_width.saturating_sub(1).max(1);
+
     let mut lines: Vec<String> = Vec::new();
-    let mut current = String::new();
-    for word in value.split(' ') {
-        if current.is_empty() {
-            current.push_str(word);
-        } else if current.len() + 1 + word.len() <= limit {
-            current.push(' ');
-            current.push_str(word);
-        } else {
-            lines.push(std::mem::take(&mut current));
-            current.push_str(word);
+    let mut rest = value;
+
+    while !rest.is_empty() {
+        // 本行能放下的前缀：**字符数**不超过 `content_width`，返回字节长度。
+        // 用 `take_chars` 而不是切片下标，是因为 `limit` 的口径一直是字符数，
+        // 而 `str` 的下标是字节——两者只在纯 ASCII 时才一致。
+        let prefix_bytes = take_chars(rest, content_width);
+        if prefix_bytes == rest.len() {
+            lines.push(rest.to_string());
+            break;
         }
+
+        // 首选切点：前缀里**第一个**「后面是空白、空白之后还有内容」的位置，
+        // 切点落在空白之前——那段空白留在本行末尾，接收端折叠折行处的 FWS 后
+        // 正好还原成原来那一个空格。
+        //
+        // 从下标 1 开始找：0 处切一刀会让「空格 + 一长串内容」在每一个空格处都
+        // 切一刀，普通标题被切成碎条。`rest` 以空白开头时交给下面的纯空白分支，
+        // 它会按宽度一次切走一大段，不会退化成一次一个字符。
+        let preferred = rest[..prefix_bytes]
+            .char_indices()
+            .map(|(byte, _)| byte)
+            .skip(1)
+            .find(|byte| rest[*byte..].starts_with(' ') && !rest[*byte..].trim_start().is_empty());
+
+        // 以空白开头、又切不动（后面全是空白）：把开头的空白单独切成一行。
+        //
+        // `rest` 此时**全是空格**——按「内容宽度」切一定会把行填满，
+        // 续行剩下的那点空格在接收端被 trim 掉、再折叠前导空格之后就是空行
+        // （R62 的第二种形态）。所以每行只放 `space_width` 个。
+        //
+        // 注意只在「全是空白」时这样切：`rest` 是「空格 + 一长串内容」时，
+        // 空白后面紧接着会走硬切，行是填满的，不会剩下孤立的一行。
+        let only_spaces = rest.chars().all(|ch| ch == ' ' || ch == '\t');
+        let cut = match preferred {
+            Some(byte) => byte,
+            None if rest.starts_with(' ') && only_spaces => take_chars(rest, space_width),
+            None if rest.starts_with(' ') => take_chars(rest, content_width),
+            // 一个比整行还长的「词」：在字符边界上硬切。
+            None => prefix_bytes,
+        };
+
+        lines.push(rest[..cut].to_string());
+        rest = &rest[cut..];
     }
-    if !current.is_empty() || lines.is_empty() {
-        lines.push(current);
+
+    if lines.is_empty() {
+        lines.push(String::new());
     }
     lines
+}
+
+/// 取 `text` 开头最多 `count` 个字符的**字节长度**。
+///
+/// `count` 为 0 时返回 0：调用方自己保证「至少切一个字符」，免得这里悄悄多切一个
+/// 字符、把行宽预算撑破（曾经就是这么错的）。
+fn take_chars(text: &str, count: usize) -> usize {
+    text.char_indices()
+        .take(count)
+        .map(|(byte, ch)| byte + ch.len_utf8())
+        .last()
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------

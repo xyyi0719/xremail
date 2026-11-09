@@ -23,7 +23,9 @@ pub mod probe;
 pub mod transfer;
 pub mod utf7;
 
-pub use append::{AppendOptions, AppendOutcome, append_message, build_append_command};
+pub use append::{
+    AppendOptions, AppendOutcome, append_message, append_message_with_timeout, build_append_command,
+};
 pub use command::{
     CommandOutcome, DEFAULT_COMMAND_TIMEOUT, FetchedMessage, ListedMailbox, MailboxInfo,
     examine_checked, examine_checked_with_timeout, run_checked, run_checked_with_timeout,

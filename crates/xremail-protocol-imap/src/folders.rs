@@ -69,16 +69,12 @@ pub async fn list_folders_with_timeout(
     session: &mut crate::connection::Session,
     timeout: std::time::Duration,
 ) -> Result<Vec<RemoteFolder>, ProtocolError> {
-    match tokio::time::timeout(
-        timeout,
-        crate::command::run_checked(session, "LIST \"\" \"*\""),
-    )
-    .await
-    {
-        Ok(outcome) => Ok(to_remote_folders(outcome?)),
-        Err(_) => Err(ProtocolError::Timeout(format!(
-            "命令超时（{timeout:?}）: LIST \"\" \"*\""
-        ))),
+    // 超时交给 `run_checked_with_timeout` 那一处收口：`run_checked` 自己也带着
+    // 默认超时，两层超时叠在一起时，外层先响会让**内层**的读循环被丢掉、
+    // 而报出来的文案却来自外层——两处的脱敏与文案就没法保证一致了（R61）。
+    match crate::command::run_checked_with_timeout(session, "LIST \"\" \"*\"", timeout).await {
+        Ok(outcome) => Ok(to_remote_folders(outcome)),
+        Err(error) => Err(error),
     }
 }
 

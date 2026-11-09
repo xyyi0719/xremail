@@ -59,6 +59,44 @@ fn classify_imap_error(error: async_imap::error::Error) -> ProtocolError {
     crate::connection::classify_imap_error(error)
 }
 
+/// 拼一条超时文案，并**抹掉命令里的凭据**（R61）。
+///
+/// 对测试公开（`tests/error_paths.rs`）：这是唯一一处把**命令原文**拼进错误
+/// 信息的地方，脱敏的正确性要能直接喂它。
+///
+/// ## 为什么必须在这里脱敏
+///
+/// 超时文案会一路变成日志与界面上的文字。而 [`run_checked_with_timeout`] 是
+/// **公开**接口，调用方传什么由调用方决定：`LOGIN "user" "password"` 本身就是
+/// 一条合法的 IMAP 命令，诊断工具也确实用它发原始命令。`lib.rs` 的承诺是
+/// 「错误信息**不含**用户名或口令」——承诺要落在**唯一**能保证它的地方，
+/// 而不是指望每个调用方各自记得。
+///
+/// ## 判据
+///
+/// 只按**命令名**决定脱不脱，不看参数长什么样：`AUTHENTICATE` 后面的东西
+/// 可能分几条命令发（`+ base64`），凭据也可能出现在 `APPEND` 的字面量里。
+/// 这几个命令名一律只留下命令名本身——排查「哪条命令卡住了」够用，
+/// 而它们的参数里没有任何一个字节是排查需要的。
+///
+/// 其余命令的原文一个字不动：`LIST "" "*"`、`UID STORE 12 (\Deleted)`
+/// 这些才是排查真正要看的，脱掉了反而害人。
+pub fn timeout_detail(timeout: Duration, command: &str) -> String {
+    let name = command.split_whitespace().next().unwrap_or_default();
+    if carries_credentials(name) {
+        format!("命令超时（{timeout:?}）: {name} (参数已隐去)")
+    } else {
+        format!("命令超时（{timeout:?}）: {command}")
+    }
+}
+
+/// 这条命令的参数里会不会有凭据（按命令名判，大小写不敏感）。
+fn carries_credentials(command_name: &str) -> bool {
+    command_name.eq_ignore_ascii_case("LOGIN")
+        || command_name.eq_ignore_ascii_case("AUTHENTICATE")
+        || command_name.eq_ignore_ascii_case("APPEND")
+}
+
 /// 一条 FETCH 响应（已解析）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FetchedMessage {
@@ -193,8 +231,9 @@ pub async fn examine_checked_with_timeout(
 ) -> Result<MailboxInfo, ProtocolError> {
     match tokio::time::timeout(timeout, examine_inner(session, mailbox)).await {
         Ok(result) => result,
-        Err(_) => Err(ProtocolError::Timeout(format!(
-            "命令超时（{timeout:?}）: EXAMINE {mailbox}"
+        Err(_) => Err(ProtocolError::Timeout(timeout_detail(
+            timeout,
+            &format!("EXAMINE {mailbox}"),
         ))),
     }
 }
@@ -255,9 +294,7 @@ pub async fn run_checked_with_timeout(
 ) -> Result<CommandOutcome, ProtocolError> {
     match tokio::time::timeout(timeout, run_checked_inner(session, command)).await {
         Ok(result) => result,
-        Err(_) => Err(ProtocolError::Timeout(format!(
-            "命令超时（{timeout:?}）: {command}"
-        ))),
+        Err(_) => Err(ProtocolError::Timeout(timeout_detail(timeout, command))),
     }
 }
 
@@ -336,10 +373,39 @@ async fn run_checked_inner(
                     other => Err(ProtocolError::Imap(format!("意外的响应状态: {other:?}"))),
                 };
             }
+            // 服务器说 `BYE`：这条连接已经不可信（R58）。
+            //
+            // 不能像别的单方面响应那样接着读：`BYE` 之后服务器要么已经关掉
+            // 连接、要么马上就关，本命令的结局可能永远不来。以前这里一律
+            // `continue`，于是一条死掉的连接被原样还给了调用方——它还会在
+            // 上面再跑几条命令，每条都要等满超时才失败。
+            Response::Data {
+                status: Status::Bye,
+                ..
+            } => return Err(bye_error()),
             // 单方面响应（`EXISTS` / `RECENT` / `EXPUNGE` 等）与本命令无关，忽略。
             _ => {}
         }
     }
+}
+
+/// 服务器发了 `BYE` 时返回的错误。
+///
+/// 为什么是 [`ProtocolError::Io`] 而不是 `Imap`：
+///
+/// * `Io` 意味着「连接没了」，`is_retryable()` 为真、`xremail-sync` 会把它翻成
+///   `AppError::Network` 并**立刻重连**（`is_session_recoverable`）；
+/// * `Imap` 是**语义**错误，同步层靠一串小写子串猜测哪些算掉线
+///   （`net.rs::is_dead_session_text`），猜错就要等满一个 `poll_interval`。
+///
+/// `BYE` 是服务器对「连接要没了」的**明说**，不需要猜。而且它与
+/// 「读的时候连接断了」是同一件事，只是提前知道了—— `connection.rs` 里
+/// `async_imap::Error::ConnectionLost` 也落在 `Io("连接被断开")`。
+///
+/// 文案里必须留下 `BYE`（大小写都行）：排查时要分得清是「服务器赶我们走」
+/// 还是「网线断了」，而且 `net.rs` 的证据表里也有 `bye`。
+pub(crate) fn bye_error() -> ProtocolError {
+    ProtocolError::Io("连接被断开（服务器发送了 BYE）".into())
 }
 
 /// 响应码是否是 `MODIFIED`（条件写失败）。
@@ -488,6 +554,41 @@ mod tests {
     fn connection_lost_is_a_retryable_io_failure() {
         let error = classify_imap_error(async_imap::error::Error::ConnectionLost);
         assert!(matches!(error, ProtocolError::Io(_)));
+    }
+
+    /// `BYE` 必须是**可重试的 Io**，不是语义错误。
+    ///
+    /// 回归用例（R58）：它曾经被当成「与本命令无关的单方面响应」吞掉，
+    /// 死掉的会话被原样还回去，后面每条命令都要等满超时才失败。
+    #[test]
+    fn bye_is_a_retryable_io_error() {
+        let error = bye_error();
+        assert!(
+            error.is_retryable(),
+            "BYE 说明连接没了，同步层要立刻重连：{error:?}"
+        );
+        assert!(
+            error.to_string().to_ascii_uppercase().contains("BYE"),
+            "文案里要留下 BYE，才分得清「服务器赶人」与「网线断了」：{error}"
+        );
+    }
+
+    /// 超时文案不带上凭据（R61）。
+    #[test]
+    fn timeout_detail_hides_credentials() {
+        let detail = timeout_detail(Duration::from_secs(30), "LOGIN \"a@b.com\" \"hunter2\"");
+        assert!(!detail.contains("hunter2"));
+        assert!(!detail.contains("a@b.com"));
+        assert!(detail.contains("LOGIN"));
+
+        // `AUTHENTICATE` 的凭据可能出现在后续几条命令里，同样按命令名脱敏。
+        let detail = timeout_detail(Duration::from_secs(30), "AUTHENTICATE PLAIN");
+        assert!(detail.contains("AUTHENTICATE"));
+        assert!(!detail.contains("PLAIN"), "机制名也可能带线索：{detail}");
+
+        // 普通命令原样保留。
+        let detail = timeout_detail(Duration::from_secs(30), "UID FETCH 1:* (UID)");
+        assert_eq!(detail, "命令超时（30s）: UID FETCH 1:* (UID)");
     }
 
     #[test]

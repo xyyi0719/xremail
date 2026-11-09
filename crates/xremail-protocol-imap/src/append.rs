@@ -29,6 +29,7 @@ use imap_proto::rfc4315::UidSetMember;
 use imap_proto::{Response, ResponseCode, Status};
 use tokio::io::AsyncWriteExt;
 
+use crate::command::DEFAULT_COMMAND_TIMEOUT;
 use crate::connection::Session;
 use crate::error::ProtocolError;
 
@@ -77,22 +78,77 @@ pub struct AppendOutcome {
     pub message: Option<String>,
 }
 
-/// 把一封信追加到文件夹末尾。
+/// 把一封信追加到文件夹末尾（超时用 [`DEFAULT_COMMAND_TIMEOUT`]）。
 ///
 /// `mailbox` 传**线路上的原名**（modified UTF-7），
 /// 不是解码后的名字——拿解码后的名字去开文件夹会得到
 /// `NO EXAMINE Folder not exist`（见 [`crate::folders`]）。
+///
+/// ## 自带超时（R60）
+///
+/// 与 [`crate::command::run_checked`] 是同一个道理，而且这里**更容易忘**：
+/// 本模块自己拼命令、自己写 socket、自己读响应，两个读循环
+/// （[`wait_for_continuation`] 与 [`read_append_result`]）都是裸的
+/// `read_response().await`。服务器收了命令却不回 `+`（半死连接、中间设备吞包、
+/// 服务器自己卡住）时，它会**永久挂住**。
+///
+/// `async-imap` 也没有命令超时——它自己的 `append()` 同样裸读。
+/// 所以超时只能由本层给：以前它靠调用方在外面包，可
+/// `apps/shell/src-tauri/src/service/sent_copy.rs` 的几处就没有包，
+/// 于是「发信后确保已发送副本」这一步在坏网络上一直转圈（R46）。
+///
+/// 要自定义时长用 [`append_message_with_timeout`]。
 pub async fn append_message(
     session: &mut Session,
     mailbox: &str,
     content: &[u8],
     options: &AppendOptions,
 ) -> Result<AppendOutcome, ProtocolError> {
+    append_message_with_timeout(session, mailbox, content, options, DEFAULT_COMMAND_TIMEOUT).await
+}
+
+/// 同 [`append_message`]，但用**调用方给的**超时。
+///
+/// 超时覆盖**整条** APPEND（发命令头 → 等 `+` → 发正文 → 等结局），
+/// 与 `command` / `transfer` 那两条读循环的范围一致：正文可能有几 MB，
+/// 只给「等 `+`」加超时、却让「发正文」与「等结局」裸着，等于没加。
+///
+/// ## 超时之后这条会话不能再用
+///
+/// 与 `transfer::run_until_tagged` 的约定相同：超时意味着**结果未知**——
+/// 正文可能已经写进去了，服务器迟到的 `OK [APPENDUID …]` 也可能正堵在连接里。
+/// 调用方必须把 `Timeout` 当成「这封信可能已经存了」，**别在原会话上重发**
+/// （APPEND 不幂等，见模块文档），重连之后先回读确认。
+pub async fn append_message_with_timeout(
+    session: &mut Session,
+    mailbox: &str,
+    content: &[u8],
+    options: &AppendOptions,
+    timeout: std::time::Duration,
+) -> Result<AppendOutcome, ProtocolError> {
     if content.is_empty() {
         // 空正文会让某些服务器直接 `BAD`，而且它一定是调用方的 bug。
         return Err(ProtocolError::Imap("APPEND 的正文是空的".into()));
     }
 
+    match tokio::time::timeout(timeout, append_inner(session, mailbox, content, options)).await {
+        Ok(result) => result,
+        // 文案里不带正文（那可能是用户写的信）：只说清是哪条命令、多大。
+        // 与 `command::timeout_detail` 对 `APPEND` 的处置一致（R61）。
+        Err(_) => Err(ProtocolError::Timeout(format!(
+            "命令超时（{timeout:?}）: APPEND {mailbox}（正文 {} 字节）",
+            content.len()
+        ))),
+    }
+}
+
+/// [`append_message_with_timeout`] 的本体（**不带**超时）。
+async fn append_inner(
+    session: &mut Session,
+    mailbox: &str,
+    content: &[u8],
+    options: &AppendOptions,
+) -> Result<AppendOutcome, ProtocolError> {
     let tag = next_tag();
     let command = build_append_command(mailbox, content.len(), options);
 
@@ -183,6 +239,14 @@ async fn wait_for_continuation(session: &mut Session, tag: &str) -> Result<(), P
 
         match response.parsed() {
             Response::Continue(_) => return Ok(()),
+            // 服务器说 `BYE`：连接要没了，再也等不到 `+`（R58）。
+            //
+            // 与其它几条读循环同一个判据、同一个错误。以前这里落进下面的
+            // `_ => {}`，于是「服务器赶人」被当成噪音，只能等到超时。
+            Response::Data {
+                status: Status::Bye,
+                ..
+            } => return Err(crate::command::bye_error()),
             Response::Done {
                 tag: done_tag,
                 status,
@@ -220,6 +284,11 @@ async fn read_append_result(
         };
 
         match response.parsed() {
+            // 服务器说 `BYE`：结局不会再来了（R58）。
+            Response::Data {
+                status: Status::Bye,
+                ..
+            } => return Err(crate::command::bye_error()),
             Response::Done {
                 tag: done_tag,
                 status,

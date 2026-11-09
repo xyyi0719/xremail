@@ -439,6 +439,22 @@ async fn read_until_tagged(
             return Err(ProtocolError::Io("连接被断开".into()));
         };
 
+        // 服务器说 `BYE`：这条连接已经不可信（R58）。
+        //
+        // 与 `command::run_checked_inner` 同一个判据、同一个错误——两条读循环
+        // 分开写是因为它们要读的东西不同，但「`BYE` 意味着别再用这条连接了」
+        // 这件事没有第二种解释。以前这里落进下面的 `continue`，
+        // 于是 `UID MOVE` 之后的一切都在一条死连接上跑。
+        if matches!(
+            response.parsed(),
+            Response::Data {
+                status: Status::Bye,
+                ..
+            }
+        ) {
+            return Err(crate::command::bye_error());
+        }
+
         // untagged 响应（`EXISTS` / `EXPUNGE` / `FETCH` …）：与成败无关，忽略。
         let Response::Done {
             tag,

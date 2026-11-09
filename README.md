@@ -24,10 +24,10 @@
 > `npm typecheck` / `npm test` 95 条 / Playwright 5 条 / `cargo sqlx prepare --check` /
 > `check_doc_links.py` 全绿。
 > 2026-11-09 再复跑（T10 补上 IMAP 响应解析的 24 条属性测试后）：
-> `cargo test --workspace` **1112 passed / 0 failed / 1 ignored**（`--list` 1113）、
+> `cargo test --workspace` **1144 passed / 0 failed / 3 ignored**（`--list` 1147）、
 > `cargo clippy --workspace --all-targets -D warnings` 零警告、`cargo fmt --all -- --check` 干净。
-> 2026-11-09 本轮复核（只改文档）：`cargo test --workspace -- --list` 点数 **1113**（逐包相加同为 1113），
-> 其中 1 条 `#[ignore]`（真实邮箱往返 `real_round_trip_between_two_mailboxes`）→ 实际执行 **1112**；
+> 2026-11-09 本轮复核（只改文档）：`cargo test --workspace -- --list` 点数 **1147**（逐包相加同为 1147），
+> 其中 1 条 `#[ignore]`（真实邮箱往返 `real_round_trip_between_two_mailboxes`）→ 实际执行 **1144**（3 条 `#[ignore]`：真实邮箱往返 1 条 + R59 的 30 秒超时验证 1 条 + R65 的已知残余 1 条）；
 > `npx vitest run` 实测 **15 个文件 / 95 条**；Playwright **2 个 spec / 5 条**。
 > **CI 口径要说清**：`.github/workflows/ci.yml` 有 **4 个 job**（`Rust (ubuntu-latest)` / `Rust (windows-latest)` /
 > `Frontend` / `Docs sanity`），它们上一次的绿是 **2026-11-09 的 `e0af98b`**（当时 CI 计数 1056）；

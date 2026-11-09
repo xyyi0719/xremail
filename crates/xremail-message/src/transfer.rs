@@ -175,6 +175,27 @@ pub fn decode_base64(bytes: &[u8]) -> Vec<u8> {
     }
 }
 
+/// 解码 RFC 2047 `Q` 编码词里的载荷。
+///
+/// **与 [`decode_quoted_printable`] 差一个字符**：RFC 2047 §4.2 规定 `Q` 编码里
+/// `_` **代表空格**（"an underscore ... always represents a 'space'"），要按
+/// `%20` / `=20` 一样理解。正文的 quoted-printable 里 `_` 就是字面下划线，
+/// 所以这条规则**只能**用在编码词上，不能塞进 `decode_quoted_printable`。
+///
+/// 于是：先把 `_` 换成 `=20` 再走同一个 QP 解码器。比在解码器内部加参数好，
+/// 因为 QP 解码器还要处理软换行、非法转义，两份实现迟早会走岔。
+pub fn decode_q_encoded_word(payload: &[u8]) -> Vec<u8> {
+    let mut swapped: Vec<u8> = Vec::with_capacity(payload.len());
+    for &byte in payload {
+        if byte == b'_' {
+            swapped.extend_from_slice(b"=20");
+        } else {
+            swapped.push(byte);
+        }
+    }
+    decode_quoted_printable(&swapped)
+}
+
 /// 解码 quoted-printable。
 ///
 /// * `=XX` → 一个字节；
@@ -273,6 +294,15 @@ mod tests {
         let input = b"a=Zb";
 
         assert_eq!(decode_quoted_printable(input), b"a=Zb");
+    }
+
+    #[test]
+    fn q_encoded_word_underscore_is_a_space() {
+        // RFC 2047 §4.2：`_` 代表空格；`=5F` 才是字面下划线。
+        assert_eq!(decode_q_encoded_word(b"hello_world"), b"hello world");
+        assert_eq!(decode_q_encoded_word(b"a=5Fb"), b"a_b");
+        // 正文的 QP 不受影响：那里 `_` 就是下划线本身。
+        assert_eq!(decode_quoted_printable(b"hello_world"), b"hello_world");
     }
 
     #[test]

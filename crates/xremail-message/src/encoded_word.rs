@@ -292,6 +292,23 @@ fn is_printable_ascii(ch: char) -> bool {
 pub fn decode_encoded_words(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
+    /// 上一段输出是从哪个编码字解出来的。
+    ///
+    /// RFC 2047 §6.2 只说「两个**编码字**之间只隔空白时，那段空白要丢掉」，
+    /// 与编码字解出来是什么字符**无关**。这里曾经用「输出末尾是不是非 ASCII」
+    /// 去猜相邻关系：一旦前一个编码字解出纯 ASCII（很常见——
+    /// `=?utf-8?B?UmU6IA==?=` 解出来是 `Re: `），「相邻」就判不出来，
+    /// 中间那段本该丢掉的空白被保留，主题里多出一个空格（R60）。
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Previous {
+        /// 输出里还没有东西。
+        Nothing,
+        /// 上一段是编码字。
+        EncodedWord,
+        /// 上一段是明文（或者被跳过的空白，见下）。
+        Plain,
+    }
+    let mut previous = Previous::Nothing;
 
     loop {
         let Some(start) = rest.find("=?") else {
@@ -304,43 +321,38 @@ pub fn decode_encoded_words(input: &str) -> String {
             // 不是合法的编码字 → 把 `=?` 当普通文本，继续找下一个。
             out.push_str(&rest[..start + 2]);
             rest = &rest[start + 2..];
+            previous = Previous::Plain;
             continue;
         };
 
         let (charset_label, encoded, text, consumed) = parsed;
 
-        // 编码字**前面**的空白：如果上一个输出也是编码字，
-        // 按 RFC 2047 §6.2 这个空白要丢掉。
+        // 编码字**前面**的空白：如果上一段输出是编码字，按 RFC 2047 §6.2 丢掉。
+        //
+        // 这里**不改** `previous`：编码字与编码字之间的连接是「穿过空白」的
+        // 直接相邻（所以三四个编码字之间的每一段空白都要丢），
+        // 而紧跟在后面的那个编码字自己就会把 `previous` 设回 `EncodedWord`。
         let before = &rest[..start];
-        if !ends_with_encoded_word(&out) {
+        if !before.is_empty() && !before.chars().all(char::is_whitespace) {
+            // 中间有非空白内容 → 不是「相邻」，原样保留。
             out.push_str(before);
-        } else if !before.is_empty() && !before.chars().all(char::is_whitespace) {
-            // 中间有非空白内容 → 不是「相邻」，保留空白。
+        } else if previous != Previous::EncodedWord {
+            // 前面没有编码字（或者是明文）→ 这是明文与编码字之间的空白，保留。
             out.push_str(before);
         }
 
         // 解码。
         let bytes = match encoded {
             Encoding::Base64 => transfer::decode_base64(text.as_bytes()),
-            Encoding::QuotedPrintable => transfer::decode_quoted_printable(text.as_bytes()),
+            Encoding::QuotedPrintable => transfer::decode_q_encoded_word(text.as_bytes()),
         };
         out.push_str(&charset::decode_lossy(&bytes, Some(&charset_label)));
+        previous = Previous::EncodedWord;
 
         rest = &rest[start + consumed..];
     }
 
     out
-}
-
-/// 输出的末尾是不是一个编码字（用于判断相邻）。
-///
-/// 判断依据：末尾是某个 Unicode 替换字符或非 ASCII 字符——
-/// 不够精确。更稳的做法是记录位置，这里用「末尾不是 ASCII 空白」
-/// 近似：**实测**三种情况（utf-8 / gb2312 / gbk）都正确。
-fn ends_with_encoded_word(out: &str) -> bool {
-    out.chars()
-        .next_back()
-        .is_some_and(|ch| !ch.is_ascii() || ch == '\u{FFFD}')
 }
 
 /// 编码字里的编码方式。
