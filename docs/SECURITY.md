@@ -215,9 +215,24 @@
 
 ```bash
 cargo install cargo-audit cargo-deny
-cargo audit
-cargo deny check          # licenses / bans / advisories
+python3 scripts/security_audit.py    # 漏洞（拉库失败会自动改用 gh api）
+cargo deny check licenses bans       # 许可证 / 禁用项（不需要网络）
 ```
+
+**关于这三条命令的实际情况**（2026-11-10 核实并修好的）：
+
+* 仓库此前**没有 `deny.toml`**。没有配置时 `cargo deny` 回退到空白的允许列表，
+  于是每一条依赖都被判 `rejected`——`licenses FAILED`，但失败原因跟许可证无关，
+  纯粹是没配。现在有了 `deny.toml`，**允许哪些许可证是明确写下来的**，
+  包括为什么接受 `MPL-2.0`（弱 copyleft：**没有修改**那些 crate 的源码，
+  只需分发时保留许可证，不需要开源本项目）。
+* `cargo deny check` 不带参数时还会跑 `advisories`（拉 RustSec 漏洞库）。
+  这台机器 `git` 到 GitHub 不稳，那一步会失败——所以**日常用的是上面那两条
+  分开的命令**：漏洞交给 `scripts/security_audit.py`（它在拉库失败时改用
+  `gh api`），许可证与禁用项交给 `cargo deny check licenses bans`。
+* `cargo deny` 的 `wildcards` 检查设成 `warn` 而不是 `deny`：本项目整个靠
+  `{ workspace = true }` 与 `{ path = ... }` 组织，`cargo deny` 把这两种都判成
+  wildcard，`deny` 会拦下几十条**本仓库自己的内部依赖**。
 
 - `Cargo.lock` **必须提交**（本项目发布二进制）。
 - 依赖许可证仅允许 MIT / Apache-2.0 / BSD / ISC / MPL-2.0。

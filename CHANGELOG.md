@@ -7,6 +7,20 @@
 ## [Unreleased]
 
 ### Security
+- **补上 `deny.toml`，让发布检查单里的「`cargo deny` 无告警」真的可执行**（2026-11-10，R71）
+  - `SECURITY.md` 的检查单要求它，但仓库**没有 `deny.toml`**；没有配置时 `cargo deny`
+    回退到空白的允许列表，于是每条依赖都被判 `rejected`——**失败原因跟许可证无关，纯粹是没配**
+  - 清点依赖实际用到的许可证后，明确写下允许哪些：MIT / Apache-2.0 / BSD-2·3-Clause /
+    ISC / Zlib / 0BSD / Unlicense / CC0 / Unicode-3.0，以及 **`MPL-2.0`**
+    （弱 copyleft，单独说明为什么接受：用到它的 5 个 crate 是构建期的 `cssparser` /
+    `selectors` 等与 `option-ext`；MPL 只要求「修改了那些文件才需以 MPL 公开」，
+    本项目没有改）。**没有**放行 GPL / AGPL / LGPL / SSPL / BUSL
+  - **变异验证**：把 `MPL-2.0` 从允许列表删掉 → 立刻 `error[rejected]`，
+    证明这份配置真的有约束力，不是摆设
+  - `cargo deny check licenses bans` → **`bans ok, licenses ok`**
+  - 同步修正 `SECURITY.md` 的命令：日常用 `scripts/security_audit.py`（漏洞）+
+    `cargo deny check licenses bans`（许可证/禁用项，不需网络）；`wildcards` 设成 `warn`，
+    因为本项目靠 `workspace = true` / `path = …` 组织，`deny` 会拦下几十条自己的内部依赖
 - **修掉两个生产路径上的依赖漏洞，并把依赖审计变成常规动作**（2026-11-10，R70）
   - 仓库此前**没有任何依赖审计手段**。第一次跑 `cargo-audit` 就报 **3 个漏洞 + 8 个未维护警告**，
     其中两个在**生产路径**上：

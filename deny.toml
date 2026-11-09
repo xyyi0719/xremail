@@ -1,0 +1,100 @@
+# `cargo deny` 的配置。
+#
+# ## 为什么需要这个文件
+#
+# `docs/SECURITY.md` 的发布前检查单里写着「`cargo audit` / `cargo deny` 无告警」，
+# 但仓库此前**没有 `deny.toml`**（2026-11-10 发现）。没有配置时 `cargo deny` 会
+# 回退到一个**空白的允许列表**，于是每一条依赖都被判 `rejected`——
+# `licenses FAILED`，而失败原因跟许可证本身没关系，纯粹是没配。
+#
+# 这个文件把「本项目接受哪些许可证」**明确写下来**，让那条检查单真的可执行。
+#
+# ## 许可证为什么是这几个
+#
+# 本项目自己的许可是 **MIT OR Apache-2.0**（见 `Cargo.toml` 的 `license`）。
+# 依赖侧的实际情况（2026-11-10 用 `cargo metadata` 清点）：
+#
+# * 绝大多数是 `MIT` / `Apache-2.0`（或其 `OR` 组合）——与本项目一致；
+# * `Unlicense` / `BSD-2-Clause` / `BSD-3-Clause` / `ISC` / `Zlib` / `0BSD` /
+#   `CC0-1.0`：都是**宽松许可**，允许闭源分发与再许可，可以接受；
+# * `Unicode-3.0`：`icu` / `unicode-*` 系列用，OSI 认可，可以接受；
+# * **`MPL-2.0`：弱 copyleft，需要单独说明**。当前用到它的 5 个 crate 是
+#   `cssparser` / `cssparser-macros` / `selectors` / `dtoa-short`（经
+#   `dom_query` ← `tauri-utils`，**构建期**依赖）与 `option-ext`
+#   （经 `dirs` ← `auto-launch`）。MPL-2.0 的义务是「**修改**了这些文件就必须
+#   以 MPL 公开那部分修改」；本项目**没有修改**它们的源码，只是链接，
+#   因此只需在分发时**保留许可证与来源**，不需要开源本项目。这是 MPL-2.0
+#   与 GPL 的关键区别，所以可以接受。
+#
+# **没有**出现在允许列表里的（如果将来被引入，`cargo deny` 会拦下来）：
+# `GPL-*` / `AGPL-*` / `LGPL-*` / `SSPL` / `BUSL` / 任何 `proprietary`。
+#
+# ## 网络受限时
+#
+# `cargo deny check` 默认会去拉 RustSec 的漏洞库（`advisories` 那一组检查）。
+# 这台机器 `git` 到 GitHub 不稳，拉库会失败。此时只跑不需要网络的两组：
+#
+# ```bash
+# cargo deny check licenses bans
+# ```
+#
+# 漏洞那一组用 `scripts/security_audit.py`（它会在拉库失败时改用 `gh api`）。
+
+[graph]
+all-features = true
+# 只检查本平台的依赖，避免把 windows/linux 分支的 crate 全算进来。
+targets = []
+
+[advisories]
+# 漏洞库。这一组要联网（见文件头）。CI 里若要跑，需要先备好库。
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+# 允许的许可证（见文件头的说明）。
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Unlicense",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "MPL-2.0",
+]
+# 遇到清单里没有的许可证时**报错**而不是放过——这正是这个文件存在的意义。
+confidence-threshold = 0.9
+exceptions = []
+
+[[licenses.clarify]]
+# `ring` 的清单里写的是 `Apache-2.0 AND ISC`，但它有一部分代码
+# 用的是 OpenSSL/SSLeay 的双许可。上游的 `LICENSE` 文件说明了这一点，
+# `cargo deny` 读不到，所以在这里声明——**只声明，不改判定**。
+crate = "ring"
+expression = "Apache-2.0 AND ISC"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+multiple-versions = "warn"
+# **不能设成 `deny`**：本项目整个就是靠 `{ workspace = true }` 与
+# `{ path = "../xremail-xxx" }` 组织的，`cargo deny` 把这两种都判成
+# 「wildcard dependency」。第一次配上 `deny` 时它报出了几十条——
+# 拦的全是本仓库自己的内部依赖，跟供应链风险无关。
+#
+# 真正想拦的是「从 crates.io 拉一个版本号写成 `*` 的外部依赖」，
+# 那种在本项目里不存在；`warn` 足以在它出现时被人看见。
+wildcards = "warn"
+# 依赖图里同一 crate 出现两个大版本时只是警告：这是生态常态，
+# 硬拦会让每次 `cargo update` 都变成一次人工裁决。真正会出问题的是
+# **同一个 crate 被链接进同一个产物**，那不是靠这条能防的。
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
