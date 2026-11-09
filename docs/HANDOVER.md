@@ -216,7 +216,7 @@ env -u DBUS_SESSION_BUS_ADDRESS cargo test --workspace -j 4 --no-fail-fast
 |---|---|---|
 | Linux 打包产物能不能跑 | `python3 scripts/verify_linux_runtime.py [appimage]` | `xvfb-run`、打包产物（**要先重新打包**，见下） |
 | HTML 消毒在真实 WebView 里 | `xvfb-run -a python3 scripts/webkit_sandbox_probe.py --engine=both` | WebKitGTK、Playwright |
-| 真钥匙串往返 | `XREMAIL_SECRET_SERVICE_PROBE=1 dbus-run-session -- <测试二进制>` | `gnome-keyring-daemon` |
+| 真钥匙串往返 | `python3 scripts/verify_linux_keychain.py`（没有守护进程时它会明说「验不了」） | `gnome-keyring-daemon` |
 | 某个偶发失败到底修没修好 | `python3 scripts/ci_failure_rate.py --job "Rust (windows" --limit 30` | `gh` 已登录 |
 | 解析器改完之后专项扫一遍 | `XREMAIL_PROPERTY_ROUNDS=2000000 cargo test -p <crate> --test <文件> --release` | 无（十几秒） |
 | **依赖有没有已知漏洞** | `python3 scripts/security_audit.py` | `cargo-audit`、`gh` 已登录 |

@@ -617,7 +617,8 @@ Gmail 将来有需求再开独立决策：授权流程、scope、个人使用与
     `credential_service.rs` 的跨平台用例改成三平台各自成立
   - **未验证**：**真钥匙串上的写→读→删往返**（这台机器没有
     `gnome-keyring-daemon`，也无法安装）。等桌面环境或装好守护进程后用
-    `XREMAIL_SECRET_SERVICE_PROBE=1 dbus-run-session -- <测试二进制>` 跑一遍即可
+    `python3 scripts/verify_linux_keychain.py` 跑一遍即可（没有守护进程时它会**明说验不了**，
+    不会假装跑过）
 - [ ] 托盘（libayatana-appindicator）、通知（D-Bus）、开机自启（XDG autostart .desktop）
   - [x] **托盘在 Linux 上真的建出来了**（2026-11-09，Xvfb 实测）
     - 此前这条写的是「运行未验证」。实测后修正：**托盘本身是能工作的**，
