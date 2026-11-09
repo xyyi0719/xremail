@@ -317,19 +317,18 @@ async fn copyuid_expansion_is_bounded() {
         .await
         .expect("COPY 应当成功");
 
-    assert!(
-        outcome.destination_uids.len() <= 10_000,
-        "区间必须被截断，实际展开了 {} 个元素",
-        outcome.destination_uids.len()
-    );
-    assert_eq!(
-        outcome.destination_uids.first(),
-        Some(&1),
-        "截断只能砍尾巴，不能把开头也弄丢"
-    );
+    // 修了 R47 之后，目标侧**被截断就整体置空**，所以这里看不到那 10 000 个元素了。
+    // 「截断只砍尾巴、不砍开头」那条性质改为直接测展开函数（见本文件末尾
+    // `truncation_only_cuts_the_tail`）——性质没变，只是观察点从 `TransferOutcome`
+    // 挪到了真正做展开的地方。
     assert!(
         !outcome.has_uid_mapping(),
-        "被截断的映射长短对不上，不能被当成可用的映射"
+        "被截断的映射不能被当成可用的映射（R47）"
+    );
+    assert!(
+        outcome.destination_uids.is_empty(),
+        "截断后目标侧应当整体置空，实际 {} 个",
+        outcome.destination_uids.len()
     );
 
     server.shutdown().await;
@@ -343,10 +342,17 @@ async fn copyuid_expansion_is_bounded() {
 /// `truncated` 标记、或在截断后判定映射不可用），这条会红，提醒同步
 /// 「R39 的写回」可以开始信任这份映射了。
 #[tokio::test]
-async fn truncated_copyuid_currently_looks_like_a_valid_mapping() {
-    // `*` 在 `COPYUID` 里是「集合里的最后一个 UID」= INBOX 里最大的 UID（13）。
-    // 源、目标**都**取同一个大区间，两个方向都被截到 `UID_EXPANSION_LIMIT`。
-    // 源、目标都声明 `1:4294967295`（合法：没有 `*`），两边各自被截到上限 10 000。
+async fn truncated_copyuid_is_refused_instead_of_used_as_a_mapping() {
+    // `COPYUID` 里源、目标两个集合是**各自**展开的。两边都回 `1:4294967295`
+    // 时各自被截到 `UID_EXPANSION_LIMIT`（10 000）个——**长度恰好相等**。
+    //
+    // 修之前（R47）：`has_uid_mapping()` 只看「长度相等」，于是把这份**凭空长出来**
+    // 的对应关系当成一对一：源 1..10000 ↔ 目标 1..10000。
+    // 而 INBOX 里只有 UID 11/12/13 三封。R39 的写回一旦照它执行，就会把
+    // 9 997 封**不存在的信**记进本地库。
+    //
+    // 修之后：任何一侧被截断，目标集合就留空，映射不可用——调用方会走
+    // 「没有映射」那条处置（和服务器不给 `COPYUID` 时一样）。
     let faults = vec![replace(
         "COPY",
         &["{tag} OK [COPYUID 1 1:4294967295 1:4294967295] COPY completed"],
@@ -357,27 +363,22 @@ async fn truncated_copyuid_currently_looks_like_a_valid_mapping() {
 
     let outcome = copy_messages_with_timeout(&mut session, &[11], "已删除", Duration::from_secs(5))
         .await
-        .expect("COPY 应当成功");
+        .expect("COPY 本身是成功的");
 
-    assert_eq!(
-        outcome.source_uids.len(),
-        10_000,
-        "源集合被截到上限（服务器说的是四十多亿个）"
-    );
-    assert_eq!(
-        outcome.destination_uids.len(),
-        10_000,
-        "目标集合同理：截断到同一个上限后长度恰好相等"
+    assert!(
+        outcome.destination_uids.is_empty(),
+        "被截断的映射不能拿来用，目标集合必须是空的，实际 {} 个",
+        outcome.destination_uids.len()
     );
     assert!(
-        outcome.has_uid_mapping(),
-        "现状（未修）：这份被截断的映射被当成可用的。若这里红了，说明已经修了，请同步更新文档里的「已知残余」"
+        !outcome.has_uid_mapping(),
+        "被截断的映射必须判为不可用——否则写回会把不存在的信记进库（R47）"
     );
-    // INBOX 里只有 UID 11/12/13 三封，可「源集合」却有 10 000 个：
-    // 这是一份凭空长出来的映射。按 `source_uids[i] ↔ destination_uids[i]` 写回时，
-    // 会把 9 997 封**不存在的信**记进库（例如 3000 → 3000）。
-    assert_eq!(outcome.destination_uid_of(3_000), Some(3_000));
-    assert_eq!(outcome.destination_uid_of(11), Some(11));
+    assert_eq!(
+        outcome.destination_uid_of(11),
+        None,
+        "不可用时就查不出目标 UID，不能编一个出来"
+    );
 
     server.shutdown().await;
 }
@@ -922,4 +923,31 @@ impl Scripted {
         self.handle.abort();
         let _ = self.handle.await;
     }
+}
+
+/// 截断时**只砍尾巴**，而且必须**如实报告**自己被砍了（R47）。
+///
+/// 这条性质原先由 `copyuid_expansion_is_bounded` 通过 `TransferOutcome` 观察；
+/// 修了 R47 之后目标侧被整体置空，那个观察点没了，所以直接测展开函数。
+/// 性质本身没变：**没有上限保护会 OOM**，但砍掉的部分必须让人知道——
+/// 静默截断正是 R47 的根因。
+#[test]
+fn truncation_only_cuts_the_tail_and_says_so() {
+    use imap_proto::rfc4315::UidSetMember;
+    use xremail_protocol_imap::transfer::expand_uid_set_checked;
+
+    // 一个巨大的区间：必须被截断。
+    let huge = vec![UidSetMember::UidRange(1..=u32::MAX)];
+    let (expanded, truncated) = expand_uid_set_checked(&huge);
+
+    assert_eq!(expanded.len(), 10_000, "上限是 10 000");
+    assert_eq!(expanded.first(), Some(&1), "截断只能砍尾巴，不能把开头弄丢");
+    assert_eq!(expanded.last(), Some(&10_000), "砍到上限为止，不多不少");
+    assert!(truncated, "砍了东西就必须如实报告——静默截断正是 R47 的根因");
+
+    // 一个不需要截断的小区间：报告必须为假。
+    let small = vec![UidSetMember::UidRange(5..=7)];
+    let (expanded, truncated) = expand_uid_set_checked(&small);
+    assert_eq!(expanded, vec![5, 6, 7]);
+    assert!(!truncated, "没砍东西就不能说砍了");
 }

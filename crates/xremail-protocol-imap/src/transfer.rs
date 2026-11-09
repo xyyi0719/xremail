@@ -481,11 +481,22 @@ async fn read_until_tagged(
 /// **只有一个** UIDVALIDITY，目标文件夹的它不告诉客户端。
 fn copy_uid_of(outcome: &imap_proto::Outcome<'_>) -> Option<CopyUid> {
     match &outcome.code {
-        Some(ResponseCode::CopyUid(validity, source, destination)) => Some(CopyUid::new(
-            *validity,
-            expand_uid_set(source),
-            expand_uid_set(destination),
-        )),
+        Some(ResponseCode::CopyUid(validity, source, destination)) => {
+            let (source_uids, source_truncated) = expand_uid_set_checked(source);
+            let (destination_uids, destination_truncated) = expand_uid_set_checked(destination);
+
+            // 任何一侧被截断，这份映射就是**残缺的**，不能当对应关系用（R47）。
+            // 把目标侧置空，`has_uid_mapping()` 自然返回假，调用方会退回
+            // 「没有映射」的处置（`absent_outcome` 那套），而不是照着编出来的
+            // 对应关系去写本地库。
+            let destination_uids = if source_truncated || destination_truncated {
+                Vec::new()
+            } else {
+                destination_uids
+            };
+
+            Some(CopyUid::new(*validity, source_uids, destination_uids))
+        }
         _ => None,
     }
 }
@@ -495,25 +506,59 @@ fn copy_uid_of(outcome: &imap_proto::Outcome<'_>) -> Option<CopyUid> {
 /// 对测试公开（`tests/imap_parsing_properties.rs`）：这里的每一个端点
 /// 都来自服务器，差一位就会去核对另一封邮件。
 pub fn expand_uid_set(members: &[UidSetMember]) -> Vec<u32> {
+    expand_uid_set_checked(members).0
+}
+
+/// 同 [`expand_uid_set`]，但**同时报告有没有被截断**。
+///
+/// ## 为什么必须把「截断」这件事传出去（R47）
+///
+/// `COPYUID` 里源、目标两个集合是**各自**展开的。服务器回
+/// `COPYUID 1 1:4294967295 1:4294967295` 时，两边都被截到
+/// `UID_EXPANSION_LIMIT`（10 000）个——长度**恰好相等**，于是
+/// [`TransferOutcome::has_uid_mapping`] 那句「长度相等即可用」把它们当成
+/// 一对一的有效映射：源 1..10000 ↔ 目标 1..10000。
+/// 可源文件夹里可能只有 3 封。R39 的写回一旦接上，就会照着这份**编出来的**
+/// 对应关系把根本不存在的信记进本地库。
+///
+/// 只靠「长度是否相等」判断映射是否可信是不够的：**必须知道展开过程中有
+/// 没有丢东西**。截断是静默的，所以这里把它显式返回。
+///
+/// 返回值第二个分量：`true` 表示至少有一个成员没被完整展开。
+pub fn expand_uid_set_checked(members: &[UidSetMember]) -> (Vec<u32>, bool) {
     let mut out: Vec<u32> = Vec::new();
+    let mut truncated = false;
 
     for member in members {
         match member {
-            UidSetMember::Uid(uid) => out.push(*uid),
+            UidSetMember::Uid(uid) => {
+                if out.len() >= UID_EXPANSION_LIMIT {
+                    // 上限已满：这个单值也放不下了，算一次截断。
+                    truncated = true;
+                    break;
+                }
+                out.push(*uid);
+            }
             UidSetMember::UidRange(range) => {
                 // `range` 是**闭区间**（imap-proto 用 `fst..=snd`），
                 // 所以 `.end()` 就是最后一个 UID，**不要**再减 1。
                 let remaining = UID_EXPANSION_LIMIT.saturating_sub(out.len());
+                let wanted = range.clone().count();
                 out.extend(range.clone().take(remaining));
+                if wanted > remaining {
+                    truncated = true;
+                }
             }
         }
 
         if out.len() >= UID_EXPANSION_LIMIT {
+            // 满了还要看后面有没有剩下的成员：有就说明确实丢了东西。
+            truncated = true;
             break;
         }
     }
 
-    out
+    (out, truncated)
 }
 
 #[cfg(test)]
