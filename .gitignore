@@ -53,3 +53,6 @@ data/
 Thumbs.db
 *.swp
 *~
+
+# 本地构建缓存（沙箱下 $HOME 只读，缓存改放工作区）
+.devcache/

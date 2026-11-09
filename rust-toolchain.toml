@@ -1,0 +1,4 @@
+# 固定工具链版本，避免系统里多个 rustc（/usr/bin 1.93 vs rustup 1.99）互相打架。
+# MSRV 见 Cargo.toml：rust-version = "1.94"（sqlx 0.9 的下限）。
+[toolchain]
+channel = "stable"
