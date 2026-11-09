@@ -512,6 +512,13 @@ fn save_credential_rejects_an_unknown_account() {
 
 #[test]
 fn forget_credential_reports_false_for_an_unknown_account() {
+    // 注入内存钥匙串：这一条**真的会去删钥匙串条目**（账户不存在也照样按
+    // 规范引用补删一次，清理「引用被清掉、条目还在」的残骸）。真实的钥匙串是
+    // 机器级设施——在 CI 上没有 Secret Service 守护进程时它直接报
+    // 「不可用」，这条用例就会红；在开发机上又会真的去碰用户的钥匙串。
+    // 两种都不该发生，所以这里用内存实现。
+    let _guard = serial_guard();
+    let _keychain = memory_keychain();
     let (_app, webview) = app();
 
     let body = get_ipc_response(
