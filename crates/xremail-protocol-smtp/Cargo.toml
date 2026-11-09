@@ -8,6 +8,8 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+# 认证载荷（明文 + base64）用完即清零，别残留在堆里等被换出。
+zeroize = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

@@ -6350,6 +6350,7 @@ dependencies = [
  "tracing",
  "x509-parser 0.16.0",
  "xremail-testkit",
+ "zeroize",
 ]
 
 [[package]]

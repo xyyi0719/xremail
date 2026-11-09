@@ -47,6 +47,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use zeroize::Zeroizing;
 
 use crate::error::SmtpError;
 use crate::transport::{SmtpConfig, TlsInfo, TlsTrust, TlsVersions, Transport};
@@ -406,10 +407,15 @@ impl SmtpSession {
         user: &str,
         password: &str,
     ) -> Result<SmtpResponse, SmtpError> {
-        let payload = format!("\0{user}\0{password}");
-        let encoded = STANDARD.encode(payload.as_bytes());
+        // 两份都装着凭据：`payload` 是明文（`\0user\0pass`），`encoded` 是它的 base64——
+        // **base64 不是加密**，还原一下就是口令。两者都用 `Zeroizing` 包住，
+        // 离开作用域时清零，别让它们残留在堆里等被换出到磁盘。
+        let payload = Zeroizing::new(format!("\0{user}\0{password}"));
+        let encoded = Zeroizing::new(STANDARD.encode(payload.as_bytes()));
 
-        let response = self.command(&format!("AUTH PLAIN {encoded}")).await?;
+        let response = self
+            .command(&format!("AUTH PLAIN {}", encoded.as_str()))
+            .await?;
         if response.code == 334 {
             // 服务器不接受初始响应：把同一份凭据（不带机制名）再发一次。
             return self.command(&encoded).await;
@@ -437,7 +443,8 @@ impl SmtpSession {
             return Ok(response);
         }
 
-        let pass_b64 = STANDARD.encode(password.as_bytes());
+        // 口令的 base64 同样是凭据（base64 不是加密），用完清零。
+        let pass_b64 = Zeroizing::new(STANDARD.encode(password.as_bytes()));
         self.command(&pass_b64).await
     }
 

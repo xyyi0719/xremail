@@ -613,6 +613,14 @@
   用于测非 UTF-8 编码（GBK 正文）
 
 ### Fixed
+- **SMTP 认证载荷用完清零**（2026-11-10，R67）
+  - `auth_plain` 的 `payload`（明文 `\0user\0pass`）与 `encoded`（它的 base64）、
+    `auth_login` 的 `pass_b64` 都是普通 `String`，离开作用域只是把内存标记为可复用、
+    **不清零**——与 `xremail-api` 的 `SecretValue`（用 `Zeroizing`）不一致
+  - **base64 不是加密**：还原一下就是口令，不该让它留在堆里等被换出到磁盘
+  - 三处都改成 `Zeroizing<String>`；`zeroize` 本来就是 workspace 依赖（DKIM 私钥在用），
+    **没有新增第三方包**
+  - `auth_failure_is_reported_without_the_password` 钉住脱敏承诺没被破坏
 - **发信队列的 `running` 补上租约：本进程卡住的那封信不再永远发不出去**（2026-11-09，R48）
   - 这是第 9 轮审计交回、第 10 轮核实的一条真实缺口。R32 给 `mail_operation` 补了
     「本进程认领 + 超时租约 → 收成 `uncertain`」，但**发信侧漏了同样的半边**：
