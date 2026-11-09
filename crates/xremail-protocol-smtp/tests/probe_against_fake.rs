@@ -106,6 +106,12 @@ async fn starttls_path_upgrades_then_re_ehlos() {
     assert_eq!(certificate.subject_cn.as_deref(), Some("localhost"));
     assert!(!certificate.expired);
     assert!(certificate.days_remaining > 0);
+    // 假证书是**现在**签的，`notBefore` 就在此刻附近——它不该被判成「尚未生效」。
+    //
+    // 这一条是 R68 的反向保护：`not_yet_valid` 是 2026-11-10 新加的字段
+    // （之前只把 notBefore 格式化成字符串打印、从不比较，于是一个「明天才生效」
+    // 的证书会显示成「未过期」）。这里确认正常证书**不会**被误判成尚未生效。
+    assert!(!certificate.not_yet_valid, "刚签发的证书不该被判成尚未生效");
 
     // 握手后**重新 EHLO**：明文阶段服务器不宣告 AUTH，TLS 阶段才宣告。
     assert!(

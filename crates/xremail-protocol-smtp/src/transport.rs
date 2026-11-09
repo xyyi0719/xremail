@@ -211,6 +211,15 @@ pub struct CertificateInfo {
     pub not_after: String,
     /// 是否已经过期。
     pub expired: bool,
+    /// 是否**尚未生效**（当前时间早于 `not_before`）。
+    ///
+    /// 单独一个字段而不是把它并进 `expired`：两者含义相反，混在一起会让人
+    /// 把「证书还没开始生效」读成「证书过期了」。一个尚未生效的证书
+    /// 同样是**不可用**的，所以 CLI 会把它和过期一样标红——但文案要分开。
+    ///
+    /// 之前**没有**这一项：`not_before` 只被格式化成字符串打印，从不比较，
+    /// 于是一个「明天才生效」的证书会显示成「未过期」，看着像没问题。
+    pub not_yet_valid: bool,
     /// 距离过期还有多少天（负数表示已经过期）。
     pub days_remaining: i64,
     /// 是否自签（主题 CN 与签发者 CN 相同）。
@@ -606,6 +615,7 @@ fn parse_certificate(der: &[u8]) -> Option<CertificateInfo> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or_default();
     let not_after_ts = validity.not_after.timestamp();
+    let not_before_ts = validity.not_before.timestamp();
 
     Some(CertificateInfo {
         subject_cn: subject_cn.clone(),
@@ -615,6 +625,7 @@ fn parse_certificate(der: &[u8]) -> Option<CertificateInfo> {
         not_before: format_date(&validity.not_before),
         not_after: format_date(&validity.not_after),
         expired: now > not_after_ts,
+        not_yet_valid: now < not_before_ts,
         days_remaining: (not_after_ts - now) / 86_400,
         self_signed: subject_cn.is_some() && subject_cn == issuer_cn,
     })

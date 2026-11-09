@@ -613,6 +613,13 @@
   用于测非 UTF-8 编码（GBK 正文）
 
 ### Fixed
+- **SMTP 证书体检补上「尚未生效」这一档**（2026-11-10，R68）
+  - `parse_certificate` 把 `notBefore` 只格式化成字符串、从不比较，`expired` 只看 `notAfter`——
+    一个「明天才生效」的证书会被报成「未过期」，看着像没问题
+  - `CertificateInfo` 新增 `not_yet_valid`，CLI 的打印从「二选一」改成**三种状态**；
+    文案刻意不把「尚未生效」写成「已过期」，那会把人引向错误的排查方向
+  - 反向保护用例确认「刚签发的证书不该被判成尚未生效」，变异测试验证有效
+  - 严重度低：真正的 TLS 校验由 rustls 完成，这只是诊断展示
 - **SMTP 认证载荷用完清零**（2026-11-10，R67）
   - `auth_plain` 的 `payload`（明文 `\0user\0pass`）与 `encoded`（它的 base64）、
     `auth_login` 的 `pass_b64` 都是普通 `String`，离开作用域只是把内存标记为可复用、

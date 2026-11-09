@@ -406,10 +406,15 @@ fn print_report(report: &ProbeReport, tls_mode: TlsMode, host: &str, port: u16) 
                             "非自签"
                         },
                         cert.days_remaining,
+                        // 三种状态分开说：**尚未生效**的证书同样是不可用的，
+                        // 但文案不能写成「已过期」——那会把人引向错误的排查方向
+                        // （去看续期，而实际该看的是服务器时钟或部署时间）。
                         if cert.expired {
                             "⚠️ **已过期**"
+                        } else if cert.not_yet_valid {
+                            "⚠️ **尚未生效**（当前时间早于证书的 notBefore）"
                         } else {
-                            "未过期"
+                            "在有效期内"
                         }
                     );
                     println!("- 主题全名：`{}`", cert.subject);
