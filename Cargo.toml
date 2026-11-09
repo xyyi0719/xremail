@@ -76,6 +76,12 @@ windows = { version = "0.62", features = [
     "Win32_Security",
 ] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Linux 的系统钥匙串（Secret Service，走 D-Bus）。
+# 只在 Linux 上编译：其它平台有自己的原生后端（Windows 用 windows crate 直接调
+# CredWriteW，见 apps/shell/src-tauri/src/secrets/windows_store.rs）。
+# 选 sync-secret-service 而不是链 libsecret：见 secrets/linux_store.rs 的模块文档。
+keyring = { version = "3", features = ["sync-secret-service"] }
+
 
 # SQLite 访问层。特性说明：
 # - sqlite-bundled：自带 SQLite 源码编译，不依赖系统安装的 sqlite3，

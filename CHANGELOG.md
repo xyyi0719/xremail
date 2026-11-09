@@ -7,6 +7,21 @@
 ## [Unreleased]
 
 ### Added
+- **Linux 上用系统钥匙串存授权码**（2026-11-09，P5-L）
+  - 之前 Linux 上钥匙串是「如实报错」的桩：**每次冷启动都要重填授权码**。
+    现在有了 Secret Service 适配（`apps/shell/src-tauri/src/secrets/linux_store.rs`）
+  - 走 **D-Bus** 而不是链 `libsecret`：直接链会把可执行文件钉在某个发行版的
+    SONAME 上，而 D-Bus 只要求「有个实现了 `org.freedesktop.secrets` 的守护进程」——
+    GNOME Keyring、KWallet 都行。为此新增 `keyring` 3.x 与 `dbus-secret-service`
+    两个 crate（依赖树很浅），这是对仓库「少拉 crate」约束的一次**明确权衡**
+  - 契约与 Windows 实现逐条对齐：条目名原样用 `secret_ref`、机密存原始字节、
+    「不存在」不是错误、错误信息不含机密
+  - **没有守护进程时如实报「不可用」**，不落盘、不降级——这条用真实 D-Bus 会话
+    （`dbus-run-session`）验过，并做了变异测试：把实现改成「失败也返回 None」
+    后用例立刻变红
+  - **尚未验证**：真钥匙串上的写→读→删往返（本机没有 `gnome-keyring-daemon`，
+    也无法安装）。有桌面环境时用
+    `XREMAIL_SECRET_SERVICE_PROBE=1 dbus-run-session -- <测试二进制>` 跑一遍即可
 - **Android PoC 第一轮：应用第一次能以 Android APK 的形式被构建出来**（2026-11-09，P4 / R08）
   - `npx tauri android init` 生成 `apps/shell/src-tauri/gen/android/`（此前 `gen/` 下只有 `schemas/`）。
     **整个 `gen/` 目录本来就被根 `.gitignore` 忽略**，构建产物（`app/build`、`.gradle`、`jniLibs`）

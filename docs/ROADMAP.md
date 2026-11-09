@@ -561,7 +561,21 @@ Gmail 将来有需求再开独立决策：授权流程、scope、个人使用与
 
 - [ ] WebKitGTK 沙箱验证：sandbox iframe、CSP、`srcdoc`、远程图片阻断的行为与 Chromium 有差异，
       必须重跑 [TESTING_STRATEGY §2.4](TESTING_STRATEGY.md) 的隔离测试，不能直接沿用 Windows 结论
-- [ ] Secret Service 凭据后端（与 Windows Credential Manager / Android Keystore 分离实现）
+- [x] **Secret Service 凭据后端**（2026-11-09，`apps/shell/src-tauri/src/secrets/linux_store.rs`）
+  - 走 **D-Bus**（`keyring` 3.x + `sync-secret-service`），**不链 `libsecret`**：
+    直接链会把可执行文件钉在某个发行版的 SONAME 上，而 D-Bus 只要求
+    「有个实现了 `org.freedesktop.secrets` 的守护进程在跑」——GNOME Keyring、
+    KWallet 都行。代价是新增两个 crate（`keyring` / `dbus-secret-service`，
+    依赖树很浅），这条偏离了仓库「少拉 crate」的一般约束，**是权衡后接受的**
+  - 契约与 Windows 实现逐条对齐：条目名原样用 `secret_ref`、机密存原始字节、
+    「不存在」不是错误、错误信息不含机密
+  - **实测到什么程度**：`tests/linux_secret_service.rs` 在**真实 D-Bus 会话**
+    （`dbus-run-session`）里验了「没有守护进程时三个方法都明确报
+    `Unavailable`」，并用**变异测试**确认「改成静默降级就立刻变红」；
+    `credential_service.rs` 的跨平台用例改成三平台各自成立
+  - **未验证**：**真钥匙串上的写→读→删往返**（这台机器没有
+    `gnome-keyring-daemon`，也无法安装）。等桌面环境或装好守护进程后用
+    `XREMAIL_SECRET_SERVICE_PROBE=1 dbus-run-session -- <测试二进制>` 跑一遍即可
 - [ ] 托盘（libayatana-appindicator）、通知（D-Bus）、开机自启（XDG autostart .desktop）
   - 托盘代码是平台无关的，**编译**过（需要 `libayatana-appindicator3` 才能链上），
         但 Linux 上 `TrayIconEvent` 不发，左键「显示窗口」不生效；**运行未验证**

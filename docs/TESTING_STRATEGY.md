@@ -1,6 +1,6 @@
 # 测试策略
 
-> 状态：规范已定义，测试设施**已部分落地**（Rust 1056 个用例 / 前端 95 个用例 / Playwright E2E 5 条，
+> 状态：规范已定义，测试设施**已部分落地**（Rust 1062 个用例 / 前端 95 个用例 / Playwright E2E 5 条，
 > 假 IMAP 与假 SMTP 服务器可用；fuzz 未开始，见 §5）。适用于个人研究项目与 AI 编码工作流。
 > 目标：以可重复证据证明数据正确、安全隔离和失败恢复，不以覆盖率或编译成功代替验收。
 > 维护者：xyyi0719
@@ -105,7 +105,7 @@ Mock 通过不能证明服务商兼容。Playwright 浏览器通过不能证明 
 | **T9** | 前端组件与 E2E | 界面层，先保证后端语义正确再投入 | T5 | P3+ | 🟡 **部分**：前端组件用例 **15 个文件 / 95 个**（Vitest + Testing Library）；**Playwright E2E 已落地**（2026-11-06）：`apps/shell/playwright.config.ts` + `apps/shell/e2e/` 共 **2 个 spec 文件 / 5 条用例**，实测 **5 passed / 0 failed**（本地 12.2s；`CI=true` 模拟 10.8s）。起的是 Vite 开发服务器 + 真实 chromium，**不拉 Tauri 窗口**（CI 上没有 WebView），`window.__TAURI_INTERNALS__` 由 `page.addInitScript` 注入假后端。覆盖：① 文件夹邮件列表按 UID 倒序显示标题与发件人（含 `list_messages` 入参）；② 点开一封看到正文、打开不自动标已读；③ 写信面板没写收件人时前端拦下、不调 `send_message`（含「地址之间有空白」提醒）；④ 改动后 800ms 防抖自动存草稿、草稿箱里出现这一封；⑤ 收件人 + 主题填好后发送显示「已发送」与 `Message-ID`，发完发送按钮停用。已接进 CI 的 `web` job。**未覆盖**：附件与富文本编辑器（组件层在用），以及 `uncertain` 二次确认流 |
 | **T10** | fuzz（MIME / HTML / IMAP 响应解析） | 防御性加固，非功能正确性 | T5/T6 | P2+ | 🟡 **部分**（2026-11-09）：**没有引入 `cargo-fuzz`**——它要 nightly + `libfuzzer-sys`，且不进 PR CI；改为**固定种子的随机化属性测试**（stable 即可跑、零新依赖、失败可逐字复现）：`crates/xremail-core/tests/sanitizer_properties.rs` **6 条**（不 panic / 幂等 / 输出良构 / 危险构造不残留，按真实属性值位置判定）、`crates/xremail-message/tests/parser_properties.rs` **7 条**（不 panic / 附件数有上限 / 部件号唯一 / 错误不越出契约）。**变异测试**验证过：短路 URL 协议过滤、删掉结束标签输出，对应用例都会立刻红。**它撞出并修掉了一条真缺陷（R45：整封转发的多个附件都记成 `TEXT`、在库里互相顶掉）**。**仍缺**：IMAP 响应解析这一层的属性测试（`xremail-testkit` / `xremail-protocol-imap` 的解析器），以及覆盖率引导的探索式 fuzz |
 
-**Rust 用例总数：4 → 1056**（2026-10-30 达 687；2026-11-03 随调度器 700、
+**Rust 用例总数：4 → 1062**（2026-10-30 达 687；2026-11-03 随调度器 700、
 移动/删除写路径 747、崩溃恢复 778、IDLE 客户端侧与调度器接线 790、
 认证失败终态 792、审计修复（重发幂等 / 命令超时 / panic 边界补漏）797、
 认证分类纠偏（R25）802、文档审计补正 803、A 组审计缺陷修复（R26–R42）835、对账时机与租约（R29/R32/R33）842；
@@ -115,7 +115,7 @@ Mock 通过不能证明服务商兼容。Playwright 浏览器通过不能证明 
 T8 乱序响应（11 条）、folder 角色落库（R04）合并后 **1050**；
 2026-11-09 属性测试补上 UTF-7（6 条）后 **1056**，CI 实测同口径）；
 其中 **1 个是 `#[ignore]`**（`apps/shell/src-tauri/tests/real_mail_roundtrip.rs:68`，
-真实邮箱往返、会真的发信），所以 `cargo test` 实际执行 **1055** 个
+真实邮箱往返、会真的发信），所以 `cargo test` 实际执行 **1061** 个
 （2026-11-06 实测：`cargo test --workspace -j 4 --no-fail-fast`，
 累加所有 `test result:` 行 = **987 passed / 0 failed / 1 ignored**；
 `--` `--list` 点数同口径 **988**）。

@@ -681,36 +681,79 @@ async fn a_broken_keychain_makes_forget_fail_instead_of_silently_forgetting() {
 
 // ---------------------------------------------------------------- 不静默降级
 
-/// 非 Windows 的**平台默认**实现：存取都明确报错，不假装存下了。
+/// 平台**默认**实现**不静默降级**。
 ///
 /// 这一条**故意不注入**：注入进去就验成别人的实现了。
-/// Windows 上默认实现是真凭据管理器，这条前提不成立，故跳过——
-/// 那边的真实往返由 `tests/windows_credential_manager.rs` 负责。
+///
+/// 三平台三种情况，承诺是同一条：**失败就说失败，不许假装存下了**。
+///
+/// * **Windows**：默认实现是真凭据管理器，前提不成立，跳过——
+///   那边的真实往返由 `tests/windows_credential_manager.rs` 负责。
+/// * **Linux**：默认实现是 Secret Service。**这台机器上有没有守护进程是不一定的**
+///   （CI 上通常没有，桌面用户那里有），所以两种结局都要接受，但**必须二选一**：
+///   要么真的存进了钥匙串（读完立刻删掉，不污染用户会话），要么明确报
+///   `Unavailable`；绝不允许「set 说成功、get 却从别处冒出来」。
+/// * **其它平台**（Android / macOS）：仍是桩，存取都必须报错。
 #[cfg(not(windows))]
 #[tokio::test]
-async fn the_platform_default_store_does_not_silently_degrade_on_unsupported_platforms() {
+async fn the_platform_default_store_never_silently_degrades() {
     // 走 `platform_default_store()`（不是 `platform_store()`）：后者会被别的用例
     // 的注入顶掉，而这里要验的**就是**默认实现。
     let store = secrets::platform_default_store();
+    let secret_ref = secret_ref_for("contract-test");
 
-    let error = store
-        .set(
-            &secret_ref_for("contract-test"),
-            &SecretValue::from_str_lossless("不该被存下来"),
-        )
-        .await
-        .expect_err("没有钥匙串适配的平台，写入必须报错");
-    assert!(
-        matches!(error, SecretStoreError::Unavailable(_)),
-        "应当报 Unavailable，实际是 {error:?}"
-    );
+    let outcome = store
+        .set(&secret_ref, &SecretValue::from_str_lossless("不该被存下来"))
+        .await;
 
-    assert!(
-        store
-            .get(&secret_ref_for("contract-test"))
-            .await
-            .expect("读取不该报错")
-            .is_none(),
-        "存不进去，也就取不出来——绝不能从某个内存格子或文件里冒出来"
-    );
+    match outcome {
+        // 有钥匙串守护进程：写成功了。那它就该能读回来——**而且只在这时**才允许读到。
+        Ok(()) => {
+            let read_back = store
+                .get(&secret_ref)
+                .await
+                .expect("写成功的条目必须能读回来");
+            assert_eq!(
+                read_back.as_ref().and_then(|v| v.as_str()),
+                Some("不该被存下来"),
+                "读回来的必须就是刚写进去的那一份"
+            );
+            // 收拾干净：这是用户的真实钥匙串，不能留垃圾条目。
+            store
+                .delete(&secret_ref)
+                .await
+                .expect("删除不该报错")
+                .then_some(())
+                .expect("刚写进去的条目必须删得掉");
+            store
+                .get(&secret_ref)
+                .await
+                .expect("删完再读不该报错")
+                .map_or_else(|| (), |value| panic!("删掉了却还能读出来：{value:?}"));
+        }
+        // 没有守护进程（CI / 无头机器）：必须**明确**报「不可用」。
+        Err(error) => {
+            assert!(
+                matches!(error, SecretStoreError::Unavailable(_)),
+                "没有钥匙串时必须报 Unavailable，实际是 {error:?}"
+            );
+            // 而且取的时候也必须报不可用，不能悄悄给一个 `None` 冒充「没存过」——
+            // 「取不到」与「没存过」是两件事（见 secrets/mod.rs 的失败语义）。
+            match store.get(&secret_ref).await {
+                Err(SecretStoreError::Unavailable(_)) => {}
+                Err(other) => panic!("读取应当报 Unavailable，实际是 {other:?}"),
+                Ok(Some(value)) => panic!("写都没成功，却从某处冒出来一份：{value:?}"),
+                // `Ok(None)` 只在「真的没有这条」时出现；本平台上没有可用的
+                // 存储设施，所以这里不该走到——除非平台是纯桩实现（桩的 `get`
+                // 恒返回 `None`）。用 cfg 分支而不是 `assert!(cfg!(..))`：
+                // 后者在编译期就是常量，clippy 会（正确地）报「断言恒为真」。
+                Ok(None) => {
+                    #[cfg(target_os = "linux")]
+                    panic!("Linux 上取不到钥匙串必须如实报错，不能返回 None 冒充「没存过」");
+                    #[cfg(not(target_os = "linux"))]
+                    {} // 纯桩平台：`get` 恒为 None，这是它的契约。
+                }
+            }
+        }
+    }
 }

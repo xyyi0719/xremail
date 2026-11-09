@@ -20,7 +20,9 @@
 //! ## 平台差异
 //!
 //! * Windows：凭据管理器（Credential Manager）——见 [`windows_store`]。
-//! * 其它平台：**暂不支持**（见 [`unsupported`])——存取都明确报错，
+//! * Linux：Secret Service（D-Bus）——见 [`linux_store`]。GNOME Keyring / KWallet
+//!   都实现了这个接口；没有守护进程时**明确报错**，而不是落盘。
+//! * 其它平台（Android / macOS）：**暂不支持**（见 [`unsupported`]）——存取都明确报错，
 //!   **不静默降级**成"内存里存着"或"存到文件里"。
 //!
 //! 静默降级会让人以为凭据已经落盘，实际却没有——那正是本模块要避免的事。
@@ -47,6 +49,8 @@ use std::sync::{Arc, RwLock};
 
 use xremail_api::SecretStore;
 
+#[cfg(target_os = "linux")]
+pub mod linux_store;
 pub mod test_hooks;
 pub mod unsupported;
 #[cfg(windows)]
@@ -65,8 +69,8 @@ static PLATFORM_STORE_OVERRIDE: RwLock<Option<Arc<dyn SecretStore>>> = RwLock::n
 
 /// 平台凭据存储。
 ///
-/// 返回平台对应的实现。Windows 上是凭据管理器，其它平台是
-/// [`unsupported::UnsupportedSecretStore`]（存取都报"不可用"）。
+/// 返回平台对应的实现：Windows 是凭据管理器，Linux 是 Secret Service，
+/// 其余平台是 [`unsupported::UnsupportedSecretStore`]（存取都报"不可用"）。
 ///
 /// 若测试通过 [`set_platform_store_for_test`] 设了覆盖，则返回那个实现——
 /// 这是**唯一**能让返回值偏离平台默认的地方。
@@ -91,8 +95,18 @@ pub fn platform_default_store() -> Arc<dyn SecretStore> {
     Arc::new(windows_store::WindowsSecretStore)
 }
 
-/// 平台**默认**实现（不看覆盖槽）。非 Windows 上是 [`unsupported`]。
-#[cfg(not(windows))]
+/// 平台**默认**实现（不看覆盖槽）。Linux 上是 Secret Service。
+#[cfg(target_os = "linux")]
+pub fn platform_default_store() -> Arc<dyn SecretStore> {
+    Arc::new(linux_store::LinuxSecretStore)
+}
+
+/// 平台**默认**实现（不看覆盖槽）。其余非 Windows 平台上是 [`unsupported`]。
+///
+/// 这里刻意用「既不是 Windows、也不是 Linux」而不是笼统的 `not(windows)`：
+/// 两个分支同时存在时，`not(windows)` 会和 Linux 那条**同时成立**，
+/// 编译器报重定义。
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn platform_default_store() -> Arc<dyn SecretStore> {
     Arc::new(unsupported::UnsupportedSecretStore)
 }
