@@ -217,6 +217,7 @@ env -u DBUS_SESSION_BUS_ADDRESS cargo test --workspace -j 4 --no-fail-fast
 | Linux 打包产物能不能跑 | `python3 scripts/verify_linux_runtime.py [appimage]` | `xvfb-run`、打包产物（**要先重新打包**，见下） |
 | HTML 消毒在真实 WebView 里 | `xvfb-run -a python3 scripts/webkit_sandbox_probe.py --engine=both` | WebKitGTK、Playwright |
 | 真钥匙串往返 | `XREMAIL_SECRET_SERVICE_PROBE=1 dbus-run-session -- <测试二进制>` | `gnome-keyring-daemon` |
+| 某个偶发失败到底修没修好 | `python3 scripts/ci_failure_rate.py --job "Rust (windows" --limit 30` | `gh` 已登录 |
 | 真实邮箱收发 | 先 `python3 scripts/precheck_real_mail.py` 预检，再 `cargo test --test real_mail_roundtrip -- --ignored` | `~/.xremail/accounts.txt`（**在仓库之外**；`.gitignore` 没覆盖这个名字，靠"不在仓库里"保证安全） |
 
 > **一个真踩过的坑**：`verify_linux_runtime.py` 会比对「库里跑出来的迁移条数」
