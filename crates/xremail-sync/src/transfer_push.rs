@@ -82,6 +82,8 @@
 
 use std::time::Duration;
 
+use sqlx::SqlitePool;
+
 use xremail_core::model::{Folder, MailOperation, Message, OperationKind, OperationState};
 use xremail_core::{AppError, AppResult};
 use xremail_protocol_imap::folders::role_by_name;
@@ -289,9 +291,10 @@ pub async fn push_transfers_as_with_options(
             // 标记操作留给 push_flags 去隔离。
             continue;
         }
-        operation::update_operation_state(
+        operation::update_operation_state_as(
             pool,
             &op.id,
+            Some(boot_id),
             OperationState::Failed,
             Some("epoch_changed"),
             Some(&format!(
@@ -327,8 +330,15 @@ pub async fn push_transfers_as_with_options(
     if let Err(error) = select_for_write(session, &folder.remote_name, timeout).await {
         let message = submit_error_message(&error);
         for op in &transfers {
-            operation::mark_operation_retryable(pool, &op.id, "select_failed", message, now_ms)
-                .await?;
+            operation::mark_operation_retryable(
+                pool,
+                &op.id,
+                boot_id,
+                "select_failed",
+                message,
+                now_ms,
+            )
+            .await?;
             report.retryable += 1;
         }
         return Ok(report);
@@ -367,9 +377,10 @@ pub async fn push_transfers_as_with_options(
                     Some(name) => Some(name),
                     None => {
                         // 目标文件夹没了：这条意图再也做不成了。
-                        operation::update_operation_state(
+                        operation::update_operation_state_as(
                             pool,
                             &op.id,
+                            Some(boot_id),
                             OperationState::Failed,
                             Some("destination_missing"),
                             Some("目标文件夹已不存在（可能被删除或改名），请重新选择"),
@@ -394,9 +405,10 @@ pub async fn push_transfers_as_with_options(
         ) {
             Ok(route) => route,
             Err(message) => {
-                operation::update_operation_state(
+                operation::update_operation_state_as(
                     pool,
                     &op.id,
+                    Some(boot_id),
                     OperationState::Failed,
                     Some("permanent"),
                     Some(message),
@@ -422,72 +434,95 @@ pub async fn push_transfers_as_with_options(
                 unreachable!("上面刚判断过只有 CopyDelete 才进这段");
             };
 
-            let message_id = message_dao::find_message_id_by_uid(
-                pool,
-                &folder.account_id,
-                &folder.id,
-                epoch,
-                op.uid,
-            )
-            .await?;
-
             // 探测结果先收起来，**切回源文件夹之后再处理**。
             //
             // `destination_has_message_id` 会 `EXAMINE` 目标文件夹，无论成功还是失败
             // 会话都停在目标文件夹上。若带着这个状态 `continue`，下一条操作会对着
             // **错的文件夹**搜 UID，被误判成 `AlreadyGone` 后静默丢掉——那正是本条
             // 要修的那类「邮件没搬、队列却空了」。
-            let probe = match &message_id {
-                // 没有 `Message-ID` 就无法确认目标文件夹里有没有副本。
-                // 宁可停住等对账 / 用户确认，也不能赌着重发一遍。
-                None => Err(
-                    "命令可能已经发出，但这封信没有 Message-ID，无法确认目标文件夹里是否已有副本，因此不重发"
-                        .to_owned(),
-                ),
-                Some(id) => {
-                    match destination_has_message_id(session, destination, id, timeout).await {
-                        Ok(found) => Ok(found),
-                        Err(error) => Err(format!(
-                            "重发前探测目标文件夹失败，因此不重发：{}",
-                            submit_error_message(&error)
-                        )),
-                    }
-                }
-            };
+            let probe = probe_copy_already_done(
+                pool,
+                session,
+                &folder.account_id,
+                &folder.id,
+                epoch,
+                op.uid,
+                destination,
+                timeout,
+            )
+            .await;
+            let probed_unreachable = probe.probed && probe.found.is_none();
 
             // 探测换了选中的文件夹，提交之前必须切回**可写**的源文件夹。
             //
             // 切不回去就别再动这个会话了：后面的每一条操作都建立在「选中了源文件夹」
             // 这个前提上，在错的状态上继续发命令会是另一类「邮件没搬、队列却空了」。
-            // 剩下的操作（含这一条，除非探测本身已有结论）统一记成 `uncertain`，
-            // 等下一轮重连再处理。
+            // 剩下的操作统一记成 `uncertain`，等下一轮重连再处理——**包括这一条**：
+            // 它的 `COPY` 有没有发出去，本轮的探测已经给不出答案了，多烧一次配额
+            // 只会让一条可能已经成功的操作离「重试用完」更近一步。
             if let Err(error) = select_for_write(session, &folder.remote_name, timeout).await {
                 let message = submit_error_message(&error);
 
                 // 这一条的探测结果本身就是「不确定」→ 报探测的原因，
                 // 否则报切回来的原因。
-                let reason = match &probe {
-                    Ok(_) => message,
-                    Err(probe_message) => probe_message.as_str(),
+                let reason = if probed_unreachable {
+                    probe.reason.as_deref().unwrap_or(message)
+                } else {
+                    message
                 };
-                operation::mark_operation_uncertain(pool, &op.id, "unknown", reason, now_ms)
-                    .await?;
+                operation::mark_operation_uncertain(
+                    pool, &op.id, boot_id, "unknown", reason, now_ms,
+                )
+                .await?;
                 report.uncertain += 1;
 
                 for rest in &transfers[index + 1..] {
-                    operation::mark_operation_uncertain(pool, &rest.id, "unknown", message, now_ms)
-                        .await?;
+                    operation::mark_operation_uncertain(
+                        pool, &rest.id, boot_id, "unknown", message, now_ms,
+                    )
+                    .await?;
                     report.uncertain += 1;
                 }
                 return Ok(report);
             }
 
-            match probe {
+            match probe.verdict() {
                 // 已经在目标文件夹里了：`COPY` 那一半不必再发。
-                Ok(found) => copy_already_done = found,
-                Err(message) => {
-                    operation::mark_operation_uncertain(pool, &op.id, "unknown", &message, now_ms)
+                CopyProbeVerdict::AlreadyThere => copy_already_done = true,
+                CopyProbeVerdict::StartOver => copy_already_done = false,
+                CopyProbeVerdict::Unknown(message) => {
+                    // 这里仍按 `uncertain` 处理（不判成功——我们确实没有证据）。
+                    //
+                    // 计次的口径：**真发出过命令**的那一次照旧走 `mark_operation_uncertain`
+                    // （R26：`COPY` 可能已经生效，不计次就会每轮重发一份副本）。
+                    // 唯一免计的是 `probe.probed == false`——本地**根本没有**这封信的
+                    // `Message-ID`，于是这一轮连 `UID SEARCH` 都没发、更不可能发 `COPY`。
+                    // 它看着像「无法确认」，实际几乎总是「源端本地行已经被上一轮**成功**
+                    // 搬走之后删掉了」（`find_message_id_by_uid` 查的就是源文件夹）。
+                    // 对它也计次的话，一条已经搬完、只是本地没收尾的操作会每轮同步
+                    // 烧一次配额，直到被收成 `failed / retry_exhausted`——文案说
+                    // 「服务器一直拒绝」，可服务器一次都没拒绝过。
+                    //
+                    // 顺带把上一轮问到的结论留着（见 [`target_has_copy_reason`]）：
+                    // 免计的路径会反复走到这里，把「目标里已经有副本」这个事实丢掉的话，
+                    // 就再也走不回「跳过 `COPY`、只补源端删除」那条收尾路了。
+                    let reason =
+                        if !probe.probed && probe.last == Some(CopyProbeVerdict::AlreadyThere) {
+                            target_has_copy_reason()
+                        } else {
+                            message.to_owned()
+                        };
+                    if probe.probed {
+                        operation::mark_operation_uncertain(
+                            pool, &op.id, boot_id, "unknown", &reason, now_ms,
+                        )
                         .await?;
+                    } else {
+                        mark_uncertain_without_attempt(
+                            pool, &op.id, boot_id, "unknown", &reason, now_ms,
+                        )
+                        .await?;
+                    }
                     report.uncertain += 1;
                     continue;
                 }
@@ -578,9 +613,10 @@ pub async fn push_transfers_as_with_options(
                     },
                 }
 
-                operation::update_operation_state(
+                operation::update_operation_state_as(
                     pool,
                     &op.id,
+                    Some(boot_id),
                     OperationState::Succeeded,
                     None,
                     None,
@@ -592,7 +628,7 @@ pub async fn push_transfers_as_with_options(
                     let message = submit_error_message(&error);
                     for rest in &transfers[index + 1..] {
                         operation::mark_operation_uncertain(
-                            pool, &rest.id, "unknown", message, now_ms,
+                            pool, &rest.id, boot_id, "unknown", message, now_ms,
                         )
                         .await?;
                         report.uncertain += 1;
@@ -604,6 +640,7 @@ pub async fn push_transfers_as_with_options(
                 operation::mark_operation_retryable(
                     pool,
                     &op.id,
+                    boot_id,
                     "server_rejected",
                     &message,
                     now_ms,
@@ -615,14 +652,17 @@ pub async fn push_transfers_as_with_options(
                 // 必须走 `mark_operation_uncertain`（而不是 `update_operation_state`）：
                 // 只有它会自增 `attempts`，而 `claim_for_push` 靠 `attempts < ?` 卡住重发。
                 // 不自增 = 这条永远可以被重认领 = 每轮重发一次 `COPY`。
-                operation::mark_operation_uncertain(pool, &op.id, "unknown", &message, now_ms)
-                    .await?;
+                operation::mark_operation_uncertain(
+                    pool, &op.id, boot_id, "unknown", &message, now_ms,
+                )
+                .await?;
                 report.uncertain += 1;
             }
             Err(SubmitError::Failed { message }) => {
-                operation::update_operation_state(
+                operation::update_operation_state_as(
                     pool,
                     &op.id,
+                    Some(boot_id),
                     OperationState::Failed,
                     Some("permanent"),
                     Some(&message),
@@ -766,6 +806,163 @@ async fn destination_has_message_id(
         other => Err(SubmitError::Uncertain {
             message: format!("期望 UID SEARCH 返回命中列表，实际是 {other:?}"),
         }),
+    }
+}
+
+/// 重发前那次探测的**结论**。
+///
+/// 做成枚举而不是 `Result<bool, String>`，是为了让调用方分得清三种「不是『在』」：
+/// 「上一轮确认目标里还没有」「问过但没问到」「压根没去问」。
+/// 这三者在**要不要计一次尝试**上完全不同（见 [`CopyProbe`] 的文档），
+/// 而 `Err(String)` 会把它们拌成一句错误文本，没人分得出来。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CopyProbeVerdict<'a> {
+    /// 目标文件夹里已经有这封：`COPY` 那一半不必再发。
+    AlreadyThere,
+    /// 上一轮确认过「目标里还没有」：这一次要正常发 `COPY`。
+    StartOver,
+    /// 没问到（或者根本没去问）。
+    Unknown(&'a str),
+}
+
+/// 一次幂等探测的完整记录：**问过没有**、**问到了什么**、**为什么没问到**。
+///
+/// 单独记住「问过没有」是因为计次点的判据要看它：[`CopyProbe::verdict`] 把
+/// 「没问」和「问了但没答」都归到 [`CopyProbeVerdict::Unknown`]（这一轮的动作
+/// 一样：不发 `COPY`），但计次必须分开——没问 = 一条命令都没发出去，
+/// 问了没答 = 可能发过，必须照旧计次（R26）。
+#[derive(Debug, Clone)]
+struct CopyProbe {
+    /// 真的把 `Message-ID` 发出去问过目标文件夹了吗（`EXAMINE` 成功并发了 `SEARCH`）。
+    probed: bool,
+    /// 问到时的答案：目标里有没有。
+    found: Option<bool>,
+    /// 没问到时的原因（直接写给用户看的那一句）。
+    reason: Option<String>,
+    /// 上一轮探测已经记下的结论。
+    last: Option<CopyProbeVerdict<'static>>,
+}
+
+impl CopyProbe {
+    /// 这一轮该怎么办。
+    ///
+    /// 答案有两个来源：
+    /// * 这一轮的探测真的问到了 → 用新答案；
+    /// * 问不到 → 退回到**上一轮**记下的结论（它写在 `error_message` 里）。
+    ///
+    /// 为什么退回去是有意义的：源文件夹的本地行在上一次**成功**提交之后就被删了，
+    /// 于是 `find_message_id_by_uid` 永远查不到 `Message-ID`。若一律按「没问到」处理，
+    /// 一条早就搬好的操作会每轮同步都烧一次配额，最后被判成「服务器一直拒绝」。
+    /// 而「`COPY` 已经进了目标文件夹」是一件**有状态**的事：目标里的副本不会自己
+    /// 消失，上一轮问到了就一直是「有」，不必再问第二遍。
+    fn verdict(&self) -> CopyProbeVerdict<'_> {
+        match self.found {
+            Some(true) => CopyProbeVerdict::AlreadyThere,
+            Some(false) => CopyProbeVerdict::StartOver,
+            None => match self.last {
+                Some(CopyProbeVerdict::AlreadyThere) => CopyProbeVerdict::AlreadyThere,
+                Some(CopyProbeVerdict::StartOver) => CopyProbeVerdict::StartOver,
+                // 上一轮也没结论（或者根本没有结论可看）：
+                // 这一刻我们知道的全部就是「不知道」，照旧不重发。
+                _ => CopyProbeVerdict::Unknown(
+                    self.reason.as_deref().unwrap_or(DEFAULT_PROBE_REASON),
+                ),
+            },
+        }
+    }
+}
+
+/// 没有更具体理由时的兜底文案（`Unknown` 总要有一句话给人看）。
+const DEFAULT_PROBE_REASON: &str = "无法确认目标文件夹里是否已有上一轮复制的副本，因此本轮不重发";
+
+/// 走一遍重发前的幂等探测。
+///
+/// 返回值同时带上「问过没有」与「上一轮的结论」，由 [`CopyProbe::verdict`]
+/// 合成这一轮的动作；计次的宽窄见 [`CopyProbe`] 与调用点的注释。
+#[allow(clippy::too_many_arguments)]
+async fn probe_copy_already_done(
+    pool: &sqlx::SqlitePool,
+    session: &mut Session,
+    account_id: &str,
+    folder_id: &str,
+    epoch: i64,
+    uid: i64,
+    destination: &str,
+    timeout: Duration,
+) -> CopyProbe {
+    let stored = operation::find_pending_transfer(pool, account_id, folder_id, uid, epoch)
+        .await
+        .ok()
+        .flatten();
+    let last = stored
+        .as_ref()
+        .and_then(|operation| operation_verdict(operation.error_message.as_deref()));
+
+    // 读库失败当成「查不到」：这条路径**不重发**，所以失败的方向是安全的，
+    // 没必要把一个本地读错误升级成整轮 `push_transfers` 的 `Err`。
+    let message_id: Option<String> =
+        message_dao::find_message_id_by_uid(pool, account_id, folder_id, epoch, uid)
+            .await
+            .unwrap_or_default();
+
+    let Some(message_id) = message_id else {
+        // 本地没有这封信的 `Message-ID`。两种原因，这一层分不出来：
+        // 源端本地行已经被删（上一轮**成功**搬走之后的样子），或者这封信本来就没有。
+        // 所以**不探测**——探测会把会话切到目标文件夹，为一条注定发不出 `COPY`
+        // 的操作白付一次 `EXAMINE` 与一次切回来。
+        return CopyProbe {
+            probed: false,
+            found: None,
+            reason: Some(
+                "本地查不到这封信的 Message-ID（源端本地行可能已被上一轮删掉），无法确认目标文件夹里是否已有副本，因此本轮不重发"
+                    .to_owned(),
+            ),
+            last,
+        };
+    };
+
+    match destination_has_message_id(session, destination, &message_id, timeout).await {
+        Ok(found) => CopyProbe {
+            probed: true,
+            found: Some(found),
+            reason: None,
+            last,
+        },
+        Err(error) => CopyProbe {
+            probed: true,
+            found: None,
+            reason: Some(format!(
+                "重发前探测目标文件夹失败，因此不重发：{}",
+                submit_error_message(&error)
+            )),
+            last,
+        },
+    }
+}
+
+/// 上一轮探测记下的结论，写在 `error_message` 的**开头**。
+///
+/// 用一个不会出现在别处的前缀而不是新列：`error_kind` 仍要表达「这条操作现在
+/// 处于什么状态」（`unknown` = 结果未知），而「探测问到了什么」是给下一轮
+/// **自己读**的簿记，不是给用户看的分类。前缀之外的原文照旧显示给用户。
+const PROBE_VERDICT_TAG: &str = "[probe:target-has-copy] ";
+
+/// 「探测到目标里已经有副本、但这一轮没能收尾」的那句话。
+///
+/// 前缀见 [`PROBE_VERDICT_TAG`]：下一轮据此**不必再问一遍**目标文件夹。
+fn target_has_copy_reason() -> String {
+    format!(
+        "{PROBE_VERDICT_TAG}目标文件夹里已经有这封信的副本，剩下的只是源端的删除；本轮没能收尾，下轮接着办"
+    )
+}
+
+/// 从上一轮的错误文本里读出探测结论。
+fn operation_verdict(message: Option<&str>) -> Option<CopyProbeVerdict<'static>> {
+    let message = message?;
+    if message.starts_with(PROBE_VERDICT_TAG) {
+        Some(CopyProbeVerdict::AlreadyThere)
+    } else {
+        None
     }
 }
 
@@ -1105,6 +1302,69 @@ fn trash_candidates<'a>(folders: &'a [Folder], current_folder_id: &str) -> Vec<&
     });
 
     declared.chain(guessed).collect()
+}
+
+// ===========================================================================
+// 一条本模块自己的状态写入
+// ===========================================================================
+
+/// 把一条操作收成「结果未知」，**不**增加尝试次数。
+///
+/// ## 为什么不直接用 `operation::mark_operation_uncertain`
+///
+/// 那个函数把「改写状态」与「尝试次数 +1」绑在一起（R26），对**真发过命令**
+/// 的出口是对的：`claim_for_push` 靠 `attempts < ?` 卡重发，不自增就永远重认领。
+///
+/// 但有**一个出口**它不适用：探测没给出答案，而这一轮连一条命令都还没发出去
+/// （`probe.probed == false`，见调用点的注释）。对它也计次的话，一条「上一轮
+/// 已经搬完、只是本地没收尾」的操作会每轮同步烧一次配额，最终被对账收成
+/// `failed / retry_exhausted` —— 文案说「服务器一直拒绝这条意图」，
+/// 可服务器一次都没拒绝过，信也早就搬好了。
+///
+/// ## 为什么写在这里而不是加进 `xremail-store`
+///
+/// 它是**这一条路径**的簿记（与探测结论前缀配套，见 [`PROBE_VERDICT_TAG`]），
+/// 不是通用的状态迁移：存储层负责「状态机允许什么」，这里负责「这一轮到底
+/// 算不算试过一次」。把口径留在用它的地方，才看得出宽窄。
+///
+/// ## 归属守卫照抄存储层
+///
+/// `AND (state <> 'running' OR owner_boot IS ?)` 与 `update_operation_state_as`
+/// （R50）一字不差：只有**认领这一行的那个提交者**才能给它写结论。少了它，
+/// 一台服务器卡住时，另一条通道（例如同一封邮件的 flag 行）刚写进去的结论
+/// 会被这里覆盖掉。
+async fn mark_uncertain_without_attempt(
+    pool: &SqlitePool,
+    id: &str,
+    boot_id: &str,
+    error_kind: &str,
+    error_message: &str,
+    now_ms: i64,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        UPDATE mail_operation
+        SET state = 'uncertain',
+            error_kind = ?,
+            error_message = ?,
+            owner_boot = NULL,
+            started_at = NULL,
+            updated_at = ?
+        WHERE id = ?
+          AND state IN ('queued', 'running', 'retryable', 'uncertain')
+          AND (state <> 'running' OR owner_boot IS ?)
+        "#,
+    )
+    .bind(error_kind)
+    .bind(error_message)
+    .bind(now_ms)
+    .bind(id)
+    .bind(boot_id)
+    .execute(pool)
+    .await
+    .map_err(|error| AppError::Storage(format!("标记操作结果未知失败: {error}")))?;
+
+    Ok(())
 }
 
 #[cfg(test)]

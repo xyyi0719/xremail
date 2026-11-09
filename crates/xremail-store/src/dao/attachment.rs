@@ -90,6 +90,20 @@ pub async fn attachment_timestamps(
 ///
 /// 语义见模块文档：形状按 `(message_id, part_key)` 对齐，下载状态保留，
 /// 消失的行删除。整个过程在**一笔事务**里完成。
+///
+/// ## 为什么要在这里把下载状态**钉住**（R55）
+///
+/// 「重拉正文不丢下载状态」原先只靠「`ON CONFLICT DO UPDATE` 的 `SET` 列表里
+/// 没有那四列」来保证——也就是说，它是一条**写给读者看的约定**，数据库里
+/// 没有任何东西拦住「某天有人往 `SET` 里补一行」。一旦补上，一次重拉正文就会把
+/// 用户已经下载过的附件清成 `fetched = 0`（文件还在盘上，界面却显示未下载），
+/// 或者反过来只写 `local_path` 不写 `fetched`——那正是 0008 迁移里
+/// 「`fetched` 与 `local_path` 必须同时成立」那句注释要防的半截状态。
+///
+/// 所以 INSERT 里这四列一律写 `NULL` / `0`（新行本来就没下载过），
+/// 而 `ON CONFLICT` 的 `SET` 只在**行还没下载**时才采纳新解析结果：
+/// `attachment.fetched = 1` 时 `CASE` 把四个字段全部写回旧值，
+/// 不管 `SET` 里写了什么都改不动它。
 pub async fn replace_attachments(
     pool: &SqlitePool,
     message_id: &str,
@@ -111,11 +125,13 @@ pub async fn replace_attachments(
 
         sqlx::query!(
             r#"
+            -- 下载状态**只**能由 `mark_downloaded` 写（见函数文档 R55）：
+            -- 解析侧传来的 local_path / sha256 / fetched / downloaded_at
+            -- 即便有值也不是「这个文件已经落盘」的证据，新行一律写成「未下载」。
             INSERT INTO attachment (
                 id, message_id, filename, mime, size, content_id, "inline",
-                local_path, sha256, fetched, part_key, downloaded_at, created_at,
-                transfer_encoding
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                part_key, created_at, transfer_encoding
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (message_id, part_key) DO UPDATE SET
                 filename   = excluded.filename,
                 mime       = excluded.mime,
@@ -127,7 +143,24 @@ pub async fn replace_attachments(
                 END,
                 content_id = excluded.content_id,
                 "inline"   = excluded."inline",
-                transfer_encoding = excluded.transfer_encoding
+                transfer_encoding = excluded.transfer_encoding,
+                -- 下载状态四列：已下载的行一律写回旧值（DB 层钉住，不靠 SET 列表漏写）。
+                local_path    = CASE
+                    WHEN attachment.fetched THEN attachment.local_path
+                    ELSE excluded.local_path
+                END,
+                sha256        = CASE
+                    WHEN attachment.fetched THEN attachment.sha256
+                    ELSE excluded.sha256
+                END,
+                fetched       = CASE
+                    WHEN attachment.fetched THEN attachment.fetched
+                    ELSE excluded.fetched
+                END,
+                downloaded_at = CASE
+                    WHEN attachment.fetched THEN attachment.downloaded_at
+                    ELSE excluded.downloaded_at
+                END
             "#,
             attachment.id,
             message_id,
@@ -136,11 +169,7 @@ pub async fn replace_attachments(
             attachment.size,
             attachment.content_id,
             attachment.inline,
-            attachment.local_path,
-            attachment.sha256,
-            attachment.fetched,
             part_key,
-            attachment.downloaded_at_ms,
             now_ms,
             attachment.transfer_encoding,
         )
@@ -233,6 +262,11 @@ pub async fn get_attachment(
 ///
 /// `sha256` 是**解码后字节**的摘要，`size` 是落盘的字节数——
 /// 两者一起写，`fetched` 与 `local_path` 同进同退，不留半截状态。
+///
+/// 这是**唯一**允许写 `fetched` / `local_path` / `sha256` / `downloaded_at` 的地方，
+/// 也是它们永远同时成立的唯一理由（[`replace_attachments`] 在 DB 层把已下载的行
+/// 钉死，见那里的 R55）。调用方必须先确认**文件已经落盘**再调：记完账就是一个
+/// 不可撤销的承诺——`fetched = 1` 之后重拉正文也不会再刷新它。
 pub async fn mark_downloaded(
     pool: &SqlitePool,
     message_id: &str,

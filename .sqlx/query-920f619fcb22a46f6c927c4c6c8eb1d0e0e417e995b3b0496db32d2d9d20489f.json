@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        UPDATE send_queue\n        SET state = 'failed',\n            error_kind = ?,\n            error_message = ?,\n            owner_boot = NULL,\n            started_at = NULL,\n            updated_at = ?\n        WHERE id = ? AND state = 'running' AND owner_boot IS ?\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "920f619fcb22a46f6c927c4c6c8eb1d0e0e417e995b3b0496db32d2d9d20489f"
+}

@@ -732,6 +732,7 @@ pub async fn set_message_flag(
             let _ = operation_dao::mark_operation_retryable(
                 state.pool(),
                 &operation.id,
+                xremail_sync::boot_id(),
                 "connect_failed",
                 &detail,
                 now,
@@ -785,6 +786,7 @@ pub async fn set_message_flag(
         let _ = operation_dao::mark_operation_retryable(
             state.pool(),
             &operation.id,
+            xremail_sync::boot_id(),
             "submit_failed",
             &detail,
             now,

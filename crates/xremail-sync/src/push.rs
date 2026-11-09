@@ -152,9 +152,10 @@ pub async fn push_flags_as_with_options(
             continue;
         }
 
-        operation::update_operation_state(
+        operation::update_operation_state_as(
             pool,
             &op.id,
+            Some(boot_id),
             OperationState::Failed,
             Some("epoch_changed"),
             Some(&format!(
@@ -252,9 +253,10 @@ pub async fn push_flags_as_with_options(
                 report.succeeded += 1;
                 report.noop += 1;
                 for op in &claimed {
-                    operation::update_operation_state(
+                    operation::update_operation_state_as(
                         pool,
                         &op.id,
+                        Some(boot_id),
                         OperationState::Succeeded,
                         None,
                         None,
@@ -277,9 +279,10 @@ pub async fn push_flags_as_with_options(
                 report.succeeded += 1;
                 report.submitted += submitted;
                 for op in &claimed {
-                    operation::update_operation_state(
+                    operation::update_operation_state_as(
                         pool,
                         &op.id,
+                        Some(boot_id),
                         OperationState::Succeeded,
                         None,
                         None,
@@ -304,6 +307,7 @@ pub async fn push_flags_as_with_options(
                     operation::mark_operation_retryable(
                         pool,
                         &op.id,
+                        boot_id,
                         "server_rejected",
                         &message,
                         now_ms,
@@ -318,16 +322,19 @@ pub async fn push_flags_as_with_options(
                     // 只有它会自增 `attempts`，而认领条件里有 `attempts < ?`。
                     // 不自增 = 这条永远可以被重新认领 = 每轮同步都重发一次命令，
                     // 「最多试 N 次就停」的上限永远到不了顶。
-                    operation::mark_operation_uncertain(pool, &op.id, "unknown", &message, now_ms)
-                        .await?;
+                    operation::mark_operation_uncertain(
+                        pool, &op.id, boot_id, "unknown", &message, now_ms,
+                    )
+                    .await?;
                 }
             }
             Err(SubmitError::Failed { message }) => {
                 report.failed += 1;
                 for op in &claimed {
-                    operation::update_operation_state(
+                    operation::update_operation_state_as(
                         pool,
                         &op.id,
+                        Some(boot_id),
                         OperationState::Failed,
                         Some("permanent"),
                         Some(&message),

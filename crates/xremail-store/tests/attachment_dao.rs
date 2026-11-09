@@ -356,3 +356,66 @@ async fn a_parsed_size_never_overrides_the_size_on_disk() {
         "已经下载过的行，size 以落盘字节为准，不能被解析长度覆盖"
     );
 }
+
+#[tokio::test]
+async fn a_downloaded_part_keeps_its_download_state_even_if_the_caller_passes_other_values() {
+    // 「重拉正文不丢下载状态」原本只靠 `ON CONFLICT DO UPDATE` 的 SET 列表里
+    // **没有**那几列。那是写给读者看的约定，数据库里没有任何东西拦住它；
+    // 而 0008 明确要求 `fetched` 与 `local_path` 同时成立，不留半截状态。
+    //
+    // 现在这条语义钉在 SQL 里：已下载的行，`local_path` / `sha256` / `fetched` /
+    // `downloaded_at` 无论入参传什么都不变。
+    let pool = setup().await;
+    replace_attachments(&pool, "m1", &[attachment("at1", "m1", "1", "a.pdf")], 1)
+        .await
+        .expect("replace");
+    mark_downloaded(&pool, "m1", "at1", "/data/x/a", "abc123", 10, 2)
+        .await
+        .expect("mark");
+
+    // 解析侧「以为」这个部件没下载过，并且带着另一套下载字段。
+    let mut repulled = attachment("at1", "m1", "1", "a-renamed.pdf");
+    repulled.local_path = Some("/somewhere/else".into());
+    repulled.sha256 = Some("zzz".into());
+    repulled.fetched = false;
+    repulled.downloaded_at_ms = Some(99);
+    replace_attachments(&pool, "m1", &[repulled], 3)
+        .await
+        .expect("replace again");
+
+    let list = list_attachments(&pool, "m1").await.expect("list");
+    let item = &list[0];
+    assert_eq!(
+        item.filename.as_deref(),
+        Some("a-renamed.pdf"),
+        "元数据照常刷新"
+    );
+    assert!(item.fetched, "已下载的部件不能被重拉翻成未下载");
+    assert_eq!(item.local_path.as_deref(), Some("/data/x/a"));
+    assert_eq!(item.sha256.as_deref(), Some("abc123"));
+    assert_eq!(item.downloaded_at_ms, Some(2));
+
+    // 反方向：新行**不能**靠入参「假装已下载」——下载状态只能由
+    // `mark_downloaded` 写，否则会出现「fetched=1 但盘上没有这个文件」。
+    let mut fake = attachment("at2", "m1", "2", "b.pdf");
+    fake.local_path = Some("/nope".into());
+    fake.fetched = true;
+    replace_attachments(
+        &pool,
+        "m1",
+        &[attachment("at1", "m1", "1", "a.pdf"), fake],
+        4,
+    )
+    .await
+    .expect("insert fake");
+    let fresh = get_attachment(&pool, "m1", "at2")
+        .await
+        .expect("get")
+        .expect("at2 应当存在");
+    assert!(
+        !fresh.fetched && fresh.local_path.is_none(),
+        "新行被写成了「已下载」而文件并不存在：fetched={} path={:?}",
+        fresh.fetched,
+        fresh.local_path
+    );
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            -- 下载状态**只**能由 `mark_downloaded` 写（见函数文档 R55）：\n            -- 解析侧传来的 local_path / sha256 / fetched / downloaded_at\n            -- 即便有值也不是「这个文件已经落盘」的证据，新行一律写成「未下载」。\n            INSERT INTO attachment (\n                id, message_id, filename, mime, size, content_id, \"inline\",\n                part_key, created_at, transfer_encoding\n            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n            ON CONFLICT (message_id, part_key) DO UPDATE SET\n                filename   = excluded.filename,\n                mime       = excluded.mime,\n                -- size 是**解码后的字节数 / 落盘字节数**：已经下载过（fetched=1）\n                -- 就以本地文件为准，只有没下载时才采用这次解析出来的长度。\n                size       = CASE\n                    WHEN attachment.fetched THEN attachment.size\n                    ELSE excluded.size\n                END,\n                content_id = excluded.content_id,\n                \"inline\"   = excluded.\"inline\",\n                transfer_encoding = excluded.transfer_encoding,\n                -- 下载状态四列：已下载的行一律写回旧值（DB 层钉住，不靠 SET 列表漏写）。\n                local_path    = CASE\n                    WHEN attachment.fetched THEN attachment.local_path\n                    ELSE excluded.local_path\n                END,\n                sha256        = CASE\n                    WHEN attachment.fetched THEN attachment.sha256\n                    ELSE excluded.sha256\n                END,\n                fetched       = CASE\n                    WHEN attachment.fetched THEN attachment.fetched\n                    ELSE excluded.fetched\n                END,\n                downloaded_at = CASE\n                    WHEN attachment.fetched THEN attachment.downloaded_at\n                    ELSE excluded.downloaded_at\n                END\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 10
+    },
+    "nullable": []
+  },
+  "hash": "df536c3805869bc2d8f78e926b4ab2b46df3c732aff12bb8f783b455dd5585ba"
+}

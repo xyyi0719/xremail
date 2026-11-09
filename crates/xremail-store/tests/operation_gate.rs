@@ -386,7 +386,7 @@ async fn the_gate_is_released_once_the_running_one_finishes() {
             .await
             .expect("认领应当成功")
     );
-    operation::mark_operation_retryable(&pool, "legacy-1", "timeout", "超时", 11)
+    operation::mark_operation_retryable(&pool, "legacy-1", "boot-a", "timeout", "超时", 11)
         .await
         .expect("标记可重试应当成功");
 

@@ -42,6 +42,14 @@
 //! flag 通道（`OperationKind::Flags`）**不参与**这两条约束：它有自己的合并逻辑
 //! （按 `seq` 定序、以服务器快照为准，见 [ARCHITECTURE §6](../../../../docs/ARCHITECTURE.md)），
 //! 多行 flag 意图叠在一起是合法的。
+//!
+//! ## 认领即凭据
+//!
+//! 「flag 不参与闸门」的直接推论是：**同一封邮件上可以同时存在一条 `running`
+//! 的 flag 和一条 `running` 的搬移**。所以所有收尾函数（[`mark_operation_retryable`] /
+//! [`mark_operation_uncertain`] / [`update_operation_state_as`]）都要求调用方
+//! 出示认领时记下的 `owner_boot`，不许按「这是个 `running` 就改」行事——
+//! 否则搬移的失败会写到别人的 flag 行上，两边的结果一起丢（R50）。
 
 use sqlx::FromRow;
 use sqlx::SqlitePool;
@@ -666,6 +674,24 @@ pub async fn expire_exhausted(
 /// 只允许在**未完结**的状态之间迁移：`succeeded` / `failed` 是终态，
 /// 不许被改回去。没有这条守卫时，一条已经确认成功的操作可能被后到的
 /// 失败分支覆盖成 `retryable`，然后重放一遍——那是靠时序碰运气的正确性。
+///
+/// ## 「未完结」不等于「是我的」（R50）
+///
+/// 上面那条守卫只看**状态**，不看**这一行是不是本进程认领的**。同一个进程里
+/// 两条提交通道可能认领**同一封邮件**上的不同行（`push_flags` 认领 flag 行、
+/// `push_transfers` 认领搬移行，见 [`claim_for_push`] 的 `kind = 'flags' OR …`），
+/// 而 `mail_operation` 里同一封邮件**同时只会有这两类 `running`**。于是
+/// 「A 认领了搬移、B 认领了 flag、A 写终态」时，这条 `UPDATE` 改到的是 B 那一行：
+///
+/// * B 收尾时 `WHERE state = 'running'` 改不到行，服务器上真实的提交结果被丢弃；
+/// * A 那一行没人写终态，要等 15 分钟租约才被收成 `uncertain`，失败原因丢失。
+///
+/// 所以写入方必须出示**认领凭据**（`owner_boot`），收尾时带着它；
+/// 不带凭据的调用只允许改**没有归属**的行（`owner_boot IS NULL`，即入队时就是这个
+/// 状态的行），碰到别人的 `running` 一律不动、返回 `false`。
+///
+/// 认领凭据为什么是 `owner_boot` 而不是「先认领、再在一笔事务里写终态」：
+/// 提交命令是网络往返，把它夹在一笔写事务里会让整轮提交都占着 SQLite 的写锁。
 pub async fn update_operation_state(
     pool: &SqlitePool,
     id: &str,
@@ -674,20 +700,42 @@ pub async fn update_operation_state(
     error_message: Option<&str>,
     now_ms: i64,
 ) -> AppResult<bool> {
+    update_operation_state_as(pool, id, None, state, error_kind, error_message, now_ms).await
+}
+
+/// 同 [`update_operation_state`]，但指定**认领凭据**（见该函数的「未完结不等于是我的」）。
+///
+/// `owner_boot = Some(boot)` 的调用者就是认领这一行的那个提交者；
+/// `None` 表示「我没有认领过任何行」，此时只能改没有归属的行。
+pub async fn update_operation_state_as(
+    pool: &SqlitePool,
+    id: &str,
+    owner_boot: Option<&str>,
+    state: OperationState,
+    error_kind: Option<&str>,
+    error_message: Option<&str>,
+    now_ms: i64,
+) -> AppResult<bool> {
     let state_text = enum_to_text(&state, "operation.state")?;
 
+    // 收尾即交还租约：留住 `owner_boot` 会让这一行看起来仍有人在提交，
+    // 而 `expire_exhausted` / 重新认领都不看它——下次满租约时它还会被
+    // `reclaim_stale_running` 再「回收」一次（虽然状态已不是 running，无害但不干净）。
     let result = sqlx::query!(
         r#"
         UPDATE mail_operation
-        SET state = ?, error_kind = ?, error_message = ?, updated_at = ?
+        SET state = ?, error_kind = ?, error_message = ?,
+            owner_boot = NULL, started_at = NULL, updated_at = ?
         WHERE id = ?
           AND state IN ('queued', 'running', 'retryable', 'uncertain')
+          AND (state <> 'running' OR owner_boot IS ?)
         "#,
         state_text,
         error_kind,
         error_message,
         now_ms,
-        id
+        id,
+        owner_boot
     )
     .execute(pool)
     .await
@@ -702,9 +750,13 @@ pub async fn update_operation_state(
 /// 也自增，一次失败会烧掉两个配额，正常抖动就会被提前判成 `retry_exhausted`。
 ///
 /// 同样只允许从未完结状态迁过来：终态不能被一次后到的失败覆盖成 `retryable`。
+///
+/// 归属守卫见 [`update_operation_state_as`] 的说明（R50）：**必须**由认领者带着
+/// 凭据调用，否则一次失败会被记到同一封邮件上另一条通道正在提交的 flag 行头上。
 pub async fn mark_operation_retryable(
     pool: &SqlitePool,
     id: &str,
+    boot_id: &str,
     error_kind: &str,
     error_message: &str,
     now_ms: i64,
@@ -713,14 +765,17 @@ pub async fn mark_operation_retryable(
         r#"
         UPDATE mail_operation
         SET state = 'retryable', attempts = attempts + 1,
-            error_kind = ?, error_message = ?, updated_at = ?
+            error_kind = ?, error_message = ?,
+            owner_boot = NULL, started_at = NULL, updated_at = ?
         WHERE id = ?
           AND state IN ('queued', 'running', 'retryable', 'uncertain')
+          AND (state <> 'running' OR owner_boot IS ?)
         "#,
         error_kind,
         error_message,
         now_ms,
-        id
+        id,
+        boot_id
     )
     .execute(pool)
     .await
@@ -744,9 +799,12 @@ pub async fn mark_operation_retryable(
 /// 与 [`mark_operation_retryable`] 的唯一区别是落到 `uncertain` 而不是
 /// `retryable`：前者是「确认失败」，后者是「不知道成没成」，下游对二者的处理
 /// 不同（`uncertain` 要先回读核对）。
+///
+/// 归属守卫与「认领即凭据」同 [`mark_operation_retryable`]（R50）。
 pub async fn mark_operation_uncertain(
     pool: &SqlitePool,
     id: &str,
+    boot_id: &str,
     error_kind: &str,
     error_message: &str,
     now_ms: i64,
@@ -755,14 +813,17 @@ pub async fn mark_operation_uncertain(
         r#"
         UPDATE mail_operation
         SET state = 'uncertain', attempts = attempts + 1,
-            error_kind = ?, error_message = ?, updated_at = ?
+            error_kind = ?, error_message = ?,
+            owner_boot = NULL, started_at = NULL, updated_at = ?
         WHERE id = ?
           AND state IN ('queued', 'running', 'retryable', 'uncertain')
+          AND (state <> 'running' OR owner_boot IS ?)
         "#,
         error_kind,
         error_message,
         now_ms,
-        id
+        id,
+        boot_id
     )
     .execute(pool)
     .await

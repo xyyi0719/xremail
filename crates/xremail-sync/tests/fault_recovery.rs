@@ -29,10 +29,18 @@ use xremail_store::dao::{
     account as account_dao, folder as folder_dao, operation as operation_dao,
 };
 use xremail_store::{PoolConfig, migrate, open_pool_in_memory, open_pool_path};
-use xremail_sync::{pull_folder, push_flags};
+use xremail_sync::{pull_folder, push_flags_as};
 use xremail_testkit::{
     FakeImapServer, Fault, MailboxFixture, MessageFixture, ServerConfig as FakeServerConfig,
 };
+
+/// 认领归属：模拟「上一次进程」与「这一次进程」。
+///
+/// `push_flags` 内部用本进程的 boot id 认领；一条 `uncertain` 的操作要能被
+/// **下一次**回写收尾（协议层的归属守卫见 `update_operation_state_as`，R50），
+/// 两次回写必须是**同一个提交者**，所以这里钉死两个名字而不是各用各的。
+const TEST_BOOT_A: &str = "test-boot-a";
+const TEST_BOOT_B: &str = "test-boot-b";
 
 /// 待标记为已读的那封邮件的 UID。
 const TARGET_UID: i64 = 1_792_658_702;
@@ -252,7 +260,7 @@ async fn server_applied_but_the_ack_was_lost_is_not_replayed() {
     enqueue_read_intent(&pool, &folder, TARGET_UID, epoch, 2_000).await;
 
     // 第一次回写：STORE 在服务器上**生效了**，但确认没送回来。
-    let report = push_flags(&pool, &mut session, &folder, 3_000)
+    let report = push_flags_as(&pool, &mut session, &folder, 3_000, TEST_BOOT_A)
         .await
         .expect("回写应当成功（失败也是预期内的结果，不是错误）");
 
@@ -275,7 +283,7 @@ async fn server_applied_but_the_ack_was_lost_is_not_replayed() {
 
     // 第二次回写（重新连上）：先回读，发现服务器上已经有了 → **一条命令都不发**。
     let mut session = login(&fixture).await;
-    let report = push_flags(&pool, &mut session, &folder, 4_000)
+    let report = push_flags_as(&pool, &mut session, &folder, 4_000, TEST_BOOT_B)
         .await
         .expect("回写应当成功");
 
@@ -327,7 +335,7 @@ async fn a_command_dropped_before_it_took_effect_is_retried() {
     enqueue_read_intent(&pool, &folder, TARGET_UID, epoch, 2_000).await;
 
     // 第一次：命令发出去了，服务器没执行，也没确认。
-    let report = push_flags(&pool, &mut session, &folder, 3_000)
+    let report = push_flags_as(&pool, &mut session, &folder, 3_000, TEST_BOOT_A)
         .await
         .expect("回写应当成功");
     assert_eq!(report.uncertain, 1);
@@ -341,7 +349,7 @@ async fn a_command_dropped_before_it_took_effect_is_retried() {
 
     // 第二次：回读发现服务器上没有 → 重发 → 真正生效。
     let mut session = login(&fixture).await;
-    let report = push_flags(&pool, &mut session, &folder, 4_000)
+    let report = push_flags_as(&pool, &mut session, &folder, 4_000, TEST_BOOT_B)
         .await
         .expect("回写应当成功");
     assert_eq!(report.succeeded, 1);
@@ -398,7 +406,7 @@ async fn a_pending_intent_survives_a_restart() {
         .unwrap()
         .unwrap();
     let mut session = login(&fixture).await;
-    let report = push_flags(&pool, &mut session, &folder, 5_000)
+    let report = push_flags_as(&pool, &mut session, &folder, 5_000, TEST_BOOT_A)
         .await
         .expect("回写应当成功");
     assert_eq!(report.succeeded, 1);

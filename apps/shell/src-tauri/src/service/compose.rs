@@ -753,10 +753,15 @@ impl ComposeService {
         outcome: &SubmitOutcome,
     ) -> AppResult<SendResultState> {
         let now = current_time_ms();
+        // 写终态要带上**认领时那个** boot id（R50 的配套改动）：`mark_*` 只改
+        // `owner_boot` 等于这个值的 `running` 行，否则会误伤同一封邮件上
+        // 别的在途记录。`claim_or_explain` 用的是同一个 `boot_id()`——它是
+        // 本进程的常量，两次调用必然相等。
+        let boot_id = xremail_sync::boot_id();
 
         match outcome {
             SubmitOutcome::Accepted { .. } => {
-                send_queue_dao::mark_succeeded(&self.pool, id, now).await?;
+                send_queue_dao::mark_succeeded(&self.pool, id, boot_id, now).await?;
                 Ok(SendResultState::Sent)
             }
             SubmitOutcome::Rejected {
@@ -768,11 +773,26 @@ impl ComposeService {
                 let text = format!("服务器在{stage_text}拒绝了这封信：{code} {message}");
                 if (400..500).contains(code) {
                     // 4xx：临时故障，服务器**没有**收下这封信，重发是安全的。
-                    send_queue_dao::mark_retryable(&self.pool, id, "rejected_4xx", &text, now)
-                        .await?;
+                    send_queue_dao::mark_retryable(
+                        &self.pool,
+                        id,
+                        boot_id,
+                        "rejected_4xx",
+                        &text,
+                        now,
+                    )
+                    .await?;
                 } else {
                     // 5xx：永久拒收，重发也没用。
-                    send_queue_dao::mark_failed(&self.pool, id, "rejected_5xx", &text, now).await?;
+                    send_queue_dao::mark_failed(
+                        &self.pool,
+                        id,
+                        boot_id,
+                        "rejected_5xx",
+                        &text,
+                        now,
+                    )
+                    .await?;
                 }
                 Ok(SendResultState::Failed)
             }
@@ -781,7 +801,8 @@ impl ComposeService {
                 // → 重发是安全的 → 记成可重试。
                 let stage_text = stage_name(*stage);
                 let text = format!("连接在{stage_text}断开了，这封信没有发出去：{reason}");
-                send_queue_dao::mark_retryable(&self.pool, id, "not_sent", &text, now).await?;
+                send_queue_dao::mark_retryable(&self.pool, id, boot_id, "not_sent", &text, now)
+                    .await?;
                 Ok(SendResultState::Failed)
             }
             SubmitOutcome::Uncertain { reason, stage } => {
@@ -789,7 +810,8 @@ impl ComposeService {
                 let text =
                     format!("命令已经发出去了，但在{stage_text}没收到服务器的最终应答：{reason}");
                 // 不确定 ≠ 可重试：服务器可能已经收下了这封信。
-                send_queue_dao::mark_uncertain(&self.pool, id, "no_reply", &text, now).await?;
+                send_queue_dao::mark_uncertain(&self.pool, id, boot_id, "no_reply", &text, now)
+                    .await?;
                 Ok(SendResultState::Uncertain)
             }
         }
@@ -822,12 +844,18 @@ impl ComposeService {
             Err(error) => {
                 let text = describe_smtp_error(&error);
                 let (kind, permanent) = classify_smtp_error(&error);
+                // 与 `record_outcome` 同一个口径：写终态必须带认领时的 boot id（R50 配套）。
+                let boot_id = xremail_sync::boot_id();
                 if permanent {
-                    let _ =
-                        send_queue_dao::mark_failed(&self.pool, entry_id, kind, &text, now).await;
+                    let _ = send_queue_dao::mark_failed(
+                        &self.pool, entry_id, boot_id, kind, &text, now,
+                    )
+                    .await;
                 } else {
-                    let _ = send_queue_dao::mark_retryable(&self.pool, entry_id, kind, &text, now)
-                        .await;
+                    let _ = send_queue_dao::mark_retryable(
+                        &self.pool, entry_id, boot_id, kind, &text, now,
+                    )
+                    .await;
                 }
                 let stored = send_queue_dao::get_entry(&self.pool, entry_id).await?;
                 return Ok(SendResult {

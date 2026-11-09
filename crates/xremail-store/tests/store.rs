@@ -760,3 +760,56 @@ async fn file_database_survives_reopen() {
     assert_eq!(accounts.len(), 1);
     assert_eq!(accounts[0].id, "a1");
 }
+
+// ===========================================================================
+// 游标不被「列文件夹」抹掉（R53）
+// ===========================================================================
+
+#[tokio::test]
+async fn a_folder_upsert_without_a_cursor_does_not_erase_the_stored_epoch() {
+    // `upsert_folder` 吃的是 `LIST` 的结论，而 `LIST` **不**给 UIDVALIDITY / UIDNEXT。
+    // 调用方本该把库里旧值抄进来，但那是约定；约定一旦抄漏（或换了调用方），
+    // 游标就被写成 NULL，而 `reconcile` 把 `folder_uidvalidity = None` 解释成
+    // 「还没同步过，不比对 epoch」——绑定旧 epoch 的意图于是永远不会被隔离，
+    // 旧 UID 会被套到新世代里另一封信上。
+    let pool = fresh_pool().await;
+    account::upsert_account(&pool, &sample_account("a1"))
+        .await
+        .unwrap();
+
+    let mut synced = sample_folder("f1", "a1");
+    synced.uidvalidity = Some(42);
+    synced.last_uid = Some(100);
+    synced.highest_modseq = Some(500);
+    folder::upsert_folder(&pool, &synced).await.unwrap();
+
+    // 第二轮 `LIST`：只认得名字与角色，游标一个都不知道。
+    let mut listed = sample_folder("f1", "a1");
+    listed.uidvalidity = None;
+    listed.last_uid = None;
+    listed.highest_modseq = None;
+    listed.role = Some("inbox".to_string());
+    folder::upsert_folder(&pool, &listed).await.unwrap();
+
+    let back = folder::get_folder(&pool, "f1")
+        .await
+        .unwrap()
+        .expect("应当还在");
+    assert_eq!(back.uidvalidity, Some(42), "epoch 被一次 LIST 抹掉了");
+    assert_eq!(back.last_uid, Some(100), "游标被一次 LIST 抹掉了");
+    assert_eq!(back.highest_modseq, Some(500));
+    assert_eq!(
+        back.role.as_deref(),
+        Some("inbox"),
+        "role 相反：NULL 是「这一轮没认出来」，必须照写"
+    );
+
+    // 反过来：拉取给出了新游标，就必须推进。
+    let mut pulled = sample_folder("f1", "a1");
+    pulled.uidvalidity = Some(43);
+    pulled.last_uid = Some(5);
+    folder::upsert_folder(&pool, &pulled).await.unwrap();
+    let back = folder::get_folder(&pool, "f1").await.unwrap().unwrap();
+    assert_eq!(back.uidvalidity, Some(43), "非空的游标必须能推进");
+    assert_eq!(back.last_uid, Some(5));
+}

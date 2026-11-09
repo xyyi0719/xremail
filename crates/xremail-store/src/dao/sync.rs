@@ -43,6 +43,19 @@ pub struct FolderSyncWrite {
 /// 4. 更新文件夹游标（`uidvalidity` / `last_uid` / `last_sync_at`）。
 ///
 /// 返回被删掉的邮件数。
+///
+/// ## 提前 `return` 也走一次**确定的**回滚（R54）
+///
+/// 第 1 步「epoch 切换却没给新 `uidvalidity`」是参数校验失败，会在
+/// `drop_other_epochs` 那一段就返回 `Invalid`。此时事务里还没有任何写语句
+/// （清旧世代是第一句写，它排在这次校验之后），所以**即使** sqlx 的异步 drop
+/// 没能及时回滚，库里的数据也不会不一致——这是本次复核的结论，不是猜测：
+/// 把这里的 `rollback` 去掉，用例照样绿。
+///
+/// 之所以仍然显式 `rollback`：不把「数据没被改过」这件事押在
+/// 「`Transaction` 在异步 drop 里补做 ROLLBACK」上。那种保证依赖
+/// 运行时线程、进程退出时机与连接关闭这三件事，而这里只要一句话就能不依赖它们；
+/// 顺手让「失败路径一定回滚」这条不变量在本函数里看得见。
 pub async fn commit_folder_sync(
     pool: &SqlitePool,
     folder: &Folder,
@@ -56,6 +69,10 @@ pub async fn commit_folder_sync(
     // 1. 旧世代作废。
     if write.drop_other_epochs {
         let Some(current) = folder.uidvalidity else {
+            // 显式回滚：见函数文档的「提前 return 也算回滚」。
+            tx.rollback()
+                .await
+                .map_err(|e| map_sqlx(e, "commit_folder_sync: rollback"))?;
             return Err(xremail_core::AppError::Invalid(
                 "epoch 切换时必须给出新的 uidvalidity".into(),
             ));

@@ -48,6 +48,26 @@ struct FolderRow {
 /// 属性）。两种读法都有代价，于是统一按「最近一次同步的观测就是事实」落库，
 /// 把「`NULL` 时怎么兜底」留在读的一方（见 `xremail-sync` 的
 /// `transfer_push::trash_candidates`）——那里才看得见「删错地方」的全部代价。
+///
+/// ## 游标与 epoch **不**跟着覆盖（R53）
+///
+/// 本函数吃的是 `LIST` 的结论，而 `LIST` 只给文件夹名、属性与角色——
+/// **不**给 `UIDVALIDITY`、`UIDNEXT`、`HIGHESTMODSEQ`。调用方（`xremail-sync`
+/// 的 `sync_account`）于是把库里旧值抄进 `Folder` 再传进来，这没错；错的是
+/// 一旦哪天它抄漏了（新建 `Folder`、字段没填、或者换了别的调用方），这里会
+/// 把 `uidvalidity` / `last_uid` 写成 `NULL`：
+///
+/// * `pull_folder` 在 `list_folders` 之后**重新**读了一次 `folder`，所以它看得见
+///   旧游标；但它自己那次 `commit_folder_sync` 会把正确的值写回去——看上去没事。
+/// * 真正的问题在**泄漏窗口**：`LIST` 与 `pull` 之间（网络往返），以及任何
+///   `selectable = false` 的文件夹（**永远不会**被 pull 覆盖回来），游标就成了
+///   `NULL`。`reconcile` 的 `folder_uidvalidity = None` 被解释成「还没同步过，
+///   不比对 epoch」——于是绑定旧 epoch 的意图**永远不会**被判成 `epoch_changed`，
+///   旧 UID 会被套到新世代里另一封信上（正是 ARCHITECTURE §4.3 禁止的那件事）。
+///
+/// 所以两列在冲突时写成「新值非空就用新值，否则保留库里的」：游标只该由
+/// **拉取**推进（[`crate::dao::sync::commit_folder_sync`]），`LIST` 无权把它们
+/// 抹掉。`role` 则相反——`NULL` 是「这一轮没认出来」，必须照写（见上）。
 pub async fn upsert_folder(pool: &SqlitePool, folder: &Folder) -> AppResult<()> {
     sqlx::query!(
         r#"
@@ -63,9 +83,10 @@ pub async fn upsert_folder(pool: &SqlitePool, folder: &Folder) -> AppResult<()> 
             subscribed     = excluded.subscribed,
             selectable     = excluded.selectable,
             last_sync_at   = excluded.last_sync_at,
-            last_uid       = excluded.last_uid,
-            highest_modseq = excluded.highest_modseq,
-            uidvalidity    = excluded.uidvalidity,
+            -- `COALESCE(新值, 旧值)`：只有新值非空才推进游标，空值不得抹掉旧值。
+            last_uid       = COALESCE(excluded.last_uid, folder.last_uid),
+            highest_modseq = COALESCE(excluded.highest_modseq, folder.highest_modseq),
+            uidvalidity    = COALESCE(excluded.uidvalidity, folder.uidvalidity),
             role           = excluded.role
         "#,
         folder.id,

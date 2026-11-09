@@ -11,6 +11,20 @@
 //! * 每条用例用**唯一**的条目名（`xremail:test:<标签>:<随机后缀>`），
 //!   不会撞上真实账户条目（`xremail:account:<uuid>`），也不会和并行用例互相干扰。
 //! * [`TestEntry`] 在 `Drop` 时删掉条目：断言中途失败也要清理干净。
+//!
+//! ## 为什么这些用例要**串行**跑（R49）
+//!
+//! 每条用例的条目名本来就不冲突，串行不是为了防撞名，而是因为**凭据管理器
+//! 是系统级单点资源**：cargo 默认让同一测试二进制里的用例并行跑，
+//! 于是 6 条用例会同时 `CredWriteW`。2026-11-09 的 CI 上撞到过一次
+//! 「`set` 报成功、紧接着 `get` 报 `NoEntry`」（此前连续 6 次全绿、
+//! 重跑即绿），而同一进程里另外 5 条并行用例都通过了——**看起来是并发写入下的偶发**。
+//!
+//! 这里**没有**以「加个重试」的方式绕过去：那会把一个没说清的现象变成
+//! 一劳永逸的掩盖。改成串行是承认「这些用例验的是凭据管理器的**语义**，
+//! 不是它的并发行为」——真要验并发，得另写一组用例并说明期望是什么。
+//!
+//! 代价：这一组用例从并行变成串行，多花约 0.2 秒（实测 6 条共 0.22 秒）。
 
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +38,19 @@ use xremail_shell_lib::secrets::windows_store::WindowsSecretStore;
 ///
 /// 用**每次新建**的运行时：`Drop` 里的清理也要驱动一次异步调用，
 /// 若共用一个运行时，测试体里 panic 之后那个运行时就不可用了。
+/// 本文件里所有用例共用的串行闸（理由见模块文档的 R49 那段）。
+///
+/// 用 `Mutex<()>` 而不是把用例改成 `--test-threads=1`：那只影响整个测试
+/// 二进制，而这里只想让**碰真实凭据管理器**的这几条互斥。
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 取得串行闸。锁中毒时照常放行（上一条用例 panic 的原因才是要看的）。
+fn serial_guard() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn block_on<F: Future>(fut: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -83,6 +110,7 @@ impl Drop for TestEntry {
 /// 写入再读回来，内容必须**逐字节**相同。
 #[test]
 fn set_then_get_returns_the_same_bytes() {
+    let _guard = serial_guard();
     let entry = TestEntry::new("roundtrip");
     let store = entry.store;
     // 内容故意带非 ASCII：通用凭据的 blob 是原始字节，
@@ -103,6 +131,7 @@ fn set_then_get_returns_the_same_bytes() {
 /// 同名条目再写一次：**后写的**内容生效（覆盖）。
 #[test]
 fn set_twice_overwrites_the_previous_value() {
+    let _guard = serial_guard();
     let entry = TestEntry::new("overwrite");
     let store = entry.store;
     let first = SecretValue::from_str_lossless("第一次写的值");
@@ -125,6 +154,7 @@ fn set_twice_overwrites_the_previous_value() {
 /// 删除：第一次 `true`（真删掉了），第二次 `false`（本来就没有），之后读不到。
 #[test]
 fn delete_reports_whether_something_was_removed() {
+    let _guard = serial_guard();
     let entry = TestEntry::new("delete");
     let store = entry.store;
     let value = SecretValue::from_str_lossless("待删除的值");
@@ -149,6 +179,7 @@ fn delete_reports_whether_something_was_removed() {
 /// 从没写过的条目：**读不到**，但**不是错误**。
 #[test]
 fn get_on_a_never_written_ref_returns_none() {
+    let _guard = serial_guard();
     let store = WindowsSecretStore::new();
     let secret_ref = unique_ref("never-written");
 
@@ -165,6 +196,7 @@ fn get_on_a_never_written_ref_returns_none() {
 /// 截断等于存下一个读回来就是错值的凭据——那比存不进去更糟。
 #[test]
 fn set_rejects_content_larger_than_the_platform_limit() {
+    let _guard = serial_guard();
     let entry = TestEntry::new("too-large");
     let store = entry.store;
     let big = SecretValue::new(vec![b'x'; CRED_MAX_CREDENTIAL_BLOB_SIZE as usize + 1]);
@@ -179,6 +211,7 @@ fn set_rejects_content_larger_than_the_platform_limit() {
 /// 空的凭据引用：明确报错，而不是让系统去接受一个无名条目。
 #[test]
 fn set_rejects_an_empty_secret_ref() {
+    let _guard = serial_guard();
     let store = WindowsSecretStore::new();
     let value = SecretValue::from_str_lossless("值");
 

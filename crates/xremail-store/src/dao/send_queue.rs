@@ -139,6 +139,17 @@ struct HeadersJson {
 ///
 /// `uncertain` 不在允许之列：服务器可能已经收下了。
 /// 要改就另起一封新的草稿——那是新的一封信，不该复用同一行的身份。
+///
+/// ## 幂等键的空串要写成 `NULL`（R51）
+///
+/// `idx_send_queue_idempotency` 是**部分**唯一索引，条件是
+/// `idempotency_key IS NOT NULL AND idempotency_key <> ''`（给 0003 之前的老行留的）。
+/// 也就是说空串**根本不进索引**：两行空串可以共存，`ON CONFLICT` 也挡不住它们。
+/// 而领域模型里 `idempotency_key` 是 `String`（[`row_to_entry`] 把 NULL 读成 `""`），
+/// 于是「没有键」在这里长着一副「有键」的样子。
+///
+/// 既然数据库把空串当成「没有键」，DAO 也必须这么写：把空串归一成 `NULL`。
+/// 否则「同一封逻辑邮件只能有一行」对调用方构造的每个空键草稿都不成立。
 pub async fn save_draft(pool: &SqlitePool, entry: &SendQueueEntry) -> AppResult<bool> {
     if entry.state != SendState::Draft {
         return Err(AppError::Invalid(format!(
@@ -152,6 +163,7 @@ pub async fn save_draft(pool: &SqlitePool, entry: &SendQueueEntry) -> AppResult<
 
     let envelope = envelope_to_json(entry)?;
     let headers = headers_to_json(entry)?;
+    let idempotency_key = idempotency_key_column(&entry.idempotency_key);
 
     let mut tx = pool
         .begin()
@@ -185,7 +197,7 @@ pub async fn save_draft(pool: &SqlitePool, entry: &SendQueueEntry) -> AppResult<
         headers,
         entry.body_text,
         entry.body_html,
-        entry.idempotency_key,
+        idempotency_key,
         entry.created_at,
         entry.updated_at,
     )
@@ -414,9 +426,23 @@ async fn replace_attachments(
 
 /// 把草稿变成「已排队」：邮件字节在这里**冻结**。
 ///
-/// 只接受 `draft` / `retryable` / `failed`：
-/// `queued` / `running` 说明有人在处理，`succeeded` 说明已经发出去了，
-/// `uncertain` 要人裁决。
+/// 只接受 `draft` / `retryable` / `failed` / `uncertain`：
+/// `queued` / `running` 说明有人在处理，`succeeded` 说明已经发出去了。
+///
+/// ## 为什么 `uncertain` 也接受（R52）
+///
+/// 「用户改内容再发一次」对 `uncertain` 是**唯一正确的出路**：`save_draft` 明说
+/// 不能就地改它（「要改就另起一封新的草稿」），而 `retry_uncertain` 发的是
+/// **冻结的旧字节**——内容其实一点没变。于是产品路径上的每一次「改完再发」
+/// 都走成了 `save_draft`（拒绝）→ `queue_for_sending`，而这里原先不收 `uncertain`，
+/// 用户只得到一句「这封信已经进入发送队列，不能重复提交」。
+///
+/// 放行是安全的，而且比拒绝更安全：
+/// * 到达这里说明字节**已经换成了新内容**——这是在**替掉**冻结的旧字节，
+///   不是在重发它；旧内容会不会已经送达与这条新内容无关；
+/// * 但不销毁旧字节的痕迹：`idempotency_key` 不动，`attempts` 不动
+///   （新内容的尝试次数从「旧内容用掉的」接着算，宁可早停也不无限重发），
+///   `error_*` 一并清空——上一轮的 `unknown` 说的是旧内容，留着只会误导。
 ///
 /// 返回 `false` = 状态不允许（别人抢走了，或状态变了）。
 pub async fn queue_for_sending(
@@ -436,7 +462,7 @@ pub async fn queue_for_sending(
             error_message = NULL,
             updated_at = ?
         WHERE id = ?
-          AND state IN ('draft', 'retryable', 'failed')
+          AND state IN ('draft', 'retryable', 'failed', 'uncertain')
         "#,
         message_bytes,
         message_id,
@@ -472,6 +498,14 @@ pub async fn queue_for_sending(
 /// 返回 `false` 时**状态不变**（还是 `queued` / `retryable`）：
 /// 本函数不替调用方做处置，因为「超时用完就转 failed」这句话属于
 /// 用户可见的语义，应该由它自己说清（带一句人话的原因）。
+///
+/// ## 认领即凭据（R50）
+///
+/// 认领写入 `owner_boot`，**所有**收尾函数（[`mark_succeeded`] / [`mark_retryable`] /
+/// [`mark_failed`] / [`mark_uncertain`]）都要求调用方把同一个 `boot_id` 带回来。
+/// 只按 `state = 'running'` 收尾意味着「谁先到谁改」：一条因租约过期被
+/// [`reclaim_stale_running`] 收成 `uncertain`、又被下一个发送器认领的行，
+/// 会被**前一个**发送器迟到的失败收成 `retryable`——而它可能刚刚真的发出去了。
 pub async fn claim_for_sending(
     pool: &SqlitePool,
     id: &str,
@@ -570,18 +604,29 @@ pub async fn fail_if_exhausted(
 }
 
 /// 发送成功（收到 250 终应答）。
-pub async fn mark_succeeded(pool: &SqlitePool, id: &str, now_ms: i64) -> AppResult<bool> {
+///
+/// `boot_id` 必须是**认领这一行的那个**发送器自己（见 [`claim_for_sending`]
+/// 的「认领即凭据」）；不是它的 `running` 行一律不碰，返回 `false`。
+pub async fn mark_succeeded(
+    pool: &SqlitePool,
+    id: &str,
+    boot_id: &str,
+    now_ms: i64,
+) -> AppResult<bool> {
     let result = sqlx::query!(
         r#"
         UPDATE send_queue
         SET state = 'succeeded',
             error_kind = NULL,
             error_message = NULL,
+            owner_boot = NULL,
+            started_at = NULL,
             updated_at = ?
-        WHERE id = ? AND state = 'running'
+        WHERE id = ? AND state = 'running' AND owner_boot IS ?
         "#,
         now_ms,
-        id
+        id,
+        boot_id
     )
     .execute(pool)
     .await
@@ -596,6 +641,7 @@ pub async fn mark_succeeded(pool: &SqlitePool, id: &str, now_ms: i64) -> AppResu
 pub async fn mark_retryable(
     pool: &SqlitePool,
     id: &str,
+    boot_id: &str,
     error_kind: &str,
     error_message: &str,
     now_ms: i64,
@@ -606,13 +652,16 @@ pub async fn mark_retryable(
         SET state = 'retryable',
             error_kind = ?,
             error_message = ?,
+            owner_boot = NULL,
+            started_at = NULL,
             updated_at = ?
-        WHERE id = ? AND state = 'running'
+        WHERE id = ? AND state = 'running' AND owner_boot IS ?
         "#,
         error_kind,
         error_message,
         now_ms,
-        id
+        id,
+        boot_id
     )
     .execute(pool)
     .await
@@ -625,6 +674,7 @@ pub async fn mark_retryable(
 pub async fn mark_failed(
     pool: &SqlitePool,
     id: &str,
+    boot_id: &str,
     error_kind: &str,
     error_message: &str,
     now_ms: i64,
@@ -635,13 +685,16 @@ pub async fn mark_failed(
         SET state = 'failed',
             error_kind = ?,
             error_message = ?,
+            owner_boot = NULL,
+            started_at = NULL,
             updated_at = ?
-        WHERE id = ? AND state = 'running'
+        WHERE id = ? AND state = 'running' AND owner_boot IS ?
         "#,
         error_kind,
         error_message,
         now_ms,
-        id
+        id,
+        boot_id
     )
     .execute(pool)
     .await
@@ -656,6 +709,7 @@ pub async fn mark_failed(
 pub async fn mark_uncertain(
     pool: &SqlitePool,
     id: &str,
+    boot_id: &str,
     error_kind: &str,
     error_message: &str,
     now_ms: i64,
@@ -666,13 +720,16 @@ pub async fn mark_uncertain(
         SET state = 'uncertain',
             error_kind = ?,
             error_message = ?,
+            owner_boot = NULL,
+            started_at = NULL,
             updated_at = ?
-        WHERE id = ? AND state = 'running'
+        WHERE id = ? AND state = 'running' AND owner_boot IS ?
         "#,
         error_kind,
         error_message,
         now_ms,
-        id
+        id,
+        boot_id
     )
     .execute(pool)
     .await
@@ -840,6 +897,11 @@ pub async fn retry_uncertain(pool: &SqlitePool, id: &str, now_ms: i64) -> AppRes
 ///
 /// 万一服务器其实已经收下了这封信，用户改完再发就变成两封——
 /// 所以**必须由用户确认**（前端弹二次确认，把这个风险说清楚）。
+///
+/// 定稿之后（`queued` / `running` / `succeeded` / `failed`）不能收回：
+/// 前三种的字节已经（或正在）发出去，撤回改内容等于让「发出去的」与
+/// 「库里留着的」变成两封信；`failed` 本来就可以直接改（[`save_draft`]），
+/// 不需要先变成草稿。
 pub async fn withdraw_to_draft(pool: &SqlitePool, id: &str, now_ms: i64) -> AppResult<bool> {
     // 这条用**运行时查询**而不是 `query!` 宏：宏需要一条离线缓存条目，
     // 而离线缓存是**整仓一起**生成的——开发过程中单独重生成会覆盖别人的。
@@ -870,6 +932,14 @@ pub async fn withdraw_to_draft(pool: &SqlitePool, id: &str, now_ms: i64) -> AppR
 // ===========================================================================
 // 编解码
 // ===========================================================================
+
+/// 幂等键落库时的样子：空串 → `NULL`。
+///
+/// 理由见 [`save_draft`] 的「幂等键的空串要写成 `NULL`」：部分唯一索引跳过空串，
+/// 写空串等于让这一行从去重里消失。
+fn idempotency_key_column(key: &str) -> Option<&str> {
+    (!key.is_empty()).then_some(key)
+}
 
 /// 把条目编码成 `envelope` 列的 JSON。
 ///

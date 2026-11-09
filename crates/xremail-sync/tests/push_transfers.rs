@@ -824,11 +824,23 @@ async fn resending_is_refused_when_message_id_is_missing() {
         OperationState::Uncertain,
         "结果不明就得落成 uncertain，不能当成功也不能当失败"
     );
-    // 这一条是"停止循环"的全部依据：`claim_for_push` 靠 `attempts < ?` 卡重发，
-    // 收尾时不自增 `attempts`，这一轮拒绝重发就等于白拒绝——下一轮照样再发一次 `COPY`。
+    // R26 的教训是「拒绝重发却不计次 = 白拒绝」，所以「这一轮**没有**命令飞出去」
+    // 与「这一轮**可能**飞出去了」必须分开看：
+    //
+    // * 这里查不到 `Message-ID`，`transfer_push` 于是**拒绝发任何命令**
+    //   （连 `UID SEARCH` 都不发，那条拒绝有 `copy_commands` 的直接证据）。
+    //   这一轮既没有 `COPY` 也没有任何别的写给服务器的命令，**不是一次尝试**，
+    //   所以 `attempts` 不动——计次只该落在「真可能执行过」的出口上。
+    //   以前这里 +1，代价是：一条「上一轮已经搬完、源端本地行被删掉」的操作
+    //   每轮同步都烧一次配额，五次之后被判成 `retry_exhausted`（见
+    //   `tests/transfer_recovery.rs`）。
+    // * 真发过 `COPY`、只是探测答不上来的那条路**照旧计次**，由
+    //   `tests/transfer_recovery.rs` 的
+    //   `an_unreachable_probe_after_a_real_copy_still_counts_as_an_attempt`
+    //   反证——那一条要是也免计次，R26 的病（每轮重发一份 `COPY`）就回来了。
     assert_eq!(
-        operation.attempts, 2,
-        "uncertain 必须计次（原本 1 次，这一轮 +1）"
+        operation.attempts, 1,
+        "这一轮一条命令都没发（没有任何要补充的疑点），不该算作一次尝试"
     );
 
     fixture.server.shutdown().await;

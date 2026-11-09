@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        INSERT INTO folder (\n            id, account_id, remote_name, remote_id, local_name, delimiter,\n            subscribed, selectable, last_sync_at, last_uid, highest_modseq, uidvalidity,\n            role\n        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n        ON CONFLICT (account_id, remote_name) DO UPDATE SET\n            remote_id      = excluded.remote_id,\n            local_name     = excluded.local_name,\n            delimiter      = excluded.delimiter,\n            subscribed     = excluded.subscribed,\n            selectable     = excluded.selectable,\n            last_sync_at   = excluded.last_sync_at,\n            -- `COALESCE(新值, 旧值)`：只有新值非空才推进游标，空值不得抹掉旧值。\n            last_uid       = COALESCE(excluded.last_uid, folder.last_uid),\n            highest_modseq = COALESCE(excluded.highest_modseq, folder.highest_modseq),\n            uidvalidity    = COALESCE(excluded.uidvalidity, folder.uidvalidity),\n            role           = excluded.role\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 13
+    },
+    "nullable": []
+  },
+  "hash": "f10352ebc414404c89adba37d3fe8543a095a527364e373d6381416e14821814"
+}

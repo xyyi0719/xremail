@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n        UPDATE send_queue\n        SET state = 'queued',\n            message_bytes = ?,\n            message_id = ?,\n            error_kind = NULL,\n            error_message = NULL,\n            updated_at = ?\n        WHERE id = ?\n          AND state IN ('draft', 'retryable', 'failed', 'uncertain')\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "6b5755e9f4611d29f9c60e87f09c8f9beb33b383e09f5ec198aa7c1d9fe95907"
+}

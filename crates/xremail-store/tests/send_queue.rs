@@ -319,7 +319,11 @@ async fn sending_walks_the_documented_state_machine() {
             .await
             .unwrap()
     );
-    assert!(send_queue::mark_succeeded(&pool, "s1", 3).await.unwrap());
+    assert!(
+        send_queue::mark_succeeded(&pool, "s1", "boot-a", 3)
+            .await
+            .unwrap()
+    );
 
     let back = send_queue::get_entry(&pool, "s1").await.unwrap().unwrap();
     assert_eq!(back.state, SendState::Succeeded);
@@ -367,7 +371,7 @@ async fn retryable_failure_can_be_claimed_again() {
         .await
         .unwrap();
     assert!(
-        send_queue::mark_retryable(&pool, "s1", "connection", "连不上", 3)
+        send_queue::mark_retryable(&pool, "s1", "boot-a", "connection", "连不上", 3)
             .await
             .unwrap()
     );
@@ -405,7 +409,7 @@ async fn uncertain_message_is_not_auto_retryable() {
         .await
         .unwrap();
     assert!(
-        send_queue::mark_uncertain(&pool, "s1", "no_reply", "没收到应答", 3)
+        send_queue::mark_uncertain(&pool, "s1", "boot-a", "no_reply", "没收到应答", 3)
             .await
             .unwrap()
     );
@@ -504,7 +508,7 @@ async fn user_can_explicitly_resend_an_uncertain_message_with_same_bytes() {
     send_queue::claim_for_sending(&pool, "s1", "boot-a", 2, MAX_SEND_ATTEMPTS)
         .await
         .unwrap();
-    send_queue::mark_uncertain(&pool, "s1", "no_reply", "没收到应答", 3)
+    send_queue::mark_uncertain(&pool, "s1", "boot-a", "no_reply", "没收到应答", 3)
         .await
         .unwrap();
 
@@ -536,14 +540,18 @@ async fn state_transitions_only_apply_to_the_state_they_come_from() {
             .await
             .unwrap()
     );
-    assert!(!send_queue::mark_succeeded(&pool, "s1", 1).await.unwrap());
     assert!(
-        !send_queue::mark_failed(&pool, "s1", "e", "m", 1)
+        !send_queue::mark_succeeded(&pool, "s1", "boot-a", 1)
             .await
             .unwrap()
     );
     assert!(
-        !send_queue::mark_uncertain(&pool, "s1", "e", "m", 1)
+        !send_queue::mark_failed(&pool, "s1", "boot-a", "e", "m", 1)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !send_queue::mark_uncertain(&pool, "s1", "boot-a", "e", "m", 1)
             .await
             .unwrap()
     );
@@ -668,7 +676,7 @@ async fn a_send_cannot_be_claimed_more_than_max_attempts_times() {
             round + 1
         );
         assert!(
-            send_queue::mark_retryable(&pool, "s1", "not_sent", "连不上", 20 + round)
+            send_queue::mark_retryable(&pool, "s1", "boot-a", "not_sent", "连不上", 20 + round)
                 .await
                 .unwrap()
         );
@@ -714,7 +722,7 @@ async fn an_exhausted_send_becomes_failed_with_an_explanation() {
                 .unwrap()
         );
         assert!(
-            send_queue::mark_retryable(&pool, "s1", "not_sent", "连不上", 20 + round)
+            send_queue::mark_retryable(&pool, "s1", "boot-a", "not_sent", "连不上", 20 + round)
                 .await
                 .unwrap()
         );
@@ -776,7 +784,7 @@ async fn fail_if_exhausted_leaves_other_states_alone() {
             .unwrap()
     );
     assert!(
-        send_queue::mark_retryable(&pool, "s1", "not_sent", "连不上", 3)
+        send_queue::mark_retryable(&pool, "s1", "boot-a", "not_sent", "连不上", 3)
             .await
             .unwrap()
     );
@@ -807,7 +815,7 @@ async fn fail_if_exhausted_leaves_other_states_alone() {
             .unwrap()
     );
     assert!(
-        send_queue::mark_uncertain(&pool, "s3", "no_reply", "没收到应答", 3)
+        send_queue::mark_uncertain(&pool, "s3", "boot-a", "no_reply", "没收到应答", 3)
             .await
             .unwrap()
     );
@@ -850,7 +858,7 @@ async fn an_exhausted_message_can_be_sent_again_after_the_user_edits_it() {
     // 认领之后有一条 `running`，先给它一个结局（这里选「可重试」），
     // 再按「上限 = 已经试过的次数」收盘——这正是调用点在认领失败之后做的事。
     assert!(
-        send_queue::mark_retryable(&pool, "s1", "not_sent", "连不上", 3)
+        send_queue::mark_retryable(&pool, "s1", "boot-a", "not_sent", "连不上", 3)
             .await
             .unwrap()
     );
@@ -905,5 +913,210 @@ async fn one_account_cannot_have_two_rows_with_the_same_idempotency_key() {
     assert!(
         !err.is_retryable(),
         "幂等键冲突是数据问题，不是可重试的临时故障：{err}"
+    );
+}
+
+// ===========================================================================
+// 认领即凭据 / 幂等键空串 / 改完再发（R50 / R51 / R52）
+// ===========================================================================
+
+#[tokio::test]
+async fn a_late_result_from_a_stale_claim_does_not_overwrite_the_new_claim() {
+    // 现场：发送器 A 认领了 s1 → 进程卡住（或只是很慢）→ 15 分钟租约到期，
+    // 对账把这条收成 `uncertain` → 用户确认「再发一次」，发送器 B 认领了同一行。
+    //
+    // 此时 A 迟到的失败回来了。若收尾只看 `state = 'running'`，它会把 B 正在
+    // 发出的那封信改成 `retryable`——而 B 那边可能刚刚真的投递出去了，
+    // 下一轮再发就是**重复投递**。认领凭据（`owner_boot`）就是为此而存在的：
+    // 不是 B 认领的行，A 一律改不动。
+    let pool = fresh_pool().await;
+    account::upsert_account(&pool, &sample_account("a1"))
+        .await
+        .unwrap();
+
+    let entry = draft("s1", "a1");
+    send_queue::save_draft(&pool, &entry).await.unwrap();
+    send_queue::queue_for_sending(&pool, "s1", b"bytes", "<m1@x>", 1)
+        .await
+        .unwrap();
+
+    let claimed_at = 1_000;
+    assert!(
+        send_queue::claim_for_sending(&pool, "s1", "boot-a", claimed_at, MAX_SEND_ATTEMPTS)
+            .await
+            .unwrap()
+    );
+
+    // 租约到期：收成 uncertain（这一段是 R48 已修好的部分）。
+    let reclaimed = send_queue::reclaim_stale_running(
+        &pool,
+        "a1",
+        "boot-a",
+        send_queue::RUNNING_LEASE_MS,
+        claimed_at + send_queue::RUNNING_LEASE_MS,
+    )
+    .await
+    .unwrap();
+    assert_eq!(reclaimed, 1);
+
+    // 用户确认后重发：B 认领。
+    assert!(
+        send_queue::retry_uncertain(&pool, "s1", claimed_at + 10)
+            .await
+            .unwrap(),
+        "用户显式重试：字节不变、Message-ID 不变"
+    );
+    assert!(
+        send_queue::claim_for_sending(&pool, "s1", "boot-b", claimed_at + 11, MAX_SEND_ATTEMPTS)
+            .await
+            .unwrap()
+    );
+
+    // A 迟到的结局：一条都不该落到 B 认领的行上。
+    assert!(
+        !send_queue::mark_retryable(&pool, "s1", "boot-a", "timeout", "A 迟到的失败", 20)
+            .await
+            .unwrap(),
+        "A 已经交还了租约，它迟到的结果不该再改这一行"
+    );
+    assert!(
+        !send_queue::mark_failed(&pool, "s1", "boot-a", "timeout", "A 迟到的失败", 21)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !send_queue::mark_uncertain(&pool, "s1", "boot-a", "timeout", "A 迟到的失败", 22)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !send_queue::mark_succeeded(&pool, "s1", "boot-a", 23)
+            .await
+            .unwrap(),
+        "A 说成功也不行：那条 250 应答属于 A 的那一次提交"
+    );
+
+    let back = send_queue::get_entry(&pool, "s1").await.unwrap().unwrap();
+    assert_eq!(
+        back.state,
+        SendState::Running,
+        "B 正在发的那行被 A 改了：状态 {:?}",
+        back.state
+    );
+    assert_eq!(back.attempts, 2, "A 的迟到结果不该动计数");
+
+    // B 自己的结局照常落库，而且收尾时把认领凭据交还了。
+    assert!(
+        send_queue::mark_succeeded(&pool, "s1", "boot-b", 30)
+            .await
+            .unwrap()
+    );
+    let owner: Option<String> =
+        sqlx::query_scalar("SELECT owner_boot FROM send_queue WHERE id = 's1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(owner, None, "收尾之后不该继续挂着认领凭据");
+    assert!(
+        !send_queue::reclaim_stale_running(
+            &pool,
+            "a1",
+            "boot-b",
+            send_queue::RUNNING_LEASE_MS,
+            1_000_000
+        )
+        .await
+        .unwrap()
+            > 0,
+        "已经收尾的行不该再被租约回收"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_idempotency_key_is_stored_as_null() {
+    // `idx_send_queue_idempotency` 是部分索引，`WHERE idempotency_key <> ''`——
+    // 空串根本不进索引。DAO 若照直写空串，「同一封逻辑邮件只能有一行」在
+    // 「没有键」这一档上就完全不设防（见 `schema_constraints.rs` 的 DB 层用例）。
+    let pool = fresh_pool().await;
+    account::upsert_account(&pool, &sample_account("a1"))
+        .await
+        .unwrap();
+
+    let mut entry = draft("s1", "a1");
+    entry.idempotency_key = String::new();
+    assert!(send_queue::save_draft(&pool, &entry).await.unwrap());
+
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT idempotency_key FROM send_queue WHERE id = 's1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, None, "空幂等键落库应当是 NULL");
+
+    // 读回来仍然是空串（领域模型用它表示「没有键」），往返不变形。
+    let back = send_queue::get_entry(&pool, "s1").await.unwrap().unwrap();
+    assert_eq!(back.idempotency_key, "");
+}
+
+#[tokio::test]
+async fn an_uncertain_message_can_be_queued_again_with_the_new_bytes() {
+    // 「结果未知」的信，用户唯一能做的正确的事就是**改内容再发**：
+    // `save_draft` 拒绝就地改（要改就另起一封），`retry_uncertain` 发的又是
+    // 冻结的**旧**字节。所以改完再发的落点是 `queue_for_sending`——
+    // 它若拒收 `uncertain`，用户看到的就是「已经进入发送队列，不能重复提交」，
+    // 而他改过的内容根本进不了队列。
+    let pool = fresh_pool().await;
+    account::upsert_account(&pool, &sample_account("a1"))
+        .await
+        .unwrap();
+
+    let entry = draft("s1", "a1");
+    send_queue::save_draft(&pool, &entry).await.unwrap();
+    send_queue::queue_for_sending(&pool, "s1", b"old bytes", "<m1@x>", 1)
+        .await
+        .unwrap();
+    assert!(
+        send_queue::claim_for_sending(&pool, "s1", "boot-a", 2, MAX_SEND_ATTEMPTS)
+            .await
+            .unwrap()
+    );
+    assert!(
+        send_queue::mark_uncertain(&pool, "s1", "boot-a", "no_reply", "没收到应答", 3)
+            .await
+            .unwrap()
+    );
+
+    let mut edited = draft("s1", "a1");
+    edited.subject = "改过的标题".to_string();
+    assert!(
+        !send_queue::save_draft(&pool, &edited).await.unwrap(),
+        "`uncertain` 不能就地改成草稿（服务器可能已经收下了旧内容）"
+    );
+
+    assert!(
+        send_queue::queue_for_sending(&pool, "s1", b"new bytes", "<m2@x>", 4)
+            .await
+            .unwrap(),
+        "改完再发必须能进队列"
+    );
+
+    let back = send_queue::get_entry(&pool, "s1").await.unwrap().unwrap();
+    assert_eq!(back.state, SendState::Queued);
+    assert_eq!(
+        back.message_bytes.as_deref(),
+        Some(&b"new bytes"[..]),
+        "发出去的必须是新内容"
+    );
+    assert_eq!(back.message_id.as_deref(), Some("<m2@x>"));
+    assert_eq!(
+        back.attempts, 1,
+        "旧内容用掉的次数不清零：新内容不会因此获得无限重试"
+    );
+    assert_eq!(back.error_kind, None, "上一轮「结果未知」的说明属于旧内容");
+
+    // 定稿之后仍然不能改内容（这条出口只对 uncertain 开）。
+    assert!(
+        !send_queue::save_draft(&pool, &edited).await.unwrap(),
+        "已经排队的信不该再被编辑"
     );
 }
