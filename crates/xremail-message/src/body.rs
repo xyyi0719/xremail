@@ -136,17 +136,21 @@ pub fn parse_message(raw: &[u8]) -> Result<ParsedMessage, MessageError> {
 
     // 附件元数据：只认 `Content-Disposition`，不看「内容看起来像不像文件」。
     // 有序遍历，保证 `part_number` 与 IMAP 的编号一致。
-    let top_is_multipart =
-        crate::mime::parse_content_type(headers.get("Content-Type")).is_multipart();
+    //
+    // 判据是「**整封是不是只有一个部件**」，而不是「顶层是不是 `multipart/*`」：
+    // 顶层是 `message/rfc822`（整封转发）时它同样是个容器，路径必须保留，
+    // 否则内嵌邮件里的每个附件都会塌成 `TEXT`，在库里互相顶掉
+    // （见 `attachment_meta` 的文档）。
     for (path, part) in &numbered {
         if parsed.attachments.len() >= MAX_ATTACHMENT_PARTS {
             break;
         }
+        let top_is_single_part = numbered.len() == 1 && path.is_empty();
         let size = i64::try_from(part.content.len()).unwrap_or(i64::MAX);
         if let Some(meta) = attachment_meta(
             &part.headers,
             Some(path.as_slice()),
-            top_is_multipart,
+            top_is_single_part,
             &part.content_type.mime_type,
             size,
             part.transfer_encoding.as_deref(),

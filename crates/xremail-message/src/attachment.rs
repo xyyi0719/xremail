@@ -70,10 +70,24 @@ fn to_part_number(path: &[usize]) -> String {
 ///
 /// `path` 是 `mime::split_parts_with_paths` 给出的相对路径（**不含**顶层那层，
 /// 但 `message/rfc822` 那层用 `0` 占位——见 `mime::EMBEDDED_MESSAGE`），
-/// `top_is_multipart` 说明顶层容器是 `multipart` 还是单个部件：
-/// * 顶层是 `multipart`：它自己占 1 号，于是 `[]` → `"1"`、`[2]` → `"1.2"`；
-/// * 顶层是单个部件：整封就是 1 号，记作 `"TEXT"`——它与 `BODY.PEEK[1]` 等价，
+/// `top_is_single_part` 说明**整封邮件是不是只有一个部件**：
+/// * 是：整封就是 1 号，记作 `"TEXT"`——它与 `BODY.PEEK[1]` 等价，
 ///   又不会撞上「`BODY.PEEK[0]` 只取结构」那个坑（见 `mime::TOP_LEVEL_PART`）。
+/// * 否（顶层是 `multipart`，或者顶层是内嵌着一整封邮件的 `message/rfc822`）：
+///   保留路径。`multipart` 自己占 1 号，于是 `[]` → `"1"`、`[2]` → `"1.2"`。
+///
+/// ## 为什么判据是「叶子自己有没有路径」而不是「顶层是不是 multipart」
+///
+/// 这里曾经用「顶层 `Content-Type` 是不是 `multipart/*`」决定要不要丢路径，
+/// 结果**顶层是 `message/rfc822`** 时（整封转发、邮件作为附件的那种形态）
+/// 判定为假，路径被整个清空，内嵌邮件里各个子部件的号**全部塌成 `TEXT`**。
+///
+/// 后果不只是编号难看：`xremail-sync` 的附件 id 是
+/// `{message_id}/{part_number}`，落库靠 `ON CONFLICT (message_id, part_key)`
+/// 去重。两个附件都叫 `TEXT` 就是同一个 key，它们会在库里**互相顶掉**。
+///
+/// 真正的判据应该是「这个叶子自己是不是整封的全部」——那正是 `path` 是否为空
+/// 所表达的东西：`collect_leaves` 对顶层单部件给出的就是空路径。
 ///
 /// `transfer_encoding` 原样记下来给下载侧用。
 ///
@@ -85,16 +99,17 @@ fn to_part_number(path: &[usize]) -> String {
 pub fn attachment_meta(
     headers: &HeaderMap,
     path: Option<&[usize]>,
-    top_is_multipart: bool,
+    top_is_single_part: bool,
     content_type: &str,
     size: i64,
     transfer_encoding: Option<&str>,
 ) -> Option<AttachmentMeta> {
-    // 顶层是单个部件：整封就是这一个，用 `TEXT`（空路径本来就表示这个）。
-    let path: &[usize] = if top_is_multipart {
-        path.unwrap_or(&[])
-    } else {
+    // 整封只有一个部件：路径本就该是空的，记作 `TEXT`。
+    // 否则**保留**调用方给的路径——包括顶层 `message/rfc822` 压出来的那个 `0`。
+    let path: &[usize] = if top_is_single_part {
         &[]
+    } else {
+        path.unwrap_or(&[])
     };
     let part_number = to_part_number(path);
     let disposition = headers.get("Content-Disposition");
@@ -551,10 +566,12 @@ mod tests {
             ("Content-ID", " <part1@example.com> "),
         ]);
 
+        // `top_is_single_part = false`：这封邮件有不止一个部件，
+        // 所以路径要保留、拼成 `1.2`（顶层 multipart 自己占 1 号）。
         let meta = attachment_meta(
             &h,
             Some(&[2]),
-            true,
+            false,
             "Application/PDF",
             1024,
             Some("Base64"),
