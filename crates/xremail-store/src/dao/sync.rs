@@ -188,7 +188,16 @@ pub async fn commit_folder_sync(
     Ok(deleted as usize)
 }
 
-/// 读一个文件夹的地址列（测试辅助）。
+/// 读一封邮件的地址列。
+///
+/// ## 当前**没有调用方**（2026-11-10 用 `scripts/find_unused_pub_fns.py` 查出）
+///
+/// 注释原本写「测试辅助」——**但测试里也没有用它**（`crates/xremail-store/tests/`
+/// 与 `apps/` 都搜不到）。`COMMIT_MESSAGE` 里的地址列由 `commit_folder_sync`
+/// 直接写入，读取方是 `message` 表的常规查询，不走这里。
+///
+/// 保留的理由：它是覆盖 `from_addr` / `to_addr` 两列的唯一读取入口，
+/// 将来若要核对「写进去的地址与读出来的一致」会用到。**别把它当活代码依赖。**
 pub async fn read_addresses(pool: &SqlitePool, id: &str) -> AppResult<(Vec<String>, Vec<String>)> {
     let row = sqlx::query!(
         r#"

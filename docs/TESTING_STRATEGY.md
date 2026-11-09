@@ -395,6 +395,35 @@ XREMAIL_PROPERTY_ROUNDS=2000000 cargo test -p xremail-core \
 后来给它单独定了 `rounds()/50`（下限 200）——它要证明的是「超限时会不会刹车」，
 几百轮就够。
 
+### 6.0.2 `pub` 函数没有调用方时，编译器不会告诉你
+
+`pub` 是给外部的承诺，所以 **`cargo clippy -D warnings` 对一个零调用的
+`pub fn` 一声不吭**。这类东西会一直藏着。
+
+`scripts/find_unused_pub_fns.py` 按文本找「除了定义行之外没有任何 `name(` 出现」
+的 `pub fn`：
+
+```bash
+python3 scripts/find_unused_pub_fns.py
+```
+
+**它是启发式的，不是证明**——会被「`use … as …` 重命名」「作为函数指针传走」
+「宏展开调用」骗到，输出是「值得看一眼的清单」，不是「可以删的清单」。
+
+**2026-11-10 用它查了一遍**，23 个命中里人工确认了 3 个**真·零调用**：
+
+| 函数 | 位置 | 原来的注释说 |
+|---|---|---|
+| `delete_messages_in_folder` | `xremail-store/src/dao/message.rs` | 「用于 epoch 切换」——**错**，epoch 切换走的是 `commit_folder_sync` 里**事务内**的按世代删除；这个是**全删**，语义不同且更危险 |
+| `read_addresses` | `xremail-store/src/dao/sync.rs` | 「测试辅助」——**测试里也没用** |
+| `imap_config_for` | `xremail-sync/src/sync.rs` | （无）——生产路径是先经连接器的，不经过它 |
+
+其余 20 个是误报（Tauri 宏注册的 command、re-export 的公开 API、只在错误字符串里出现的名字）。
+
+**处理方式：标注，不删除。** `pub` 是承诺，删掉可能打掉别人（或未来的自己）
+依赖的入口；这三处都加了注释写清「当前没有调用方」与保留的理由。
+**重点是不能让下一个人把它们当活代码依赖**——尤其是第一个，它的语义是「全删」。
+
 ### 6.1 真实邮箱验收：现在能做什么、还差什么
 
 `apps/shell/src-tauri/tests/real_mail_roundtrip.rs` 会**真的发一封邮件**出去，

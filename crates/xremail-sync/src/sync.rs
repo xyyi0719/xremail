@@ -275,6 +275,14 @@ async fn flush_pending(
 }
 
 /// 从账户配置构造 IMAP 连接参数。
+///
+/// ## 当前**没有调用方**（2026-11-10 用 `scripts/find_unused_pub_fns.py` 查出）
+///
+/// 生产路径里连接参数是 `xremail_sync::actor` 的连接器直接拼的
+/// （它还要带凭据、信任根、超时），不经过这里；测试也没用它。
+///
+/// 保留的理由：它把「账户配置 → `ImapConfig`」这条映射单独拎了出来，
+/// 不用拖进连接器的一堆依赖。**别把它当活代码依赖。**
 pub fn imap_config_for(account: &Account) -> ImapConfig {
     let mut config = ImapConfig::imaps(&account.server.imap_host);
     config.port = account.server.imap_port;
