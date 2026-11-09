@@ -757,6 +757,20 @@
   也不申请 Android 13+ 的运行时权限
 
 ### Changed
+- **清理未使用的依赖与清单声明，并用「未来的 stable」验证**（2026-11-10，R69）
+  - 用 `cargo +nightly clippy`（比 stable 新 2 个版本）**模拟未来的 stable**，
+    一次暴露 13 个警告——这正是「某天 CI 突然变红、且不可复现」的具体形态
+  - 修掉其中可行动的：
+    - `xremail-crypto` 未使用 `xremail-core`、`xremail-testkit` 未使用 `xremail-core` 与 `tracing`
+      （已核实代码与测试都没用到，也没有 re-export）
+    - 根 `Cargo.toml` 的 `anyhow` 声明**没有任何 crate 使用**（代码里零引用）
+    - `encoding_rs` 在 `xremail-message` 里用版本号直接声明、没走 workspace，已统一
+    - `[workspace.package]` 的 `repository` **没有任何 crate 继承**，已给 11 个 crate 补上
+    - 一处 `.map_or_else(|| (), |v| panic!(…))` 被 `unnecessary_lazy_evaluations` 点名，改成 `if let`
+  - **结果：nightly 下从 13 个警告降到 1 个**，剩下那个是 `xremail-crypto` 被标「未使用」——
+    那是预期的（它服务 P6/L2，当前没有调用方），已在 `Cargo.toml` 里写明理由
+  - **没改** `rust-toolchain.toml` 的 `channel = "stable"`：钉死会让安全更新变慢，
+    不钉死就每年要处理一两次工具链升级——这是个需要人来做的决定
 - **文档与代码对齐**（2026-11-02）：一次全量审计，把文档里**与实际代码不符**的表述改掉。
   审计的标准是「文档说的能不能在代码里找到对应的东西」，不是「读起来顺不顺」
   - **README**：技术栈表改成**实际用的**——原生 CSS、React 内置 `state`、自写 `contentEditable`、

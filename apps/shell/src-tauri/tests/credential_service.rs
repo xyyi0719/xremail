@@ -725,11 +725,14 @@ async fn the_platform_default_store_never_silently_degrades() {
                 .expect("删除不该报错")
                 .then_some(())
                 .expect("刚写进去的条目必须删得掉");
-            store
-                .get(&secret_ref)
-                .await
-                .expect("删完再读不该报错")
-                .map_or_else(|| (), |value| panic!("删掉了却还能读出来：{value:?}"));
+            // 删完之后必须真的读不到。用 `if let` 而不是
+            // `.map_or_else(|| (), |v| panic!(…))` 或 `.map(|v| panic!(…))`：
+            // 后两种都是「为了副作用而套 Option 组合子」，
+            // clippy 会（正确地）报 `unnecessary_lazy_evaluations` / `option_map_unit_fn`。
+            let after_delete = store.get(&secret_ref).await.expect("删完再读不该报错");
+            if let Some(value) = after_delete {
+                panic!("删掉了却还能读出来：{value:?}");
+            }
         }
         // 没有守护进程（CI / 无头机器）：必须**明确**报「不可用」。
         Err(error) => {

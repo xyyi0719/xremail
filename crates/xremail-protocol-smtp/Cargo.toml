@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [dependencies]
 # 认证载荷（明文 + base64）用完即清零，别残留在堆里等被换出。

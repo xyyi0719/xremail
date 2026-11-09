@@ -6,11 +6,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [dependencies]
-xremail-core = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 
 # 假 SMTP 服务器要解析 AUTH PLAIN / AUTH LOGIN 的 base64 载荷。
 base64 = { workspace = true }

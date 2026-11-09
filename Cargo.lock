@@ -6277,7 +6277,6 @@ dependencies = [
  "rand 0.9.5",
  "serde",
  "thiserror 2.0.21",
- "xremail-core",
  "zeroize",
 ]
 
@@ -6428,8 +6427,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
- "tracing",
- "xremail-core",
 ]
 
 [[package]]

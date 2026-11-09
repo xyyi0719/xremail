@@ -36,6 +36,10 @@ repository = "https://github.com/xyyi0719/xremail"
 [workspace.dependencies]
 xremail-core = { path = "crates/xremail-core" }
 xremail-store = { path = "crates/xremail-store" }
+# **当前没有任何 crate 依赖它**——它服务的是 P6 的 L2（端到端加密同步），
+# 见 ARCHITECTURE §8。`xremail-api` 的 L2 契约与 `xremail-crypto` 的密文封装
+# 都已就位并有测试，只是还没有调用方。`cargo +nightly clippy` 会报
+# 「unused workspace dependency」——那是**预期**的，不是缺陷。
 xremail-crypto = { path = "crates/xremail-crypto" }
 xremail-api = { path = "crates/xremail-api" }
 xremail-sync = { path = "crates/xremail-sync" }
@@ -45,7 +49,6 @@ xremail-message = { path = "crates/xremail-message" }
 xremail-dkim = { path = "crates/xremail-dkim" }
 xremail-testkit = { path = "crates/xremail-testkit" }
 
-anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

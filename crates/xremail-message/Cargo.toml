@@ -6,12 +6,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+repository.workspace = true
 
 [dependencies]
 xremail-core = { workspace = true }
 # 字符集解码：覆盖 UTF-8 / GBK / GB18030 / Big5 / ISO-8859-* 等。
 # encoding_rs 是 WHATWG Encoding Standard 的 Rust 实现。
-encoding_rs = "0.8"
+encoding_rs = { workspace = true }
 # MIME 的 base64 传输编码。
 base64 = "0.22"
 thiserror = { workspace = true }
