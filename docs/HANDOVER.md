@@ -219,6 +219,7 @@ env -u DBUS_SESSION_BUS_ADDRESS cargo test --workspace -j 4 --no-fail-fast
 | 真钥匙串往返 | `XREMAIL_SECRET_SERVICE_PROBE=1 dbus-run-session -- <测试二进制>` | `gnome-keyring-daemon` |
 | 某个偶发失败到底修没修好 | `python3 scripts/ci_failure_rate.py --job "Rust (windows" --limit 30` | `gh` 已登录 |
 | 解析器改完之后专项扫一遍 | `XREMAIL_PROPERTY_ROUNDS=2000000 cargo test -p <crate> --test <文件> --release` | 无（十几秒） |
+| **依赖有没有已知漏洞** | `python3 scripts/security_audit.py` | `cargo-audit`、`gh` 已登录 |
 | 真实邮箱收发 | 先 `python3 scripts/precheck_real_mail.py` 预检，再 `cargo test --test real_mail_roundtrip -- --ignored` | `~/.xremail/accounts.txt`（**在仓库之外**；`.gitignore` 没覆盖这个名字，靠"不在仓库里"保证安全） |
 
 > **一个真踩过的坑**：`verify_linux_runtime.py` 会比对「库里跑出来的迁移条数」

@@ -6,7 +6,19 @@
 
 ## [Unreleased]
 
-### Added
+### Security
+- **修掉两个生产路径上的依赖漏洞，并把依赖审计变成常规动作**（2026-11-10，R70）
+  - 仓库此前**没有任何依赖审计手段**。第一次跑 `cargo-audit` 就报 **3 个漏洞 + 8 个未维护警告**，
+    其中两个在**生产路径**上：
+    - `ctutils`：在 `xremail-crypto` 的 argon2 / chacha20poly1305 依赖链里，
+      掩码生成与 `u128` 比较**不是常数时间** → 升级 0.4.3 → **0.4.8**
+    - `tokio`：`Interval` 在 1.54.0 有竞态，影响所有异步代码与调度器 → 升级 1.54.0 → **1.54.1**
+  - **3 个漏洞降到 1 个**；stable 下 fmt / clippy / 1144 条测试全绿
+  - 新增 `scripts/security_audit.py`：本机 `git` 到 GitHub 不稳，脚本在拉库失败时改用
+    `gh api` 下 tarball 并整理成 `cargo audit --db` 能接受的形式（要 git 仓库且要有 `origin` remote）；
+    输出会打出每个受影响的 crate **处在依赖树的什么位置**，而不只是列清单
+  - **残余 1 个**：`libsqlite3-sys 0.37.0` 受 CVE-2026-119375 影响，**没有可用补丁**
+    （`sqlx 0.9.0` 已是最新）。可达性低（数据库路径固定、攻击是本地且需用户操作），但**不是零**，已记录
 - **找出「零调用方的 `pub` 函数」的工具**（2026-11-10，`scripts/find_unused_pub_fns.py`）
   - `pub` 是给外部的承诺，所以编译器**不会**为零调用的 `pub fn` 报 `dead_code`——
     `cargo clippy -D warnings` 一声不吭，这类东西会一直藏着
