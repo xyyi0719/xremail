@@ -184,6 +184,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 | [docs/ISSUES_AND_RISKS.md](docs/ISSUES_AND_RISKS.md) | 风险登记册、旧审查纠错、关闭条件 |
 | [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md) | 本机 shell / 代理 / DNS / 工具链限制，各平台 WebView 与 API 差异 |
 | [docs/adr/](docs/adr/) | 架构决策记录（ADR）：为什么选 Tauri、为什么先做 L1、Gmail 怎么处理 |
+| [docs/HANDOVER.md](docs/HANDOVER.md) | **接手前先读这个**：当前状态、哪些话不能信、还差什么 |
 | [CHANGELOG.md](CHANGELOG.md) | 变更日志 |
 
 ---
