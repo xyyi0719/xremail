@@ -220,11 +220,52 @@ async fn examine_inner(session: &mut Session, mailbox: &str) -> Result<MailboxIn
 ///
 /// 与 async-imap 的同名方法不同：**服务器回 `NO` / `BAD` 时一定返回错误**。
 ///
+/// ## 自带超时
+///
+/// 超时用默认值（[`DEFAULT_COMMAND_TIMEOUT`]）。这一点与 [`examine_checked`]
+/// 是同一个道理，而且**更容易被忘掉**：本函数的读循环是裸的
+/// `session.read_response().await`，async-imap 也**没有**命令超时——
+/// 服务器收了命令却不回话（半死连接、中间设备吞包）时它会**永久挂住**。
+///
+/// 之前的提法是「超时由调用方自己包」。那在 `xremail-sync` 里做到了
+/// （`net.rs` 的 `run_checked_with_timeout`），但**别处漏了**：
+/// `apps/shell/src-tauri/src/service/sent_copy.rs` 的两处裸调用就没有包，
+/// 于是「发信后找已发送副本」这一步在坏网络上会一直转圈（R46）。
+/// 把默认超时收进本函数，裸调用也不会再挂死；要自定义时长的调用方用
+/// [`run_checked_with_timeout`]。
+///
 /// ```
 /// # use xremail_protocol_imap::command::run_checked;
 /// # async fn demo() {}
 /// ```
 pub async fn run_checked(
+    session: &mut Session,
+    command: &str,
+) -> Result<CommandOutcome, ProtocolError> {
+    run_checked_with_timeout(session, command, DEFAULT_COMMAND_TIMEOUT).await
+}
+
+/// 同 [`run_checked`]，但用**调用方给的**超时。
+///
+/// 同步引擎按账户自己的 `command_timeout` 调这个；诊断工具想要更长的窗口也可以。
+pub async fn run_checked_with_timeout(
+    session: &mut Session,
+    command: &str,
+    timeout: Duration,
+) -> Result<CommandOutcome, ProtocolError> {
+    match tokio::time::timeout(timeout, run_checked_inner(session, command)).await {
+        Ok(result) => result,
+        Err(_) => Err(ProtocolError::Timeout(format!(
+            "命令超时（{timeout:?}）: {command}"
+        ))),
+    }
+}
+
+/// [`run_checked`] 的实际调用（**不带**超时）。
+///
+/// 单独拆出来是为了让超时的处置只有一处：下面的循环只负责解析，
+/// 不关心时间。直接调它就会绕过超时保护，所以它是模块私有的。
+async fn run_checked_inner(
     session: &mut Session,
     command: &str,
 ) -> Result<CommandOutcome, ProtocolError> {

@@ -45,12 +45,14 @@
 //! 后果是「已发送」里多一封同样的信——**难看，但不丢数据、也不会重复发给收件人**。
 //! 真要更稳，就得在补之前等一小会儿再查一次。
 
+use std::time::Duration;
+
 use xremail_api::SecretValue;
 use xremail_core::model::Account;
 use xremail_core::{AppError, AppResult};
 use xremail_protocol_imap::{
-    AppendOptions, ImapConfig, Session, TlsTrust, append_message, connect_and_login_with,
-    examine_checked, list_folders, run_checked,
+    AppendOptions, DEFAULT_COMMAND_TIMEOUT, ImapConfig, Session, TlsTrust, append_message,
+    connect_and_login_with, examine_checked_with_timeout, list_folders, run_checked_with_timeout,
 };
 
 /// 存副本的结果。
@@ -96,6 +98,13 @@ pub struct SentCopyService {
     lookback: u32,
     /// 补副本之前等多久再查（毫秒）。
     settle_ms: u64,
+    /// 每条 IMAP 命令的超时。
+    ///
+    /// 有一条**必须交代的现实**（R46）：`run_checked` 的读循环是裸的
+    /// `read_response().await`，async-imap 也没有命令超时。服务器收了命令
+    /// 却不回话时，没有超时就会**永久挂住**——用户看到的是写信面板上
+    /// 永远的「正在发送」。所以这里每条命令都过超时。
+    command_timeout: Duration,
 }
 
 impl SentCopyService {
@@ -105,7 +114,14 @@ impl SentCopyService {
             trust,
             lookback: LOOKBACK,
             settle_ms: SETTLE_MS,
+            command_timeout: DEFAULT_COMMAND_TIMEOUT,
         }
+    }
+
+    /// 改命令超时（**给测试用**：默认 30 秒，用例里要短到能等）。
+    pub fn with_command_timeout(mut self, timeout: Duration) -> Self {
+        self.command_timeout = timeout;
+        self
     }
 
     /// 改「补副本前等多久」（**给测试用**：`0` = 不等）。
@@ -247,9 +263,12 @@ impl SentCopyService {
         }
 
         let start = max_uid.saturating_sub(self.lookback - 1).max(1);
-        let outcome = run_checked(
+        // 显式带超时（R46）：`run_checked` 现在自带默认超时，但这里写明时长，
+        // 让「这一步会挂」这件事在代码里是显式的，而不是靠记住默认值。
+        let outcome = run_checked_with_timeout(
             session,
             &format!("UID FETCH {start}:{max_uid} (BODY.PEEK[HEADER])"),
+            self.command_timeout,
         )
         .await
         .map_err(|e| AppError::Protocol(format!("读「已发送」失败: {e}")))?;
@@ -266,7 +285,7 @@ impl SentCopyService {
     /// 先看 `EXAMINE` 报的 `UIDNEXT`（减一就是最大的 UID）；
     /// 有些服务器不报这个，那就退一步用 `UID FETCH 1:* (UID)` 自己数。
     async fn max_uid(&self, session: &mut Session, raw_name: &str) -> AppResult<u32> {
-        let info = examine_checked(session, raw_name)
+        let info = examine_checked_with_timeout(session, raw_name, self.command_timeout)
             .await
             .map_err(|e| AppError::Protocol(format!("打开「已发送」失败: {e}")))?;
 
@@ -274,9 +293,10 @@ impl SentCopyService {
             return Ok(next.saturating_sub(1));
         }
 
-        let outcome = run_checked(session, "UID FETCH 1:* (UID)")
-            .await
-            .map_err(|e| AppError::Protocol(format!("读「已发送」失败: {e}")))?;
+        let outcome =
+            run_checked_with_timeout(session, "UID FETCH 1:* (UID)", self.command_timeout)
+                .await
+                .map_err(|e| AppError::Protocol(format!("读「已发送」失败: {e}")))?;
         Ok(outcome
             .fetches()
             .iter()

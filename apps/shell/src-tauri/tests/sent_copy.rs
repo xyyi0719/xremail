@@ -8,15 +8,44 @@
 //! 不依赖真实邮箱、凭据、网络或本机绝对路径
 //! （见 [TESTING_STRATEGY §5.2](../../../../docs/TESTING_STRATEGY.md)）。
 
+use std::time::{Duration, Instant};
+
 use xremail_api::{NewAccountRequest, SecretValue};
 use xremail_core::model::{Account, ProviderKind, SmtpAuth, SyncMode, TlsMode};
 use xremail_protocol_imap::TlsTrust as ImapTlsTrust;
 use xremail_shell_lib::service::account::AccountService;
 use xremail_shell_lib::service::sent_copy::{SentCopyOutcome, SentCopyService};
-use xremail_testkit::{FakeImapServer, MailboxFixture, MessageFixture, ServerConfig};
+use xremail_testkit::{FakeImapServer, Fault, MailboxFixture, MessageFixture, ServerConfig};
 
 const USER: &str = "user@163.com";
 const PASSWORD: &str = "imap-auth-code";
+
+/// 在内存库里建一个指向假服务器的账户（两处套件共用）。
+async fn account(imap: &FakeImapServer) -> Account {
+    let pool = xremail_store::open_pool_in_memory(&xremail_store::PoolConfig::default())
+        .await
+        .expect("打开内存库失败");
+    xremail_store::migrate(&pool).await.expect("应用迁移失败");
+
+    AccountService::new(pool)
+        .create(NewAccountRequest {
+            email: USER.to_string(),
+            provider: ProviderKind::Netease163,
+            display_name: None,
+            imap_host: imap.host().to_string(),
+            imap_port: imap.port(),
+            imap_tls: TlsMode::Implicit,
+            smtp_host: "smtp.163.com".to_string(),
+            smtp_port: 465,
+            smtp_tls: TlsMode::Implicit,
+            smtp_auth: SmtpAuth::Login,
+            username: USER.to_string(),
+            sync_mode: SyncMode::Poll,
+            poll_interval_secs: 300,
+        })
+        .await
+        .expect("建账户失败")
+}
 
 /// 一套「假 IMAP 服务器 + 账户 + 凭据」。
 struct Fixture {
@@ -49,30 +78,7 @@ impl Fixture {
         .await
         .expect("假 IMAP 服务器启动失败");
 
-        let pool = xremail_store::open_pool_in_memory(&xremail_store::PoolConfig::default())
-            .await
-            .expect("打开内存库失败");
-        xremail_store::migrate(&pool).await.expect("应用迁移失败");
-
-        let accounts = AccountService::new(pool);
-        let account = accounts
-            .create(NewAccountRequest {
-                email: USER.to_string(),
-                provider: ProviderKind::Netease163,
-                display_name: None,
-                imap_host: imap.host().to_string(),
-                imap_port: imap.port(),
-                imap_tls: TlsMode::Implicit,
-                smtp_host: "smtp.163.com".to_string(),
-                smtp_port: 465,
-                smtp_tls: TlsMode::Implicit,
-                smtp_auth: SmtpAuth::Login,
-                username: USER.to_string(),
-                sync_mode: SyncMode::Poll,
-                poll_interval_secs: 300,
-            })
-            .await
-            .expect("建账户失败");
+        let account = account(&imap).await;
 
         Self {
             imap,
@@ -82,6 +88,30 @@ impl Fixture {
     }
 
     /// 造一个信任假服务器自签 CA 的服务。
+    /// 造一套**带故障注入**的套件（R46 的用例要服务器「收下命令但不回话」）。
+    async fn with_faults(faults: Vec<Fault>) -> Self {
+        let mut sent = MailboxFixture::new("已发送").with_attribute("\\Sent");
+        sent = sent.with_message(message_with_id(1, "<already@example.com>"));
+
+        let imap = FakeImapServer::start(ServerConfig {
+            user: USER.to_string(),
+            password: PASSWORD.to_string(),
+            mailboxes: vec![MailboxFixture::new("INBOX"), sent],
+            faults,
+            ..ServerConfig::default()
+        })
+        .await
+        .expect("假 IMAP 服务器启动失败");
+
+        let account = account(&imap).await;
+        let credential = SecretValue::from_str_lossless(PASSWORD);
+        Self {
+            imap,
+            account,
+            credential,
+        }
+    }
+
     fn service(&self) -> SentCopyService {
         // 等待时间设 0：这些用例要的是逻辑，不是等待。
         SentCopyService::new(ImapTlsTrust::Roots(self.imap.root_store())).with_settle(0)
@@ -202,4 +232,50 @@ async fn a_missing_message_id_never_triggers_an_append() {
         "报错要说清为什么不动：{error}"
     );
     assert!(fixture.sent_messages().is_empty(), "不该补出没头没尾的一份");
+}
+
+/// **R46**：服务器收下 `UID FETCH` 却不回话时，必须在超时内返回错误，
+/// **不能永久挂住**。
+///
+/// 这条以前会挂死：`sent_copy` 里那两处 `run_checked` 是裸调用，
+/// 而 `run_checked` 内部的读循环没有超时、async-imap 也没有命令超时。
+/// 用户在写信面板上看到的就是永远的「正在发送」。
+///
+/// 不止断言「返回了错误」，还断言**它回得够快**——只断言错误的话，
+/// 一个「等 30 秒再失败」的实现也会过，而那对用户和挂死差别不大。
+#[tokio::test]
+async fn a_server_that_never_answers_does_not_hang_the_sent_copy_check() {
+    // 服务器收到 `EXAMINE`（「查已发送」的第一步）就不回话——半死连接的样子。
+    //
+    // 为什么不用 `HangOn("FETCH")`：假服务器**总是**在 `EXAMINE` 的
+    // `[UIDNEXT]` 里给值，于是 `max_uid` 走的是捷径、根本不会发 `UID FETCH`，
+    // 那条分支在这套夹具下**不可达**（我试过，用例照样绿，说明它没打到点上）。
+    // 换 `EXAMINE` 才真正踩到「发出去没人应」。
+    let fixture = Fixture::with_faults(vec![Fault::HangOn("EXAMINE".to_string())]).await;
+    // 超时调短：用例要的是「有界」，不是等满 30 秒。
+    let service = SentCopyService::new(ImapTlsTrust::Roots(fixture.imap.root_store()))
+        .with_settle(0)
+        .with_command_timeout(Duration::from_millis(300));
+
+    let started = Instant::now();
+    let result = service
+        .ensure_sent_copy(
+            &fixture.account,
+            &fixture.credential,
+            "<new@example.com>",
+            b"Subject: hi\r\n\r\nbody\r\n",
+        )
+        .await;
+    let elapsed = started.elapsed();
+
+    let error = result.expect_err("服务器不回话时必须报错，不能当成成功");
+    let text = error.to_string();
+    assert!(
+        text.contains("超时") || text.contains("timeout"),
+        "错误里应当说清是超时：{text}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "必须在超时后立刻返回，实际用了 {elapsed:?}"
+    );
 }
