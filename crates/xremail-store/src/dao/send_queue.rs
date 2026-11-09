@@ -728,6 +728,76 @@ pub async fn reclaim_running(
     Ok(result.rows_affected() as usize)
 }
 
+/// 发信队列的 `running` 租约长度（毫秒）。
+///
+/// 与 [`crate::dao::operation::RUNNING_LEASE_MS`] 同一个数（15 分钟）、同一个理由：
+/// 这个值只是「怎么算太久了」的一个宽松上界，不是精度要求。
+///
+/// 比 `mail_operation` 那边更宽松也不影响正确性：租约只决定「什么时候认为
+/// 这次认领已经没人管了」，判早了会把**还在发**的信误判成结果未知（那是更糟的
+/// 错误——用户会看到「不确定」而实际上信可能正在发）。15 分钟远大于一次 SMTP
+/// 提交的任何合理耗时（命令超时是 30 秒），所以只会收真正的残骸。
+pub const RUNNING_LEASE_MS: i64 = 15 * 60 * 1000;
+
+/// 回收**本进程**认领后卡住的 `send_queue` 行（R32 的发信侧）。
+///
+/// ## 为什么发信也需要这个
+///
+/// [`reclaim_running`] 只收「**不是本 boot** 留下的」行。本进程自己认领之后、
+/// 写终态之前如果 `?` 早退（`require_account`、读附件、取草稿字节……都在
+/// `claim_for_sending` 与终态写入之间）或 panic，那条行就停在 `running`
+/// 且 `owner_boot` 等于本进程——`reclaim_running` 不管它（那是「我的」），
+/// `claim_for_sending` 也拒绝它（`state IN ('queued','retryable')`），
+/// 于是**在本次进程的整个生命周期里**这封信再也发不出去，界面只显示
+/// 「正在发送」，用户只能重启应用。
+///
+/// ## 收成 `uncertain` 而不是重排
+///
+/// 命令可能已经到了服务器（`DATA` 已经发出去、只是终态没写下来）。
+/// 重排会让它**再发一封**；判成 `uncertain` 则交给用户决定（与 DATA 后
+/// 丢应答那一套语义一致，见 ARCHITECTURE §5）。宁可让用户手工确认一次，
+/// 也不要替他发第二封。
+///
+/// ## 判据为什么写成 `started_at <= ?`
+///
+/// 与 `operation::reclaim_stale_running` 同一个坑：`sqlx::query!` 会把
+/// `INTEGER` 列的类型放宽成 `REAL`，写成 `started_at < now - lease` 时
+/// 边界那一毫秒判不出来。必须在 SQL 里化简成与一个已算好的值比较。
+pub async fn reclaim_stale_running(
+    pool: &SqlitePool,
+    account_id: &str,
+    boot_id: &str,
+    lease_ms: i64,
+    now_ms: i64,
+) -> AppResult<usize> {
+    let result = sqlx::query!(
+        r#"
+        UPDATE send_queue
+        SET state = 'uncertain',
+            error_kind = 'lease_expired',
+            error_message = ?,
+            owner_boot = NULL,
+            started_at = NULL,
+            updated_at = ?
+        WHERE account_id = ?
+          AND state = 'running'
+          AND owner_boot = ?
+          AND started_at IS NOT NULL
+          AND started_at <= ?
+        "#,
+        "发送开始后长时间没有结果，按结果未知处理（可能进程中断在写终态之前）。请先到「已发送」或对方那里确认这封信到底发出去没有，再决定怎么办",
+        now_ms,
+        account_id,
+        boot_id,
+        now_ms - lease_ms
+    )
+    .execute(pool)
+    .await
+    .map_err(|e| map_sqlx(e, "reclaim_stale_running"))?;
+
+    Ok(result.rows_affected() as usize)
+}
+
 /// 用户**显式**决定再发一次：`uncertain` → `queued`。
 ///
 /// 字节不变，所以 `Message-ID` 不变——对端能认出这是同一封，

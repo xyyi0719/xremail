@@ -419,6 +419,84 @@ async fn an_operation_left_running_in_the_send_queue_becomes_uncertain() {
     );
 }
 
+/// **本进程**认领了发信、却在写终态之前早退/panic 的那条行，租约到期后要能收掉。
+///
+/// 这是审计查出来的一个缺口（R32 的发信侧）：`reclaim_running` 只收
+/// 「**不是本 boot** 留下的」行，而 `claim_for_sending` 又拒绝 `running`。
+/// 于是本进程认领后卡住的那封信**在本次进程的整个生命周期里**再也发不出去，
+/// 界面只显示「正在发送」，用户只能重启应用。
+///
+/// 收成 `uncertain` 而不是重排：`DATA` 可能已经送达，重排等于让人收到两封。
+#[tokio::test]
+async fn a_send_claimed_by_this_process_is_reclaimed_after_its_lease() {
+    let pool = store().await;
+    let entry = SendQueueEntry {
+        id: "s-lease".to_string(),
+        account_id: "acct-1".to_string(),
+        from: "tester@example.com".to_string(),
+        to: vec!["friend@example.com".to_string()],
+        cc: Vec::new(),
+        bcc: Vec::new(),
+        subject: "租约".to_string(),
+        body_text: Some("正文".to_string()),
+        body_html: None,
+        attachments: Vec::new(),
+        in_reply_to: None,
+        references: None,
+        state: SendState::Draft,
+        idempotency_key: "key-s-lease".to_string(),
+        message_bytes: None,
+        message_id: None,
+        attempts: 0,
+        error_kind: None,
+        error_message: None,
+        created_at: 0,
+        updated_at: 0,
+    };
+    send_queue_dao::save_draft(&pool, &entry).await.unwrap();
+    send_queue_dao::queue_for_sending(&pool, "s-lease", b"bytes", "<m-lease@x>", 1)
+        .await
+        .unwrap();
+
+    // 本进程（boot-a）在 t=1000 认领。
+    send_queue_dao::claim_for_sending(
+        &pool,
+        "s-lease",
+        "boot-a",
+        1_000,
+        send_queue_dao::MAX_SEND_ATTEMPTS,
+    )
+    .await
+    .unwrap();
+
+    // 同一个 boot 来对账，但**还没到租约**——不能动它（可能真的还在发）。
+    let early = reconcile_account_as(&pool, "acct-1", "boot-a", 2_000)
+        .await
+        .expect("对账应当成功");
+    assert_eq!(
+        early.reclaimed_stale_sends, 0,
+        "租约之内不动：这封信可能正在发"
+    );
+
+    // 过了租约，同一 boot 再对账：必须收成 uncertain。
+    let later = 1_000 + send_queue_dao::RUNNING_LEASE_MS + 1;
+    let report = reconcile_account_as(&pool, "acct-1", "boot-a", later)
+        .await
+        .expect("对账应当成功");
+    assert_eq!(report.reclaimed_stale_sends, 1, "过了租约就要收掉");
+
+    let back = send_queue_dao::get_entry(&pool, "s-lease")
+        .await
+        .unwrap()
+        .expect("条目应当还在");
+    assert_eq!(
+        back.state,
+        SendState::Uncertain,
+        "收成「不知道」而不是重排——DATA 可能已经送达，重排等于让人收到两封"
+    );
+    assert_eq!(back.error_kind.as_deref(), Some("lease_expired"));
+}
+
 #[tokio::test]
 async fn an_operation_on_a_deleted_folder_is_failed() {
     let pool = store().await;

@@ -248,6 +248,8 @@ fn init_storage(app: &tauri::AppHandle) -> Result<AppState, Box<dyn std::error::
                         account = %account.email,
                         reclaimed_operations = report.reclaimed_operations,
                         reclaimed_sends = report.reclaimed_sends,
+                        reclaimed_stale = report.reclaimed_stale,
+                        reclaimed_stale_sends = report.reclaimed_stale_sends,
                         expired = report.expired,
                         quarantined = report.quarantined,
                         failed_orphans = report.failed_orphans,

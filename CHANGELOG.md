@@ -560,6 +560,15 @@
   用于测非 UTF-8 编码（GBK 正文）
 
 ### Fixed
+- **发信队列的 `running` 补上租约：本进程卡住的那封信不再永远发不出去**（2026-11-09，R48）
+  - 这是第 9 轮审计交回、第 10 轮核实的一条真实缺口。R32 给 `mail_operation` 补了
+    「本进程认领 + 超时租约 → 收成 `uncertain`」，但**发信侧漏了同样的半边**：
+    `send_queue` 只有按 `owner_boot` 的 `reclaim_running`（只收别个进程留下的），
+    而 `claim_for_sending` 又拒绝 `running`
+  - 后果：本进程在认领与写终态之间 `?` 早退或 panic，那封信**在本次进程里再也发不出去**，
+    界面只显示「正在发送」，用户只能重启
+  - 修法与 R32 对称；收成 `uncertain` 而不是重排——DATA 可能已经送达，重排等于让人收到两封
+  - 变异测试：撤销修复 → 用例立刻变红
 - **构建环境的两个只读 `$HOME` 障碍**（不是产品缺陷，记下来免得下一个人再踩）
   - Gradle wrapper 连自己的锁文件都建不了：`java.io.FileNotFoundException:
     /home/xl/.gradle/wrapper/dists/gradle-9.6.1-bin/…/gradle-9.6.1-bin.zip.lck (只读文件系统)`

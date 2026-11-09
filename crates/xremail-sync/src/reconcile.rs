@@ -125,8 +125,15 @@ pub enum ReconcileDecision {
 pub struct ReconcileReport {
     /// 收成 `uncertain` 的残骸操作数。
     pub reclaimed_operations: usize,
-    /// 收成 `uncertain` 的残骸发信数。
+    /// 收成 `uncertain` 的残骸发信数（**上一个进程**留下的）。
     pub reclaimed_sends: usize,
+    /// 收成 `uncertain` 的残骸**操作**数（本进程认领、租约到期，R32）。
+    pub reclaimed_stale: usize,
+    /// 收成 `uncertain` 的残骸**发信**数（本进程认领、租约到期，R32 的发信侧）。
+    ///
+    /// 与 [`Self::reclaimed_sends`] 分开计：那个说的是「上个进程留下的」，
+    /// 这个说的是「我自己认领了却没写完终态」。两者的排查方向完全不同。
+    pub reclaimed_stale_sends: usize,
     /// 尝试次数到顶、判为 `retry_exhausted` 的操作数。
     pub expired: usize,
     /// 因为 epoch 变化而隔离的操作数。
@@ -271,6 +278,18 @@ pub async fn reconcile_account_as(
         now_ms,
     )
     .await?;
+    // 发信侧的同一件事：`send_queue` 也有「本进程认领后卡住」这种残骸。
+    // 之前**漏了**这一半——`reclaim_running` 只管别个进程留下的，
+    // `claim_for_sending` 又拒绝 `running`，于是那封信在本次进程里永远发不出去，
+    // 界面只显示「正在发送」。
+    let reclaimed_stale_sends = send_queue::reclaim_stale_running(
+        pool,
+        account_id,
+        boot_id,
+        send_queue::RUNNING_LEASE_MS,
+        now_ms,
+    )
+    .await?;
 
     // 第 2 步：次数到顶的未完结操作收成终态。
     let expired =
@@ -278,6 +297,8 @@ pub async fn reconcile_account_as(
 
     let mut report = ReconcileReport {
         reclaimed_sends,
+        reclaimed_stale,
+        reclaimed_stale_sends,
         reclaimed_operations: reclaimed_operations + reclaimed_stale,
         expired,
         ..Default::default()
