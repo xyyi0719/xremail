@@ -41,7 +41,12 @@ use xremail_api::{NewAccountRequest, SecretStore, SecretStoreError, SecretValue}
 use xremail_core::AppError;
 use xremail_core::model::{Account, ProviderKind, SmtpAuth, SyncMode, TlsMode};
 use xremail_shell_lib::secrets::test_hooks::{Injection, install, serial_guard};
-use xremail_shell_lib::secrets::{self, secret_ref_for};
+// `self`（即 `secrets::`）只在下面那条 `#[cfg(not(windows))]` 的用例里用到：
+// 它验的是「非 Windows 的默认实现不静默降级」。Windows 上没有这个分支，
+// 不带 cfg 的话那边就是一条 unused import，而 CI 的 Windows job 带 -D warnings。
+#[cfg(not(windows))]
+use xremail_shell_lib::secrets;
+use xremail_shell_lib::secrets::secret_ref_for;
 use xremail_shell_lib::service::{AccountService, CredentialService};
 
 /// 测试里用的授权码。**不是**真口令，但当成真口令那样对待：它不该出现在库里。
