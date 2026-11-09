@@ -529,11 +529,12 @@ pub fn expand_uid_set_checked(members: &[UidSetMember]) -> (Vec<u32>, bool) {
     let mut out: Vec<u32> = Vec::new();
     let mut truncated = false;
 
-    for member in members {
+    let total = members.len();
+    for (index, member) in members.iter().enumerate() {
         match member {
             UidSetMember::Uid(uid) => {
                 if out.len() >= UID_EXPANSION_LIMIT {
-                    // 上限已满：这个单值也放不下了，算一次截断。
+                    // 上限已满、而这个成员放不下了：确实丢了一个。
                     truncated = true;
                     break;
                 }
@@ -552,8 +553,12 @@ pub fn expand_uid_set_checked(members: &[UidSetMember]) -> (Vec<u32>, bool) {
         }
 
         if out.len() >= UID_EXPANSION_LIMIT {
-            // 满了还要看后面有没有剩下的成员：有就说明确实丢了东西。
-            truncated = true;
+            // 满了：**只有后面还有成员才算丢东西**。恰好用满、后面一个都不剩时
+            // 什么都没丢——那时置 `truncated` 就是谎报（会让一份完好的
+            // `COPYUID` 被判成不可用，写回白丢一次）。
+            if index + 1 < total {
+                truncated = true;
+            }
             break;
         }
     }

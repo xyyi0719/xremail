@@ -135,6 +135,13 @@ impl<R: Runtime> TauriSink<R> {
         // 这里在 `emit` 里，而 `emit` 是**同步**回调、不是异步上下文——
         // 但账户查询是异步的。用一个短任务去做，**不阻塞**这条 sink 链路：
         // sink 里卡住就等于卡住那个账户的同步循环（见本文件的模块文档）。
+        //
+        // **句柄不持有**（`spawn` 的返回值被丢弃）：这个任务的寿命是
+        // 「一次查库 + 一次 D-Bus 通知」，几十毫秒级，没有什么可取消的。
+        // `Scheduler::shutdown` 因此停不到它——这是**刻意的取舍**：
+        // 为一个可能正好在飞的通知去加一层任务登记，代价大于收益。
+        // （ARCHITECTURE §3 最后一条「后台任务应被监督并回收」讨论的是
+        // 同步循环那种长任务，不是这个。）
         tauri::async_runtime::spawn(async move {
             let Ok(Some(account)) = accounts.get(&account_id).await else {
                 return;

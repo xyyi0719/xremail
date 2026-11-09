@@ -30,10 +30,10 @@
 | xremail-message | MIME 结构、charset 解码、RFC 5322 头 | 不落库、不加载远程资源；**不做 HTML 清洗**（清洗在 `xremail-core::html`，见 §9.1） |
 | xremail-provider | 可覆盖预设、接入诊断 | 企业邮箱需管理员配置，不能按品牌猜服务器。**尚未创建**（服务器地址目前由用户手填） |
 | xremail-crypto | 成熟密码库封装、版本化密文格式 | 不自行实现密码算法；不承担所有平台钥匙串职责 |
-| 平台 SecretStore 适配器 | Windows/Android 等安全存储 | 与可选远端 VaultStore 分离 |
+| 平台 SecretStore 适配器 | 操作系统的凭据设施：Windows 凭据管理器、Linux Secret Service（D-Bus / `keyring` 3.x），其余平台（macOS / Android）是**桩** | 与可选远端 VaultStore 分离；桩**不静默降级**，见 §9 |
 | xremail-testkit | 假服务器、合成样本、故障注入 | 测试专用；生产代码不得依赖 |
 | xremail-diagnostics | 需要同时用协议层与内容层的诊断工具 | 生产代码不得依赖 |
-| shell | 组合根、Command/Event、窗口/平台生命周期 | Command 薄封装，业务在服务层 |
+| shell | 组合根、Command/Event、窗口/平台生命周期，以及**宿主能力**（钥匙串 / 托盘 / 新邮件通知，见 §9） | Command 薄封装，业务在服务层；宿主能力不进 `xremail-sync`（它不认识 Tauri） |
 
 依赖基线：`shell → 应用服务/编排 → store、protocol、message、provider → core`。
 trait 放在使用方或低层契约模块；不因“只有 trait”就允许产生环。密钥存储与 vault 同步不是同一接口。
@@ -88,6 +88,21 @@ trait 放在使用方或低层契约模块；不因“只有 trait”就允许�
   两处均已修：命令错误一律走 `connection::classify_imap_error`，只有登录路径
   才能产出 `ProtocolError::Auth`；外壳层改走 `xremail_sync::map_protocol_error`。见 R25）
 - SMTP 可独立连接；操作 worker 按账户/文件夹身份顺序执行，不能与 Actor 争用 IMAP 流。
+  （**2026-11-09，R46**：发信之后「确保已发送副本」那一段会自己开一条 IMAP 连接，
+  它同样有「服务器收了命令却不回话」的问题。`SentCopyService` 因此带一个
+  `command_timeout`（默认 30 秒，与协议层 `DEFAULT_COMMAND_TIMEOUT` 同源），
+  三处命令——`EXAMINE` 与两条 `UID FETCH`——**全部显式**带超时，而不是「靠记住默认值」。
+  没有它的后果是：写信面板上的「正在发送」永久停住，而 `catch_unwind` 救不了 hang。）
+- **事件出口不能阻塞，所以它只做「投递」**。`TauriSink`（`service/scheduler.rs`）的 `emit`
+  跑在 actor 的任务里，卡住就等于卡住那个账户的同步循环；但新邮件通知要先查一次
+  账户地址才能写标题，而查账户是异步的。所以 `TauriSink::notify` 只做两件事：
+  用纯函数判断「值不值得通知」（不值就直接返回，不碰库），值的话把
+  「查账户 → 发通知」`tauri::async_runtime::spawn` 出去，**立刻返回**。
+  因此通知是**尽力而为**的旁路：查账户失败、没有通知守护进程，都只记日志，
+  不会让一轮同步变成失败（策略见 §9）。
+  一点形状上的取舍：现在 `TauriSink::new` 要拿一份 `AccountService`，
+  理由与 `AppConnector` 相同——**显式传入，不回头查 `AppState`**，
+  否则「状态 → 调度器 → sink → 状态」会成环，且「sink 需要什么」变得不可见。
 - SQLite WAL、有界连接池、busy timeout；所有业务写入由 Rust 协调，不等于只有一个连接或一个 task。
 - 退出、账户删除、网络切换均传播取消；后台任务应被监督并回收。
   （桌面端的「退出」只有一条路：托盘菜单 → `app.exit(0)` → `RunEvent::Exit` →
@@ -135,6 +150,11 @@ RFC Message-ID 只能作线索，不能作为唯一键或自动跨文件夹去�
 - 第 4 步：远端 UID 集合用 `UID FETCH 1:* (UID)`——**FETCH 是必备命令，SEARCH 是可选扩展**；
   然后 `diff_uids` 作差；拉取时带上 `BODY.PEEK[HEADER]`（头），
   解析出主题 / 发件人 / 日期 / Message-ID 一并落库。
+- 第 4 步附带的**落库**：每轮 `LIST` 的结论（含文件夹角色）写回 `folder` 表。
+  角色**属性优先、名字兜底**（`xremail-protocol-imap::folders::detect_role`）算在协议层，
+  但名字兜底只是**这一次决策**里的猜测，不落库——库里 `role` 为 `NULL` 的语义是
+  「这一轮没认出来」，读的一方（§6 的「删除 = 进垃圾箱」）必须自己再兜一次。
+  不做区分的后果是：升级上来的老库全是 `NULL`，删信会悄悄从「进垃圾箱」退化成「就地标删」。
 - 第 5 步：正文**按需**拉（`BODY.PEEK[]`，见 `crates/xremail-sync/src/body.rs`）——
   正文可能很大且带附件，一个邮箱几千封全拉一遍既慢又费流量。
 - 第 6 步：服务器已删的 UID 清缓存；**本地草稿的保留策略**由 `UidDiff::retain_local` 落实。
@@ -149,8 +169,10 @@ RFC Message-ID 只能作线索，不能作为唯一键或自动跨文件夹去�
   发 `DONE` → 等 tagged `OK`；30 分钟或一到推送就发 `DONE` 重进，
   出口无条件 `is_authenticated()` 校验——**没走完 `DONE` 三次握手的会话一律丢弃重连**，
   绝不把半 IDLE 流的 `Session` 还回连接池。IDLE 失败 / 服务器不支持 → 自动降级轮询。
-  同时：这个 actor **已经接进应用层**——`apps/shell/src-tauri/src/lib.rs` 启动时
-  从凭据可用性决定拉起哪些账户、`RunEvent::Exit` 时停；
+  同时：这个 actor **已经接进应用层**——`apps/shell/src-tauri/src/lib.rs` 的
+  `start_background_sync` 在启动时从凭据可用性决定拉起哪些账户
+  （判据是「内存里有会话凭据」**或**「`account.secret_ref` 指向钥匙串条目」，
+  两者都没有就不起：没口令的账户每轮只会失败、把日志刷满）、`RunEvent::Exit` 时停；
   `cmd::sync_account` 在「第一次拿到可用凭据」时也补一次 `start`（幂等，已在跑就不叫醒，
   避免和本次手动同步并发跑两轮）。
 
@@ -191,11 +213,16 @@ UIDVALIDITY 不得为 0（RFC 3501），收到 0 视为协议错误。
 
 **实现落点（2026-11-03，`crates/xremail-sync/src/reconcile.rs`）**：
 
-* **按 boot 归属回收**。`running` 只说明有人认领了，不说明认领者还活着。
+* **按启动归属 + 租约回收**。`running` 只说明有人认领了，不说明认领者还活着。
   认领时写 `owner_boot`（迁移 `0006_operation_owner.sql`，`claim_for_push` /
   `claim_for_sending`），对账只收 `owner_boot IS NULL OR owner_boot <> 本次 boot` 的行；
   `IS NULL` 单独判是因为升级上来的老数据没有归属，按「不是我的」处理。
-  没有这层守卫，同一台机器上另一个**还活着**的进程的存途行会被翻成「结果未知」。
+  没有这层守卫，同一台机器上另一个**还活着**的进程的行会被翻成「结果未知」。
+  同一进程内的卡死另算（R32）：`operation::reclaim_stale_running` 把「本进程认领、
+  却超过 `RUNNING_LEASE_MS` 没写终态」的行收成 `uncertain / lease_expired`，
+  且在 `expire_exhausted` **之前**跑。
+  为什么需要它：`owner_boot` 只挡得住别的进程，挡不住自己——进程活着、那条意图却死了
+  （库偶尔报错、任务被 panic 带走），没有任何触发点会再碰它，直到下次重启。
 * **先回收、后判过期——顺序本身是语义**。反过来的话，一条属于上次进程、
   次数也已到顶的 `running` 会被 `expire_exhausted` 的状态过滤（`queued` /
   `retryable` / `uncertain`）漏掉，永远卡在 `running`：既没人推它，也没人报错。
@@ -206,13 +233,18 @@ UIDVALIDITY 不得为 0（RFC 3501），收到 0 视为协议错误。
   对账不能凭空造第二套真相。
 * **同时收掉的残骸**：孤儿操作（文件夹已删 → `folder_missing`；移动目标已删 →
   `destination_missing`）、绑定旧 epoch 的操作（→ `epoch_changed`，与 §4.3 一致）。
-* **幂等**。触发点有两个：应用启动（`apps/shell/src-tauri/src/lib.rs:235`）与
-  **每轮同步成功之后**（2026-11-06 随 R33 新增，`crates/xremail-sync/src/actor.rs:437 reconcile_after_tick`，
-  `Synced` 事件前调用）。
+* **幂等**。触发点有两个：应用启动（`apps/shell/src-tauri/src/lib.rs` 的 `init_storage`，
+  即 `reconcile_account` 那一处）与
+  **每轮同步成功之后**（2026-11-06 随 R33 新增，`crates/xremail-sync/src/actor.rs` 的
+  `reconcile_after_tick`，在 `emit(AccountEvent::Synced)` 之前调用；
+  对账结果随 `Synced` 一起发出，`TauriSink` 见到非空报告就补一条 `OperationsChanged`）。
   启动时要做的理由：调度器只对「已交给它调度」的账户跑，
   而崩溃恢复必须对**每个**账户都发生。幂等是为了容忍重复调用。
   **仍未做**：actor 的 `Startup` 轮**不单独**先对一次账——它靠第一轮 `tick`
   成功后的 `reconcile_after_tick` 顺带覆盖。
+  （**引用规则**：本文件不写 `文件:行号`。这个仓库有过「一次审计报出的六类成立项里
+  没一条行号是准的」的记录（见 [ISSUES §6](ISSUES_AND_RISKS.md) 的 2026-11-04 那行），
+  所以要定位就按**上面引用的标识符原文** `grep -F`，行号只在当次有效。）
 * 纯函数 `plan_reconcile` 把「观测 → 决定」从 IO 里拆出来，可单测；
   `reconcile_account_as` 是执行的壳。
 * 用例：`crates/xremail-sync/tests/crash_recovery.rs` 11 个（含「活着的进程的行不动」
@@ -261,7 +293,8 @@ Message-ID、稳定操作 ID 有助于排查，但不能保证 SMTP 去重。明
 （六态，取值与 `mail_operation.state` 列一致）；`xremail-store::dao::operation` 提供入队、
 列未完结操作、更新状态。**已实现的类别**：flag（2026-10-26）、append（2026-10-30，发信存副本）、
 move / delete（2026-11-03）、SMTP（2026-10-28，`send_queue` 独立队列）。
-`OperationKind` 三值：`flags` / `move` / `delete`（`crates/xremail-core/src/model.rs:463`），
+`OperationKind` 三值：`flags` / `move` / `delete`（`xremail-core/src/model.rs` 的
+`enum OperationKind`），
 移动的目标文件夹记在 `MailOperation::destination_folder_id`（迁移 `0005_operation_destination.sql`）；
 协议层 `crates/xremail-protocol-imap/src/transfer.rs` 提供 `copy_messages` / `move_messages` /
 `mark_deleted` / `uid_expunge` 与假服务器支持。
@@ -313,11 +346,18 @@ epoch 绑定：意图落库时记下当时的 `uidvalidity`。提交前发现 ep
 QQ 要 **30–90 秒**才落盘（第一次实测查得太早，误记成「QQ 不存」）。
 所以程序不能一律存（163 会变成两份），也不能一律不存（Gmail 这类根本不自存的就看不到自己发出去的信）。
 **自适应做法**（`apps/shell/src-tauri/src/service/sent_copy.rs`）：
-1. 发完等一个**短的沉降窗口**（2.5 秒）让服务器自己存；
-2. 在「已发送」文件夹里按 `Message-ID` 找这封信；
+1. 发完**轮询**一个短的沉降窗口（2.5 秒，每 400 毫秒问一次）让服务器自己存；
+2. 在「已发送」文件夹里回看最近 20 封的头，按 `Message-ID` 找这封信；
 3. 找到了 → 服务器自己存了，**不碰**；
 4. 没找到 → 自己 `APPEND` 一份（协议层 `crates/xremail-protocol-imap/src/append.rs`）；
-5. `APPEND` 被拒且理由是「已经存过了」 → 照样当「已有一份」（**第二道保险**）。
+5. `APPEND` 被拒且理由是「已经存过了」（错误文本里含 `already saved`，QQ 回的是
+   `NO [CANNOT] Mail already saved to Sent by SMTP`）→ 照样当「已有一份」（**第二道保险**）。
+
+**「已发送」是哪个文件夹，看角色不看名字**：`LIST` 回来的 `role == "sent"`——
+即 RFC 6154 的 `\Sent`（`detect_role` 属性优先、名字兜底）——而不是去猜
+「Sent Messages」这类名字。认不出来就直接返回 `NoSentFolder`，**不猜一个**：
+猜错的后果是把副本塞进别人（或归档）的文件夹里。反过来，每轮同步会把角色
+写进 `folder.role`（§4.2），「删除 = 进垃圾箱」用的是同一份结论（§6）。
 
 **匹配要比尖括号段**：`Message-ID` 在 RFC 5322 里一定是 `<…>` 形态，
 而 QQ 会**改写** `Message-ID`、把原值挪到 `X-OQ-MSGID`。
@@ -380,13 +420,48 @@ QQ 要 **30–90 秒**才落盘（第一次实测查得太早，误记成「QQ �
   | 场景 | 发什么 |
   |---|---|
   | 有 `MOVE` | 一条 `UID MOVE` |
-  | 没有 `MOVE`（163、沃） | `UID COPY` → `UID STORE +FLAGS (\Deleted)` → **有 `UIDPLUS` 才** `UID EXPUNGE`（两家实测都有 `UIDPLUS`，会走到最后一步） |
-  | `MOVE` 与 `UIDPLUS` 都没有（三家实测都不属于此类） | 停在「已标删」 |
+  | 没有 `MOVE`、有 `UIDPLUS`（163、沃） | `UID COPY` → `UID STORE +FLAGS (\Deleted)` → `UID EXPUNGE`（三家实测都有 `UIDPLUS`） |
+  | `MOVE` 与 `UIDPLUS` 都没有（三家实测都不属于此类） | **一条都不发**：记 `failed` 并把原因报给用户（`NO_UIDPLUS`） |
 
+  第三档曾经是「停在『已标删』」，那是个**假成功**：`COPY` + 标删之后源文件夹里那封信
+  还在原地、目标文件夹多了一份副本，而队列却把它当成搬完了。何况「只标删不 expunge」
+  迟早会被下一轮 `pull` 当成「服务器上还在」回弹——用户看到的是「删了又回来」。
+  所以宁可失败等人决定（R35）。另：`OperationKind::Flags` 传进 `route_for` 会直接 `Err`——
+  标记有意**不**共用这条通道（理由见本节最后一条）。
 * **裸 `EXPUNGE` 一律不用**：它会把这个文件夹里所有带 `\Deleted` 的信都删掉，
   包括别的客户端标了还没提交的。那也是用户的数据。
 * **删除 = 进垃圾箱**（保守优先）：有垃圾箱就挪进去（可撤销），没有才就地标删。
-  垃圾箱靠**文件夹名**推断（本地库还不存 `\Trash` 属性）；推不出来就不乱挪。
+  谁的垃圾箱，**先看服务器宣告的 `folder.role`，再看名字**（`trash_candidates`，顺序即决策）：
+  1. 库里 `role = 'trash'` 的（`LIST` 宣告过 `\Trash`，是事实）；
+  2. 库里 `role` 为 `NULL` 的，才退回按名字推断（`role_by_name`）。
+
+  两条线索都没有时：**能**精确 expunge（有 `UIDPLUS`）才就地 `UID EXPUNGE`——那种情况下
+  删的是确定的那几封，不是裸 `EXPUNGE`；连 `UIDPLUS` 都没有就一条都不发、把原因报出来
+  （`NO_UIDPLUS`，与路由表第三档同一条闸门）。
+  为什么 `NULL` 不能当成「没有垃圾箱」：升级上来的老行、以及本轮 `LIST` 没认出来的文件夹
+  （QQ 只给 `\NoSelect` / `\HasChildren`，很多中文名也不在兜底表里）都是 `NULL`；
+  把它读成否定答案，这些账户的删除就会悄悄从「进垃圾箱」降级成「就地标删」——
+  一个不可撤销的动作，而用户没有任何提示。为什么反过来「名字优先」也不行：
+  名字是猜测，服务器说「这是 `\Archive`」却被名字碰巧判成垃圾箱，信就会被挪进用户没指望的地方。
+  当前文件夹自己排除在外（在垃圾箱里点删除就是真删）。
+  用例：`crates/xremail-sync/tests/push_transfers.rs` 里 `sync_persists_the_trash_role_…` /
+  `delete_goes_into_a_trash_the_name_would_never_reveal` /
+  `delete_stays_in_place_when_no_folder_claims_the_trash_role` /
+  `an_unknown_role_falls_back_to_the_name_instead_of_losing_the_trash` /
+  `a_known_non_trash_role_beats_a_trash_looking_name` 五条，
+  存储侧另有 `crates/xremail-store/tests/folder_role.rs`（含「从停在 0009 的旧库升级后
+  数据完好且 `role` 为 `NULL`」）。0010 迁移的边界也要知道：`ALTER TABLE … ADD COLUMN`
+  **不可重放**，手动重跑会得到 `duplicate column name: role`——响亮地失败，已有数据一个字节不动；
+  以及迁移 SQL 的**注释里不能出现分号**（sqlx 按 `;` 切语句，注释里多一个分号会让后面的语句错位）。
+* **`COPYUID` 被截断就不当映射用**（R47）。`COPYUID` 的源、目标两个集合是**各自**按
+  `UID_EXPANSION_LIMIT`（10 000）展开的；服务器回 `COPYUID 1 1:4294967295 1:4294967295`
+  时两边都被截到恰好 10 000 个，**长度相等**，旧的 `has_uid_mapping()`（「长度相等即可用」）
+  于是把一份**残缺的**映射当成一对一（源 1..10000 ↔ 目标 1..10000，可源文件夹里只有 3 封）。
+  现在 `expand_uid_set_checked` 如实报告「有没有丢东西」，`copy_uid_of` 只要**任何一侧**
+  被截断就把目标集合置空，调用方退回「没有映射」的处置——**宁可空，不造假**。
+  这条必须写在文档里而不是只留在注释里：写回目标 UID 那条路（R39）一旦接上，
+  它会照着编出来的对应关系把**不存在的信**写进本地库。残余：截断上限仍是 10 000，
+  一次真的移动超过一万封会拿不到映射（退化成「不知道」，不会写错）。
 * **移动专属的保守处理**：源文件夹里已经没有这封邮件 → 算成功。
   可能是上次尝试生效了（应答丢了），也可能别人挪走了——两种情况下
   「再挪一次」都是错的（RFC 6851 的 `MOVE` 不是幂等的，`COPY` 重发会多一份）。
@@ -447,13 +522,44 @@ P6 前重新审查身份认证、密钥恢复、轮换、回滚/重放防护与�
 Windows 先打通完整链路，Android 保留目标并尽早做小型生命周期 PoC。普通轮询不保证 Doze 下准时执行；前台服务也不是永久保活承诺。
 Linux/macOS/iOS 不属于当前验收平台，不因 Tauri 支持就视为产品可用。
 
-**平台钥匙串（2026-10-26 已实现 Windows 侧）**：`xremail_api::SecretStore` 的 Windows 适配
-在 `apps/shell/src-tauri/src/secrets/windows_store.rs`，条目名 `xremail:account:<account_id>`
-（通用凭据，`CRED_PERSIST_LOCAL_MACHINE`）。非 Windows 平台是 `secrets/unsupported.rs` 的**桩**：
-它**不**把凭据落到任何地方（`get` 恒为 `None`），平台不支持时**如实报错**，
-**不**降级成「存内存」或「存文件」——那样用户会以为已经保存了。
+**平台钥匙串（2026-10-26 起，Windows → 2026-11-09 加 Linux）**：`xremail_api::SecretStore`
+有**三档**实现，分发的唯一入口是 `apps/shell/src-tauri/src/secrets/mod.rs` 的
+`platform_default_store()`，cfg 写成 `windows` / `target_os = "linux"` /
+`not(any(windows, target_os = "linux"))` 三个分支——**不是**笼统的 `not(windows)`，
+否则 Linux 那条会与 Windows 那条同时成立、编译器报重定义。
+
+| 平台 | 实现 | 要点 |
+|---|---|---|
+| Windows | `secrets/windows_store.rs` | 凭据管理器，条目名 `xremail:account:<account_id>`（通用凭据，`CRED_PERSIST_LOCAL_MACHINE`） |
+| Linux | `secrets/linux_store.rs` | Secret Service（D-Bus，`keyring` 3.x 的 `sync-secret-service`）；服务名 `xremail`、用户名原样用 `secret_ref`、机密存**原始字节** |
+| 其余（macOS / Android） | `secrets/unsupported.rs` | **桩**：不可存也不可取——`get` 恒为 `None`、`set` 明确报 `Unavailable`、`delete` 回 `false` |
+
+三档共同守住的几条，比「支持了什么平台」更要紧：
+
+* **不静默降级**。桩**不**把凭据落到任何地方，也**不**降级成「存内存」或「存文件」——
+  那样用户会以为已经保存了。读（`get`）在桩上回 `None`、删（`delete`）回 `false`，
+  只有**写**（`set`）明确报 `Unavailable`——「存不进去」是唯一必须喊出来的那件事。
+  Linux 上没有 D-Bus 会话 / 没有守护进程时同理，
+  `set` 明确回 `Unavailable`，而不是假装写成功（无头 CI 正是这种环境，
+  调用方必须看到「存不进去」）。collection 被锁定时不去**自动解锁**：解锁是用户的决定。
+* **错误信息里不含机密**（只带 `secret_ref` 这种不透明引用与系统给的说明）。
+* **「不存在」不是错误**：`get` 回 `Ok(None)`、`delete` 回 `Ok(false)`。
+
+为什么 Linux 走 D-Bus 而不是直接链 `libsecret`：链它会把可执行文件钉在某个发行版的
+SONAME 上；走接口只要求「有个实现了 `org.freedesktop.secrets` 的守护进程在跑」，
+GNOME Keyring、KWallet 都算。代价是新增 `keyring` 依赖，这是**显式权衡**，不是顺手拉的。
+
 `CredentialService`（`service/credential.rs`）只认 `account.secret_ref`：
 没有引用就**不去打扰钥匙串**；`forget_credential` 会同时删钥匙串条目并把 `secret_ref` 清成 `None`。
+
+**测试注入点**（`secrets/mod.rs` 的覆盖槽 + `secrets/test_hooks.rs`）：这是钥匙串是
+**机器级**设施带来的麻烦——集成测试若真往凭据管理器里写条目，并行跑的用例会抢同一个条目名，
+还会在用户机器上留下 `xremail:account:<随机 uuid>` 这类垃圾。所以 `platform_store()`
+先看进程级覆盖槽（生产里永远是空的），注入时直接返回注入的实现。
+两个约束是配套的：入口是 `test_hooks::install`（返回的守卫在 `Drop` 里还原，
+断言 panic 也会还原——直接调 `set_platform_store_for_test` 而不还原，Windows 上后面跑的
+**真实**凭据管理器用例会全绿但什么也没证明），碰钥匙串的用例要过 `test_hooks::serial_guard`
+（覆盖是进程级全局的）。真实凭据管理器的往返测试**不走**这个口子——它要验的就是系统设施本身。
 
 **panic 边界要盖住全部 await 点，不是只盖「主流程」**：`catch_unwind` 是手写的，
 漏一处就等于没盖。`crates/xremail-sync/src/actor.rs` 里有**两条**会 `connect` 的路径——
@@ -477,18 +583,60 @@ Linux/macOS/iOS 不属于当前验收平台，不因 Tauri 支持就视为产品
   未提交的写操作会停在 `running`（下次启动靠对账收拾）。系统发起的退出（注销、关机）
   同样走 `Exit`，收尾一致。
 
-托盘菜单只有「显示主窗口 / 立即同步 / 退出」三项。左键单击 = 显示并聚焦，
+托盘菜单是：显示主窗口 / 立即同步 / **开机自启（勾选项）** / 退出。左键单击 = 显示并聚焦，
 与 `tauri_plugin_single_instance` 的「第二次启动」走同一个函数（藏起来的窗口必须先
 `show`）。「立即同步」对**已调度**账户逐个 `Scheduler::wake`（`service::scheduler::wake_all`），
 **不**用 `start`——后者的语义是「确保在调度」，读起来像新增了一份调度。
+菜单 id → 动作（`TrayAction::from_menu_id`）是纯映射、有单测：不认识的 id 一律 `None`，**不猜**——
+把不认识的 id 当成「退出」是最糟的猜法。另有一条 `wakes_sync`：只有「立即同步」会拉起网络，
+「显示主窗口」顺手开一轮同步会让用户以为「一打开就在收信」。
+
+**开机自启只有一个勾选项，勾读的是系统里的真实状态**（`app.autolaunch().is_enabled()`），
+不是内存里的一个 bool。「打开」「关闭」写成两项会让菜单长得像状态指示器，用户点哪一个都得先
+自己判断当前是开还是关；自记一个 bool 则会与真实状态分叉（用户可以在启动器设置或
+`systemctl --user disable` 里改掉它），于是勾开始说谎。读不到状态时按「没开」显示、并且
+**不去切换**——猜错方向会把用户已经打开的自启关掉。切换失败只记日志（托盘菜单没有能弹提示的
+地方，而在托盘回调线程里 panic 会直接带崩进程）。实现上它是 `CheckMenuItemBuilder` 单独建的：
+`MenuBuilder` 没有能带初始勾选状态的 `check()`，所以句柄存进 `TrayMenuState`
+（`TrayIcon` 不暴露 `menu()`，要改勾只能靠它）。
+
 开机自启时**仍然弹窗口**：按启动参数「只驻留托盘」能做，但那要在 `setup` 里
 把默认显示的窗口再关掉，参数一错就是「点了没反应」，而自启的诉求
 （登录后后台同步已在跑）当前实现已满足。
 
 托盘是 tauri 的核心 API（`tauri::tray`），只需要开 tauri 自己的 `tray-icon` feature，
 不引入新依赖；托盘只在桌面端创建（`#[cfg(desktop)]`）。
+**托盘建失败不拦启动**（只 warn）：应用照常可用。代价要写清楚——那时关闭主窗口照样会藏起来
+（窗口事件钩子管不着托盘建没建成），却没有图标能把它叫回来，只能再启动一次程序
+（单实例会把藏起来的窗口 `show` 出来）。
 **验证程度**：Linux 上编译与 clippy、fmt 通过，菜单 id → 动作有单元用例；
-**Windows 真机行为（图标、左键聚焦、退出收尾）未验证**——本机无显示器。
+**Linux 上左键单击不生效**——libayatana-appindicator 只提供菜单、根本不发 `TrayIconEvent`，
+要用菜单里的「显示主窗口」（这是平台能力，不是缺省实现）；
+**Windows 真机行为（图标、左键聚焦、勾选项、退出收尾）未验证**——本机无显示器。
+
+**新邮件通知（2026-11-09，`apps/shell/src-tauri/src/notify.rs`）**：走
+`tauri_plugin_notification`，Linux 上就是 D-Bus 通知。它是**同步轮次的旁路**，
+四条策略全是产品取舍，不是实现细节：
+
+* **只通知 `INBOX`**。别的文件夹的新信（已发送的自副本、归档、垃圾箱里新来的垃圾）不该打断用户。
+  判据是 `FolderSyncReport.remote_name` 与 `INBOX` 做**大小写不敏感**比较——
+  RFC 3501 §5.1.3 规定收件箱名大小写不敏感，且它**不做** modified UTF-7 编码，
+  所以这里不用走 `utf7::decode`。
+* **应用在前台时不通知**。判据是主窗口 `is_focused()`，**不是** `is_visible()`：
+  窗口被托盘藏起来时 `visible == false`，而那正是**需要**通知的时候；反过来窗口开着但在后台
+  （`visible` 真、`focused` 假）用户看不见，也该通知。拿不到窗口时按「不在前台」处理——
+  宁可多弹一条，也不要因为读不出窗口状态就让用户彻底收不到提醒。
+* **首次同步与 epoch 切换不通知**。第一次接一个邮箱会一口气拉几百上千封，那不是「新邮件」，
+  那是历史；服务器重建了文件夹（`epoch_changed`）同理，一封都不是新的。
+* **聚合显示**。一轮来了 50 封只弹**一条**：标题写账号与封数，超过 3 封时正文改成「还有 N 封」。
+  不逐封弹是这一条的全部意义。
+* **不做去重表**：`added` 来自 `UidDiff`，本地已经有了就不会再算，同一封信在相邻两轮里
+  不会算两次。加一份「已通知过哪些 UID」反而要处理清理、epoch 失效、崩溃恢复，代价远大于收益。
+* **失败只记 debug 日志**：没有通知守护进程的机器（无头 CI、精简桌面）本来发不出来，
+  那不该让一轮同步失败。**点击通知只保证能回到应用**（聚焦主窗口）——「跳到那一封」
+  需要前端配合（切账户 → 文件夹 → 选中），是一条独立的交互链路，当前未做。
+* **验证程度**：判定与文案是纯函数、有单测；**真实桌面会话里通知真的弹出未验证**
+  （本机沙箱里连 `notify-send` 都失败），点击也点不了（Xvfb 里没有可点的通知）。
 
 错误按可恢复原因分类：传输临时失败退避；认证需用户动作；磁盘满/迁移失败不能当普通 Storage 错误无限重试；协议错误不原样输出可能含凭据/正文的响应。
 事件枚举以 `xremail-core/src/event.rs` 为准，flag 更新使用 MessageUpserted，当前没有 FlagsChanged。
@@ -499,7 +647,7 @@ Linux/macOS/iOS 不属于当前验收平台，不因 Tauri 支持就视为产品
 错误附加上下文时必须保留错误变体，否则 `is_retryable()` / `requires_user_action()` 判定失效。
 `AppError::with_context` 按变体逐个包裹，`Context::ctx` 基于它实现，已有单测锁定该行为。
 `panic = "abort"` 会让后台任务无法用 `catch_unwind` 兜底，单个同步 task 的 panic 就会终止整个应用。
-因此 release profile 选用 `unwind`（仓库根 `Cargo.toml:96`），并在同步任务边界加 `catch_unwind`
+因此 release profile 选用 `unwind`（仓库根 `Cargo.toml` 的 `[profile.release]` 段），并在同步任务边界加 `catch_unwind`
 （`crates/xremail-sync/src/actor.rs`，每轮同步一个边界）；取舍与残余见 [ISSUES_AND_RISKS R13](ISSUES_AND_RISKS.md)。
 
 ### 9.1 HTML 正文的安全边界（R06）
@@ -510,11 +658,22 @@ Linux/macOS/iOS 不属于当前验收平台，不因 Tauri 支持就视为产品
 消毒器的白名单因此在 core 层维护，用例锁住（`crates/xremail-core/src/html.rs`）。
 
 消毒规则：标签白名单 + 属性白名单；`script` / `style` / `iframe` / `object` / `embed` /
-`form` 等**连内容一起删**（它们的内容本身就是载荷）；删 `on*` 事件属性与
-`javascript:` / `data:` 协议；删**远程图片**（`src` 指向 http/https）——
-远程图片是**跟踪像素**与**信息泄露**的通道。
+`form` 等**连内容一起删**（它们的内容本身就是载荷；`DROP_WITH_CONTENT` 那份清单更长，
+还含 `svg` / `math` / `template` / `noscript` / `base` / `link` / `meta` 之类）；删 `on*` 事件属性与
+白名单外的协议（只放行 `http` / `https` / `mailto`，所以 `javascript:` 与 `data:` 都进不来）；
+删**远程图片**（`src` 指向 http/https）——远程图片是**跟踪像素**与**信息泄露**的通道。
 其余**未知标签只删标签、留着内容**：真实邮件的正文全都被 `html` / `body` 包着，
 连内容一起删的话整封信就没了。
+
+**内联图片是这道消毒的一个例外，例外必须是「我们自己拼的字节」**：邮件里的
+`<img src="cid:…">` 指向的是附件，**本机已经把那段字节下载下来**时
+（`service/message.rs` 的 `sanitize_with_inline_images` → `xremail_core::inline_image`），
+先把它换成 `data:image/…;base64,…`；别的 `<img>`（远程 `http(s)`、`cid:` 匹配不上、
+`file:`、`javascript:` …）原样交给消毒器删掉。匹配上的部件还必须是 `image/*`
+（**SVG 除外**）、且不超过单图/合计上限——SVG 里能带脚本，`data:image/svg+xml` 等于把
+`<script>` 换个马甲放回来。为什么不能简单地在消毒器里放行 `cid:`：那样远程图片就能借一个
+`cid:` 名字混进来，跟踪像素的通道又开了。`data:` 也不是整体放行，只放行我们自己写出的
+`<img src="data:image/…">` 那一段，其余 `data:` 协议照样删。
 
 正文只有 `text/html` 时，**从 HTML 派生纯文本**（`html_to_text`），
 写入时派生、启动时回填老数据：实测 163 的邮件大多只有 `text/html`，
@@ -524,6 +683,21 @@ Linux/macOS/iOS 不属于当前验收平台，不因 Tauri 支持就视为产品
 
 旧版启动、内存、5000 封 3 分钟、30 秒双端一致等数字都是未测目标，不是门槛保证。
 先测基线，记录设备/网络/数据规模与缓存状态，再设回归阈值；安全和数据正确性不因性能而让步。
+
+**同步路径上新增的库访问必须写明次数与周期**（没有这些，下一轮的「顺手加一条查询」就无从判断）。
+2026-11-09 为止**实测到的**形状如下，量级都在「每轮一次 / 每文件夹一次」，不是「每封一次」：
+
+| 新增来源 | 次数 | 判据 |
+|---|---|---|
+| 文件夹角色落库（§4.2，0010 迁移） | 每文件夹一次 `upsert_folder` | 同一个 `folder` 行的写，不是新增的一次往返之外另有开销 |
+| 新邮件通知（§9） | **每轮最多一次** `accounts.get` | `TauriSink::notify` 先用纯函数判 `inbox_added`，不值得通知就**不碰库** |
+| 删除时的垃圾箱判定（§6） | **有**待提交的移动/删除时，每文件夹每轮一次 `list_folders` | `push_transfers` 在 `transfers` 为空时提前返回，连能力集都不读；`find_trash` 只在有这类操作时才调 |
+| 每轮对账（§4.4） | 每轮一次 | 随 R33 新增，见 §4.4 |
+
+一个**已知的**而不是新增的项：`sync.rs` 里每个远程文件夹都会调一次
+`folder_dao::list_folders`，再在内存里按 `remote_name` 找同名的——那是 O(文件夹数²) 的库读，
+行数很小（一个账户几十个文件夹）时可忽略，但「每轮同步加一条查询」和「每个文件夹加一条」
+是两种不同的增长方式，后者在文件夹很多时会先显形。**未测**：没有针对这一项做过基线。
 
 架构变更需写明不变量、迁移与失败路径；改变 UI 栈、同步层次或 Android 范围须用户确认。测试覆盖见 TESTING_STRATEGY。
 

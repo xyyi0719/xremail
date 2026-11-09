@@ -3,14 +3,14 @@
 **多端、多账号、隐私优先的邮件客户端。** 核心用 Rust 写，界面用 Web 技术，Windows / Android 优先，iOS / macOS / Linux 随后。
 > 维护者：xyyi0719
 
-计划先接入 163、QQ 与沃邮箱，保留通用 IMAP/SMTP 手动配置；Gmail 暂缓，其他服务商后续评估。**已能实际收发邮件**（163 / QQ 的真实收发往返已验收），但凭据不落盘、无后台调度。
+计划先接入 163、QQ 与沃邮箱，保留通用 IMAP/SMTP 手动配置；Gmail 暂缓，其他服务商后续评估。**已能实际收发邮件**（163 / QQ 的真实收发往返已验收）；授权码存平台钥匙串（Windows / Linux），后台调度（`Scheduler` + IDLE）与桌面托盘 / 开机自启 / 新邮件通知已落地。
 **L1 邮件状态由 IMAP 服务器同步**，时效受网络、服务商和平台后台限制；本地设置等 L2 数据暂不跨端。
 
 ---
 
 ## 当前状态
 
-> **v0.3.0 · P0–P3 已出关 / P4 平台化未开始**（2026-10-30）
+> **v0.3.0 · P0–P3 已出关；P4 的 Windows 侧已交付、Android 侧只验到「能编出 APK」；P5-L（Linux）主要工作已落地；P5 增值功能 / P6 未开始**（2026-11-09）
 >
 > 架构持续复核。当前设计见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 > 2026-10-30 验证（当时的数字）：`cargo fmt` / `cargo clippy -D warnings` / `cargo test`（**687 个 Rust 用例**）/
@@ -24,32 +24,43 @@
 > `npm typecheck` / `npm test` 95 条 / Playwright 5 条 / `cargo sqlx prepare --check` /
 > `check_doc_links.py` 全绿。
 > 2026-11-09 再复跑（T10 补上 IMAP 响应解析的 24 条属性测试后）：
-> `cargo test --workspace` **1095 passed / 0 failed / 1 ignored**（`--list` 1096）、
+> `cargo test --workspace` **1096 passed / 0 failed / 1 ignored**（`--list` 1097）、
 > `cargo clippy --workspace --all-targets -D warnings` 零警告、`cargo fmt --all -- --check` 干净。
+> 2026-11-09 本轮复核（只改文档）：`cargo test --workspace -- --list` 点数 **1097**（逐包相加同为 1097），
+> 其中 1 条 `#[ignore]`（真实邮箱往返 `real_round_trip_between_two_mailboxes`）→ 实际执行 **1096**；
+> `npx vitest run` 实测 **15 个文件 / 95 条**；Playwright **2 个 spec / 5 条**。
+> **CI 口径要说清**：`.github/workflows/ci.yml` 有 **4 个 job**（`Rust (ubuntu-latest)` / `Rust (windows-latest)` /
+> `Frontend` / `Docs sanity`），它们上一次的绿是 **2026-11-09 的 `e0af98b`**（当时 CI 计数 1056）；
+> 其后的 `R46` / `R47` / 新邮件通知等提交**本地全绿，但 CI 是否已经跑绿没有核**——本机连不上 GitHub Actions。
 >
 > **已落地**：存储层（`xremail-store`，含 FTS5 全文索引）、密文封装（`xremail-crypto`）、
-> L2 契约（`xremail-api`）、同步引擎（`xremail-sync`）、IMAP / SMTP 协议层
-> （`xremail-protocol-imap` / `xremail-protocol-smtp`）、内容解析（`xremail-message`）、
-> HTML 消毒（`xremail-core::html`）、假服务器（`xremail-testkit`）、诊断工具（`xremail-diagnostics`）。
+> L2 契约（`xremail-api`）、同步引擎（`xremail-sync`，含 `Scheduler` actor、IDLE 与崩溃对账）、
+> IMAP / SMTP 协议层（`xremail-protocol-imap` / `xremail-protocol-smtp`）、内容解析（`xremail-message`）、
+> **DKIM 签名（`xremail-dkim`）**、HTML 消毒（`xremail-core::html`）、假服务器（`xremail-testkit`）、
+> 诊断工具（`xremail-diagnostics`）；外壳侧另有托盘 / 开机自启（`src/tray.rs`）与新邮件通知（`src/notify.rs`）、
+> 平台钥匙串（Windows 凭据管理器 / Linux Secret Service）。
 >
 > **能读、能搜、能写、能发**（2026-10-30）：UI 里能看真实邮箱的邮件（正文经**后端消毒**后渲染），
 > 本地**全文搜索**可用（命中带片段），撰写面板可发信（草稿 / 撤回 / 发送，校验以后端为准）。
 > 163 / QQ 两家的**真实收发往返**已实测通过；30 封真实邮件解码零错误。
 > 协议事实见 [docs/PROTOCOLS.md](docs/PROTOCOLS.md)。
 >
-> **还缺**：凭据不落盘（每次同步要重填授权码）、无调度器（要手动点同步）、
-> 邮件列表未虚拟化、无 P4 的 Android 前台服务与跨端推送。
+> **还缺**：**Android 的运行时一条没验**（本机无设备与模拟器；钥匙串在 Android 上仍是桩、
+> `lib.rs` 没有 `Resumed`/`Suspended` 分支、Android 13+ 的通知运行时权限能否拿到未验）、
+> macOS / Android 的钥匙串适配、邮件列表未虚拟化、跨端推送未做；
+> 通知与「点通知跳到那一封」在真实桌面会话里是否成立**未验**。
 > 想看进度：[docs/ROADMAP.md](docs/ROADMAP.md)
 
 | 阶段 | 状态 |
 |---|---|
 | P0 骨架与地基 | ✅ 已出关 |
 | P1 账户接入与收信 | ✅ 已出关（真实邮箱接入应用，UI 里能看） |
-| P2 同步引擎与阅读 | 🟡 引擎与 HTML 安全门已完成，缺调度器与列表虚拟化 |
+| P2 同步引擎与阅读 | 🟡 引擎、后台调度器与 HTML 安全门已完成，只缺列表虚拟化 |
 | P3 发信与草稿 | ✅ 已出关（真实邮箱收发往返已验收） |
-| P4 平台化与实时推送 | ⬜ |
-| P5 增值功能 | ⬜ |
-| P6 跨端账号信息同步（可选） | ⬜ |
+| P4 平台化与实时推送 | 🟡 Windows 侧已交付；**Android 侧只做到「能编出 APK」**，运行时未验 |
+| P5 增值功能（标签 / 规则 / 联系人） | ⬜ 未开始 |
+| P5-L Linux 支持（可选） | 🟡 打包、钥匙串、托盘、通知、开机自启、WebKitGTK 沙箱验证已落地；真实桌面会话与非 Debian 发行版未验 |
+| P6 跨端账号信息同步（可选） | ⬜ 未开始 |
 
 > 路线图以验收门槛描述，不承诺固定日期（个人研究项目）。
 
@@ -64,7 +75,7 @@
                          │ Tauri Command（请求/响应）
                          │ Tauri Event（增量推送）
 ┌────────────────────────┴─────────────────────────────────┐
-│  src-tauri (Rust)               托盘 / Android 前台服务  │
+│  src-tauri (Rust)           托盘 / 通知 / 钥匙串适配器   │
 ├──────────────────────────────────────────────────────────┤
 │  crates/                     全部业务逻辑在 Rust 侧      │
 │  xremail-core    领域模型 + HTML 消毒                    │
@@ -72,10 +83,14 @@
 │  xremail-sync   同步引擎        xremail-message MIME 解析│
 │  xremail-protocol-imap / -smtp   IMAP / SMTP 协议层      │
 │  xremail-api    领域服务接口    xremail-diagnostics 诊断 │
+│  xremail-dkim   DKIM 签名       xremail-testkit 假服务器 │
 └──────────────────────────────────────────────────────────┘
 ```
 
-**目标架构：UI 经 Rust 服务查询 SQLite，持久化写入只走 Rust。** 事件用于刷新提示，漏事件后可重新查询；上图中**除 `xremail-provider`（厂商预设）与平台 SecretStore 适配器（钥匙串）外均已创建**——这两块还没开工。
+**目标架构：UI 经 Rust 服务查询 SQLite，持久化写入只走 Rust。** 事件用于刷新提示，漏事件后可重新查询；上图中**除 `xremail-provider`（厂商预设）外均已创建**——它还没开工。
+平台 SecretStore 适配器**已经开了工、且两个平台都落地了**：Windows 走凭据管理器（`src-tauri/src/secrets/windows_store.rs`），
+Linux 走 D-Bus 的 Secret Service（`src-tauri/src/secrets/linux_store.rs`，`keyring` 3.x）；**macOS 与 Android 仍是明确报错的桩**。
+托盘（`src-tauri/src/tray.rs`）与新邮件通知（`src-tauri/src/notify.rs`）属于外壳层，不在 crate 列表里。
 
 ---
 
@@ -85,7 +100,7 @@
 |---|---|---|
 | 外壳 | Tauri（Rust） | 2.12 |
 | 前端 | React + TypeScript + Vite | 19 / 6.x / 8.x |
-| 前端测试 | Vitest + Testing Library | 5.x |
+| 前端测试 | Vitest + Testing Library；E2E 用 Playwright（**不拉 Tauri 窗口**，注入 `window.__TAURI_INTERNALS__` 桩） | 5.x / 1.65 |
 | 前端样式 | **原生 CSS**（无 Tailwind / shadcn） | — |
 | 前端状态 | **React 内置 state**（无 TanStack / Zustand） | — |
 | 富文本 | **自写**（contentEditable + `document.execCommand`） | — |
@@ -94,8 +109,8 @@
 | SMTP | **自研协议层**（rustls + x509-parser，**未用 lettre**） | 0.23 / 0.16 |
 | 存储 | SQLite (sqlx, WAL) + FTS5 | 0.9 |
 | 全文索引 | FTS5 **trigram**（外部内容表 + 触发器维护） | — |
-| 密钥库 | 平台 SecretStore（**Windows 已接入**，2026-10-26，Windows 凭据管理器；其它平台仍是「如实报错」的桩） | 待定 |
-| 密码学 | argon2 + chacha20poly1305 | 0.6 / 0.11 |
+| 密钥库 | 平台 SecretStore：**Windows 凭据管理器**（2026-10-26，`CredWriteW` 系列）、**Linux Secret Service**（2026-11-09，`keyring` + `sync-secret-service`，走 D-Bus、**不链 `libsecret`**）；macOS / Android 是「如实报错」的桩 | keyring 3.6（**只在 Linux 上编译**：`[target.'cfg(target_os = "linux")'.dependencies]`） |
+| 密码学 | argon2 + chacha20poly1305；DKIM 用 `ring`（RSA）+ `zeroize` | 0.6 / 0.11 / 0.17 / 1 |
 
 > **与早期规划不同**：原计划里的 TanStack Query / Router / Zustand、Tailwind + shadcn/ui、
 > TanStack Virtual、TipTap、lettre **都没有引入**。原因有二：一条是「前端不加第三方依赖」
@@ -110,7 +125,7 @@
 ```
 xremail/
 ├─ crates/                 Rust 库：
-│  └─ core / store / crypto / api / sync / message
+│  └─ core / store / crypto / api / sync / message / dkim
 │     protocol-imap / protocol-smtp / testkit / diagnostics
 ├─ apps/
 │  └─ shell/               Tauri 应用（桌面 + 移动）

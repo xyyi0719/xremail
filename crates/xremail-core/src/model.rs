@@ -485,7 +485,7 @@ pub enum OperationKind {
     /// 标记变更（bit 级增删）。
     #[serde(rename = "flags")]
     Flags,
-    /// 把邮件摄到另一个文件夹。
+    /// 把邮件挪到另一个文件夹。
     ///
     /// 目标文件夹记在 [`MailOperation::destination_folder_id`]。
     #[serde(rename = "move")]
@@ -493,7 +493,7 @@ pub enum OperationKind {
     /// 删除邮件。
     ///
     /// 这是「用户点了删除」，不是「已经删干净了」：
-    /// 有垃圾箱就往里摄（等于 `Move`），没有才标删。
+    /// 有垃圾箱就往里挪（等于 `Move`），没有才标删。
     /// 具体走哪条路由同步层按服务器能力定（见 `xremail_sync::push_transfers`）。
     #[serde(rename = "delete")]
     Delete,

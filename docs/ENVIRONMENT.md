@@ -426,8 +426,8 @@ create_account not allowed. Plugin not found
 | 平台 | 状态 | 证据 |
 |---|---|---|
 | **Windows** | ✅ 可编译可运行 | 本机构建通过；CI `windows-latest` 绿 |
-| **Linux (Ubuntu)** | ✅ **可编译**（运行未验证） | CI `ubuntu-latest` 绿，且 ubuntu job 编译了 tauri 应用本体 |
-| **Android** | 🟡 **Rust 侧可交叉编译**；完整 APK 打包待符号链接权限 | 工具链已装（见 §1.8）；`aarch64-linux-android` 产物已验证为 ARM aarch64 ELF；APK 打包卡在 Windows 符号链接权限（需重登录） |
+| **Linux (Ubuntu)** | ✅ **可编译**；🟡 **可在 Xvfb 里运行**（真实桌面会话未验） | CI `ubuntu-latest` 绿；`scripts/verify_linux_runtime.py` 在 Xvfb 里真跑了 deb 与 AppImage：启动不 panic、10 条迁移全部成功、20 张表齐全、托盘图标渲染出 PNG |
+| **Android** | 🟡 **可编出 APK**（运行时一条未验） | 工具链已装（见 §1.8）；`tauri android build` 产出了 APK（debug 254 MiB / release 14.2 MiB），9 个 crate 全过 `aarch64-linux-android`；**真机/模拟器上的运行时行为未验证** |
 | **macOS** | ❓ 未验证 | 本机无 macOS；CI 未覆盖 |
 | **iOS** | ❓ 未验证 | 需要 Apple 开发者账号 |
 

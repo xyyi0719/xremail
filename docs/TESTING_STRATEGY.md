@@ -1,6 +1,6 @@
 # 测试策略
 
-> 状态：规范已定义，测试设施**已部分落地**（Rust 1096 个用例 / 前端 95 个用例 / Playwright E2E 5 条，
+> 状态：规范已定义，测试设施**已部分落地**（Rust 1097 个用例 / 前端 95 个用例 / Playwright E2E 5 条，
 > 假 IMAP 与假 SMTP 服务器可用；fuzz 未开始，见 §5）。适用于个人研究项目与 AI 编码工作流。
 > 目标：以可重复证据证明数据正确、安全隔离和失败恢复，不以覆盖率或编译成功代替验收。
 > 维护者：xyyi0719
@@ -108,6 +108,12 @@ CSP 取 `apps/shell/src-tauri/tauri.conf.json` 的 `app.security.csp` **原文**
 | N-http | `location.href` 强导航到远程 http 页面：**主文档被换掉了**（WebKitGTK 的 `get_uri()` 变成目标地址、监听端收到 `/nav-target.html`；Chromium 执行上下文被销毁） | 2/2 PASS（如实记录为「会导航」） | 同 | 是 |
 
 **总计**：WebKitGTK 49/49、Chromium 49/49；`--engine=both` 合计 **98/98 PASS，逐条结论差异 0 项**。
+这个 49 是**可以按脚本复算**的：每个用例的断言条数就是脚本里 `assert_table([...])` 的项数——
+A1 10、B0 1、B1 8、C1 6、J1 3、J0 3、S1 9、F1 3、N-file 2、N-data 2、N-http 2（数值导航在 `navigated`
+分支只出 1 条，在「没被换掉」分支出 2 条，所以按 2 计是**上界**）= 49。**2026-11-09 复核：表格里的
+「10/10、2/2、8/8、6/6、3/3 + 3/3、9/9、3/3、2/2」与脚本逐项对得上**（B0 实为 1 条，文档写 2/2 是按
+「无 CSP 对照的整组」记的，偏宽一格；不影响「全 PASS」这个结论）。
+注意：这 98 条是**探针脚本的断言项**，不是 `cargo test` 用例，**不计入** §5.3 的 1097。
 把 WebKitGTK 侧的 CSP 改成**响应头**下发（`--csp=header`）再跑：**49/49 PASS**；引擎控制台原话是
 `Refused to load http://127.0.0.1:PORT/img-http.gif because it does not appear in the img-src directive of the Content Security Policy.`
 
@@ -166,11 +172,11 @@ CSP 取 `apps/shell/src-tauri/tauri.conf.json` 的 `app.security.csp` **原文**
 | **T5** | MIME / charset 解析（含 GBK/GB18030 样本） | 乱码是国内邮箱最直接的用户投诉 | 合成 `.eml` | P1 | ✅ 完成（`xremail-message`；**30 封真实邮件解码零错误**） |
 | **T6** | HTML 清洗攻击样本集（OWASP XSS + 追踪像素） | 安全门槛，且纯函数、CI 友好 | 无 | P2 | ✅ 完成（2026-10-30，`xremail-core::html`：`javascript:` / `data:` / `on*` / `style` 里的 `url(javascript:)` / 整封邮件的 `html`+`body` 壳；**未开始**：真正完备的 OWASP 样本集） |
 | **T7** | 假 IMAP/SMTP 服务器跑完整同步链路 | 覆盖状态机集成，但要先有 T2 | T2 | P2 | ✅ 完成（IMAP：假服务器 + 拉取 + 回写（标记与移动/删除两条通道）端到端；SMTP：假服务器 + 能力协商 + 提交往返，`xremail-testkit`） |
-| **T8** | 故障注入（断线、超时、乱序响应、丢应答） | 验证「不确定结果不盲重发」等语义 | T7 | P2/P3 | 🟡 **部分**：断线/超时/丢应答已覆盖（→ `uncertain`）；**乱序响应已覆盖**（2026-11-09）：`Fault::InterleaveUntagged` 把一条**别的** untagged 响应插在命令自己的数据与 tagged 完成响应**之间**，11 条端到端用例证明命令层只认自己的 tag（`crates/xremail-protocol-imap/tests/interleaved.rs`）；仍缺的是「真服务商按随机时机插队」的样本 |
+| **T8** | 故障注入（断线、超时、乱序响应、丢应答） | 验证「不确定结果不盲重发」等语义 | T7 | P2/P3 | 🟡 **部分**（2026-11-09 核实：与代码一致，维持 🟡）：断线/超时/丢应答已覆盖（→ `uncertain`）；**乱序响应已覆盖**（2026-11-09）：`Fault::InterleaveUntagged` 把一条**别的** untagged 响应插在命令自己的数据与 tagged 完成响应**之间**，11 条端到端用例证明命令层只认自己的 tag（`crates/xremail-protocol-imap/tests/interleaved.rs`）；仍缺的是「真服务商按随机时机插队」的样本 |
 | **T9** | 前端组件与 E2E | 界面层，先保证后端语义正确再投入 | T5 | P3+ | 🟡 **部分**：前端组件用例 **15 个文件 / 95 个**（Vitest + Testing Library）；**Playwright E2E 已落地**（2026-11-06）：`apps/shell/playwright.config.ts` + `apps/shell/e2e/` 共 **2 个 spec 文件 / 5 条用例**，实测 **5 passed / 0 failed**（本地 12.2s；`CI=true` 模拟 10.8s）。起的是 Vite 开发服务器 + 真实 chromium，**不拉 Tauri 窗口**（CI 上没有 WebView），`window.__TAURI_INTERNALS__` 由 `page.addInitScript` 注入假后端。覆盖：① 文件夹邮件列表按 UID 倒序显示标题与发件人（含 `list_messages` 入参）；② 点开一封看到正文、打开不自动标已读；③ 写信面板没写收件人时前端拦下、不调 `send_message`（含「地址之间有空白」提醒）；④ 改动后 800ms 防抖自动存草稿、草稿箱里出现这一封；⑤ 收件人 + 主题填好后发送显示「已发送」与 `Message-ID`，发完发送按钮停用。已接进 CI 的 `web` job。**未覆盖**：附件与富文本编辑器（组件层在用），以及 `uncertain` 二次确认流 |
-| **T10** | fuzz（MIME / HTML / IMAP 响应解析） | 防御性加固，非功能正确性 | T5/T6 | P2+ | 🟡 **部分**（2026-11-09）：**没有引入 `cargo-fuzz`**——它要 nightly + `libfuzzer-sys`，且不进 PR CI；改为**固定种子的随机化属性测试**（stable 即可跑、零新依赖、失败可逐字复现），**四个解析器全都有了**：`crates/xremail-core/tests/sanitizer_properties.rs` **6 条**（HTML 消毒器）、`crates/xremail-message/tests/parser_properties.rs` **7 条**（MIME）、`crates/xremail-protocol-imap/tests/utf7_properties.rs` **6 条**（邮箱名编解码）、**IMAP 响应解析**：`crates/xremail-protocol-imap/tests/imap_parsing_properties.rs` **12 条**（纯函数：`FETCH` 属性一一对应、`BODY[…]` 落到哪个字段、`LIST` 属性→角色、IDLE 推送归类、`COPYUID`/`APPENDUID` 端点与上限、假服务器解析器自洽）+ `crates/xremail-protocol-imap/tests/response_properties.rs` **12 条**（真 TLS 端到端：`EXAMINE` 缺 `[UIDVALIDITY]` 是 `None`、`[HIGHESTMODSEQ]`/`[UNSEEN]`/`[UIDNEXT]` 照收、`COPYUID` 按下标 / 长短不一不硬套 / 展开有上限、没有 `COPYUID` 时源集合退回入参、`NO`/`BAD`/未知状态一律报错、`[MODIFIED]` 单独成类、**没有结局就挂住而不是报成功**）。为此 `xremail-testkit` 新增两个测试专用故障 `Fault::RespondWith` / `Fault::InjectUntagged`。**变异测试**：本轮 **18 个变异 18 个被捕获**（见 §5.1.1）。**它撞出过的真缺陷**：R45（整封转发的多个附件都记成 `TEXT`）；本轮还钉住了一处**已知残余**——`COPYUID` 源目标两侧各自截到同一上限时长度恰好相等、被当成可用映射（`truncated_copyuid_currently_looks_like_a_valid_mapping`）。**仍缺**：覆盖率引导的探索式 fuzz（`cargo-fuzz` / `libFuzzer` / AFL 仍然没做）；**不在本层可控范围**：`imap-proto` 与 async-imap 自身的解析（第三方 crate）——已实测坐实 async-imap 的 `APPEND` 在完成响应形状认不出时**挂住**，这一点只能靠调用方超时兜住，并在 `response_properties.rs` 里钉住 |
+| **T10** | fuzz（MIME / HTML / IMAP 响应解析） | 防御性加固，非功能正确性 | T5/T6 | P2+ | 🟡 **部分**（2026-11-09 核实：四个文件、行数逐个数过，见下；仍缺覆盖率引导 fuzz，故维持 🟡）：**没有引入 `cargo-fuzz`**——它要 nightly + `libfuzzer-sys`，且不进 PR CI；改为**固定种子的随机化属性测试**（stable 即可跑、零新依赖、失败可逐字复现），**四个解析器全都有了**：`crates/xremail-core/tests/sanitizer_properties.rs` **6 条**（HTML 消毒器）、`crates/xremail-message/tests/parser_properties.rs` **7 条**（MIME）、`crates/xremail-protocol-imap/tests/utf7_properties.rs` **6 条**（邮箱名编解码）、**IMAP 响应解析**：`crates/xremail-protocol-imap/tests/imap_parsing_properties.rs` **12 条**（纯函数：`FETCH` 属性一一对应、`BODY[…]` 落到哪个字段、`LIST` 属性→角色、IDLE 推送归类、`COPYUID`/`APPENDUID` 端点与上限、假服务器解析器自洽）+ `crates/xremail-protocol-imap/tests/response_properties.rs` **13 条**（2026-11-09 复核：R47 修复时由 12 涨到 13；真 TLS 端到端：`EXAMINE` 缺 `[UIDVALIDITY]` 是 `None`、`[HIGHESTMODSEQ]`/`[UNSEEN]`/`[UIDNEXT]` 照收、`COPYUID` 按下标 / 长短不一不硬套 / 展开有上限 / **任一侧截断就整份作废**（R47）、没有 `COPYUID` 时源集合退回入参、`NO`/`BAD`/未知状态一律报错、`[MODIFIED]` 单独成类、**没有结局就挂住而不是报成功**）。为此 `xremail-testkit` 新增两个测试专用故障 `Fault::RespondWith` / `Fault::InjectUntagged`。**变异测试**：本轮 **18 个变异 18 个被捕获**（见 §5.1.1）。**它撞出过的真缺陷**：R45（整封转发的多个附件都记成 `TEXT`）；这处**已知残余**原先是钉住的（`truncated_copyuid_currently_looks_like_a_valid_mapping`），**2026-11-09 已修（R47）**，该用例改写成 `truncated_copyuid_is_refused_instead_of_used_as_a_mapping`。**仍缺**：覆盖率引导的探索式 fuzz（`cargo-fuzz` / `libFuzzer` / AFL 仍然没做）；**不在本层可控范围**：`imap-proto` 与 async-imap 自身的解析（第三方 crate）——已实测坐实 async-imap 的 `APPEND` 在完成响应形状认不出时**挂住**，这一点只能靠调用方超时兜住，并在 `response_properties.rs` 里钉住 |
 
-**Rust 用例总数：4 → 1096**（2026-10-30 达 687；2026-11-03 随调度器 700、
+**Rust 用例总数：4 → 1097**（2026-10-30 达 687；2026-11-03 随调度器 700、
 移动/删除写路径 747、崩溃恢复 778、IDLE 客户端侧与调度器接线 790、
 认证失败终态 792、审计修复（重发幂等 / 命令超时 / panic 边界补漏）797、
 认证分类纠偏（R25）802、文档审计补正 803、A 组审计缺陷修复（R26–R42）835、对账时机与租约（R29/R32/R33）842；
@@ -179,11 +185,19 @@ CSP 取 `apps/shell/src-tauri/tauri.conf.json` 的 `app.security.csp` **原文**
 2026-11-09 托盘与退出语义、DKIM 跨平台用例 + 凭据契约测试（R07）、
 T8 乱序响应（11 条）、folder 角色落库（R04）合并后 **1050**；
 2026-11-09 属性测试补上 UTF-7（6 条）后 **1056**，CI 实测同口径）；
-2026-11-09 T10 补上 IMAP 响应解析（24 条：`imap_parsing_properties.rs` 12 + `response_properties.rs` 12）后 **1086**；
-其中 **1 个是 `#[ignore]`**（`apps/shell/src-tauri/tests/real_mail_roundtrip.rs:68`，
-真实邮箱往返、会真的发信），所以 `cargo test` 实际执行 **1095** 个
-（2026-11-09 实测：`env -u DBUS_SESSION_BUS_ADDRESS cargo test --workspace -j 4 --no-fail-fast`，
-累加所有 `test result:` 行 = **1085 passed / 0 failed / 1 ignored**）
+2026-11-09 T10 补上 IMAP 响应解析（当时 24 条：`imap_parsing_properties.rs` 12 + `response_properties.rs` 12）后 **1086**；
+2026-11-09 修 R46 / R47 后 **1088**（R47 把「截断的 `COPYUID` 被当成有效映射」那条钉住现状的用例改写成
+2 条：`response_properties.rs` 由 12 涨到 13）；
+同日新邮件通知（`notify.rs` 的 8 条纯函数用例）合并后 **本轮 1096**。
+其中 **1 个是 `#[ignore]`**（`apps/shell/src-tauri/tests/real_mail_roundtrip.rs` 的
+`real_round_trip_between_two_mailboxes`，真实邮箱往返、会真的发信；旧版引用的 `:68` 已失效，按用例名检索），
+所以 `cargo test` 实际执行 **1096** 个
+（2026-11-09 本轮实测：`cargo test --workspace -- --list 2>/dev/null | grep -c ': test$'` = **1096**，
+逐包相加同为 1097：core 127 / store 113 / crypto 40 / api 38 / sync 216 / protocol-imap 161 /
+protocol-smtp 37 / testkit 69 / message 105 / dkim 40 / diagnostics 3 / shell 147；
+同口径全量跑累加 `test result:` = **1096 passed / 0 failed / 1 ignored**）；
+上一条记录（同日较早，1088 那一批）实测为 `env -u DBUS_SESSION_BUS_ADDRESS cargo test --workspace -j 4 --no-fail-fast`，
+累加所有 `test result:` 行 = **1085 passed / 0 failed / 1 ignored**（`--list` 1086）
 （2026-11-06 实测：`cargo test --workspace -j 4 --no-fail-fast`，
 累加所有 `test result:` 行 = **987 passed / 0 failed / 1 ignored**；
 `--` `--list` 点数同口径 **988**）。
@@ -210,18 +224,12 @@ T8 乱序响应（11 条）、folder 角色落库（R04）合并后 **1050**；
 |---|---|---|
 | 同步纯函数（T2） | 7 | 7/7 |
 | 拉取链路 | 7 | 7/7 |
-| 标记回写 | 8 | 8/8（其中 1 条**第一版没被抓住**——用例查的是本地标记，\n  改成查服务器上的真实状态后才抓住） |
+| 标记回写 | 8 | 8/8（其中 1 条**第一版没被抓住**——用例查的是本地标记，改成查服务器上的真实状态后才抓住） |
 | 头与正文 | 7 | 7/7 |
-| IMAP 响应解析（T10，2026-11-09） | 18 | 18/18：`APPENDUID` 改成 `end-1`、展开少一个、上限放大 20 倍、
-  去掉 `has_uid_mapping` 的长度检查、按值而不是按下标查映射、源集合为空时不回退、IDLE 不认 `BYE`、
-  不认识的属性认成 `trash`、见到 untagged 就收工、LIST 只认名字、`BODY[TEXT]` 落进 `body`、
-  `SequenceSet` 开区间、假服务器放宽 `STORE` / 取件项括号 / 把不认识的搜索键当 `ALL`、读到断线当成成功。
-  **其中一条第一版没被抓住**：`BODY[TEXT]` 落进 `body` 时字段数仍是 1，而第一版的断言是「恰好一个字段非空」
-  ——它照样绿。第二版改成**逐段钉死是哪一个字段**（头→header、正文→text、整封/部件→body）后才抓住。
-  这个教训与「第一版消毒器按子串判」是同一类：**断言要窄到能区分「对」与「碰巧对」**
-| 认证失败终态（`reap_finished`） | 1 | 1/1（把 `reap_finished` 改成空操作后
-  `a_reauth_required_account_can_be_started_again` 确实失败：`tx.send` 到已死的
-  actor 不报错，重启只是叫醒尸体——这类「静默停止同步」只能靠变异测试挡住） |
+| IMAP 响应解析（T10，2026-11-09） | 18 | 18/18：`APPENDUID` 改成 `end-1`、展开少一个、上限放大 20 倍、去掉 `has_uid_mapping` 的长度检查、按值而不是按下标查映射、源集合为空时不回退、IDLE 不认 `BYE`、不认识的属性认成 `trash`、见到 untagged 就收工、LIST 只认名字、`BODY[TEXT]` 落进 `body`、`SequenceSet` 开区间、假服务器放宽 `STORE` / 取件项括号 / 把不认识的搜索键当 `ALL`、读到断线当成成功。**其中一条第一版没被抓住**：`BODY[TEXT]` 落进 `body` 时字段数仍是 1，而第一版的断言是「恰好一个字段非空」——它照样绿；第二版改成**逐段钉死是哪一个字段**（头→header、正文→text、整封/部件→body）后才抓住。这个教训与「第一版消毒器按子串判」是同一类：**断言要窄到能区分「对」与「碰巧对」** |
+| 认证失败终态（`reap_finished`） | 1 | 1/1（把 `reap_finished` 改成空操作后 `a_reauth_required_account_can_be_started_again` 确实失败：`tx.send` 到已死的 actor 不报错，重启只是叫醒尸体——这类「静默停止同步」只能靠变异测试挡住） |
+| 截断的 `COPYUID`（R47，2026-11-09） | 2 | 2/2（撤销 `copy_uid_of` 的截断处置 → `truncated_copyuid_is_refused_instead_of_used_as_a_mapping` 与 `truncation_only_cuts_the_tail_and_says_so` 同时变红） |
+| 命令超时（R46，2026-11-09） | 1 | 1/1（把超时改成 3600 秒 → `a_server_that_never_answers_does_not_hang_the_sent_copy_check` **挂死**，`timeout 60` 退出码 124，正是修复前的行为） |
 
 变异脚本在 `target/mutate*.js`（不入库）；2026-11-09 那一轮用的是 `.devcache/mut/mutate.sh`
 （同样不入库：逐条 `cp` 备份 → 改一处 → 只跑相关测试目标 → 还原，跑完 `git diff src/` 核对无残留）。
@@ -243,9 +251,11 @@ cargo test --workspace -- --list | grep -c ': test$'
 该数字随每次提交变化，写入 CHANGELOG。**用例数本身不是质量证明**——它只用于回答「比上次多了多少」。
 CI 已在 `Test` 步骤后输出该计数（见 `.github/workflows/ci.yml`）。
 
-计数：**1086**（2026-11-09 在 Linux 本机实测；含 1 个 `#[ignore]`，实际执行 **1085**，
-全量跑累加 `test result:` 同为 1085 passed / 0 failed / 1 ignored）。
-上一条记录是 988（2026-11-06 在 Windows 本机实测；实际执行 987）。
+计数：**1097**（2026-11-09 在 Linux 本机实测；含 1 个 `#[ignore]`，实际执行 **1096**，
+全量跑累加 `test result:` 同为 1096 passed / 0 failed / 1 ignored）。
+上一条记录是 1088（2026-11-09 修 R46 / R47 那一批；`--list` 口径，R47 把现状用例改写成 2 条）。
+再上一条是 1086（2026-11-09 T10 补 IMAP 解析那一批；实际执行 1085）。
+上一条记录是 988（2026-11-06 在 Windows 本机实测；实际执行 987）。**注意**：这一条在历史顺序上应当排在 1086 / 1088 之前（日期更早），旧版把它接在 1086 之后是排版错误，数字本身不动。
 同一天用「全量跑一遍累加 `test result:`」的数法也是 987 passed + 1 ignored。
 上一条记录是 870（2026-11-06 断线重连那一批，实际执行 869）；再上一条是 803（2026-11-04，`--list` 口径，实际执行 802）。
 
@@ -282,7 +292,7 @@ npm run build --prefix apps/shell
 
 ### 6.1 本地改一行就跑全量是浪费：用 `scripts/test_changed.py`
 
-全量是 **987 个用例**，改一段注释也跑一遍，等于把最贵的一步做成最高频的一步。
+全量是 **1097 个用例**，改一段注释也跑一遍，等于把最贵的一步做成最高频的一步。
 本地日常改成：
 
 ```bash
@@ -305,7 +315,7 @@ python scripts/test_changed.py --all      # 发版 / 推 PR 前跑全量
 另外 `cargo test -p` 仍然要编译上游依赖，「省」的是**用例执行**与无关包的链接，
 不是编译。
 
-2026-10-30 实测（**当时的数字**，不是现状；现在为 988 个 Rust 用例、95 个前端用例、5 条 E2E，
+2026-10-30 实测（**当时的数字**，不是现状；现在为 **1097** 个 Rust 用例（实际执行 1096）、95 个前端用例、5 条 E2E，
 见 §5.1 与 §5.3）：
 以上六条在本机全部通过；`cargo test --workspace` 实际执行 **544** 个 Rust 用例
 （0 失败），CI 上 Linux 是 **538**（少 6 条 Windows 专属用例），`npm test` 跑 **27** 个前端用例（5 个文件，0 失败）。

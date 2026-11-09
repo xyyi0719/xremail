@@ -42,7 +42,15 @@ impl SecretStore for UnsupportedSecretStore {
 
     async fn set(&self, _secret_ref: &str, _value: &SecretValue) -> Result<(), SecretStoreError> {
         Err(SecretStoreError::Unavailable(
-            "当前平台暂不支持保存凭据（只有 Windows 凭据管理器已适配）".into(),
+            // 文案里**不要**再举「只有 Windows 已适配」这种例子：
+            // Linux 的 Secret Service 适配（`linux_store.rs`）早已落地，
+            // 这句话会把 macOS / Android 用户引向一个过时的印象。
+            // 说「本平台」就够了——调用方拿到的就是这个平台的结果。
+            concat!(
+                "当前平台暂不支持保存凭据（本平台还没有钥匙串适配；",
+                "Windows 用凭据管理器、Linux 用 Secret Service）"
+            )
+            .into(),
         ))
     }
 

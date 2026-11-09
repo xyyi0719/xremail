@@ -1,7 +1,9 @@
 # 路线图
 
 > 执行范围入口。个人研究项目，AI 编码，允许一年以上探索；不使用未经测量的 AI 耗时系数或固定交付日期。
-> 当前已交付 P0–P3（见 §2 的打勾项）；P4 的 Windows 侧已交付、**Android 侧只做到「能编出 APK」**（真机上的运行时行为一条未验，见 P4 小节）；P5（增值）/ P6（L2 远端同步）未开始。
+> 当前已交付 P0–P3（见 §2 的打勾项）；P4 的 Windows 侧已交付、**Android 侧只做到「能编出 APK」**（真机上的运行时行为一条未验，见 P4 小节）；
+> **P5-L（Linux 支持）** 的主要工作已落地（打包、钥匙串、托盘、通知、开机自启、WebKitGTK 沙箱验证），剩下的只有「真实桌面会话 / 非 Debian 发行版」这类需要真机的项；
+> P5（本地增值功能：标签/规则/联系人）/ P6（L2 远端同步）**未开始**。
 > 已确认：国内邮箱优先、Gmail 暂缓、先 L1 且 P0 预留 L2。
 > 维护者：xyyi0719
 
@@ -491,8 +493,14 @@ Gradle 9.6.1（wrapper 自带）、cargo-ndk。**没有任何 Android 设备或�
      其 manifest 带来 `POST_NOTIFICATIONS` / `WAKE_LOCK` / `RECEIVE_BOOT_COMPLETED`
      三个权限（`aapt2` 在 APK 里都看得到），并注册了
      `TimedNotificationPublisher` / `LocalNotificationRestoreReceiver` 等接收器。
-     **但应用自己从未调用过通知 API**（`grep` 无 `Notification` 调用点），
-     Android 13+ 的运行时通知权限也从没申请过——**能不能弹、弹出来长什么样，未验证**。
+     **这一段在 2026-11-09 之后已经不准了**：当时写的是「应用自己从未调用过通知 API」，
+     但同一天 P5-L 的新邮件通知已经落地（`apps/shell/src-tauri/src/notify.rs`，
+     触发点是 `TauriSink` 收到 `AccountEvent::Synced`）。所以现在的情况是：
+     - 桌面端：通知**代码存在且判据有单测**，但**在真实桌面会话里是否真的弹出未验证**
+       （本机连 `notify-send` 都被沙箱的 AppArmor 只读限制挡住）
+     - Android：`notify_new_mail` 会调 `request_permission()`，但
+       **Android 13+ 的运行时 `POST_NOTIFICATIONS` 权限在真机上能不能申请到、弹出来长什么样，仍然未验证**
+       ——这一段**只有真机/AVD 才能回答**，不要因为「代码写了」就当成验过
 5. **为跑通构建改了什么**：**Android 工程与 `tauri.conf.json` 一个字都没改**，
    `AndroidManifest.xml` 与 `build.gradle.kts` 保持 `init` 生成的原样。
    卡住的是**沙箱环境**（`$HOME` 只读），不是 Tauri 2.12 的配置：
@@ -539,7 +547,7 @@ Gradle 9.6.1（wrapper 自带）、cargo-ndk。**没有任何 Android 设备或�
 | 数据目录 / SQLite 打开 / 迁移 | **未验证** | 真机或 AVD 上启动一次，看 `app_data_dir` 与 `xremail.db` 是否落地 |
 | 阅读 / 发信 / 本地缓存 | **未验证** | 同上，且要能连真实邮箱（163/QQ） |
 | 前台 / 后台 / 息屏 / 进程恢复 | **未验证** | 真机；`adb` 观察进程优先级与 `dumpsys` 的 Doze 状态 |
-| 通知 | **未验证**（权限已在 manifest 里，但从未申请、从未发） | 真机 + Android 13+ 的运行时权限 |
+| 通知 | **未验证**（2026-11-09 起代码会调 `request_permission()` 并发通知——见 `src/notify.rs`；但**真机上能不能拿到 Android 13+ 的运行时权限、通知长什么样，没验过**） | 真机 + Android 13+ 的运行时权限 |
 | Keystore | **未实现**（当前是桩，已在二进制里坐实） | 先写适配器，再按上面的门槛验 |
 
 **出口**：Windows 与 Android 分别记录能力矩阵；若 Android 未验收，只能称 Windows alpha，不能称双端 MVP。
@@ -554,8 +562,11 @@ Gmail 将来有需求再开独立决策：授权流程、scope、个人使用与
 
 ### P5-L：Linux 支持（可选，不承诺）
 
-**当前事实**：Linux 编译已被 CI 验证（ubuntu job 编译了 tauri 应用本体）；**运行未验证**。
-详见 [ENVIRONMENT.md §2](ENVIRONMENT.md)。
+**当前事实（2026-11-09 更新）**：Linux 编译早已被 CI 验证（ubuntu job 编译的是应用本体）；
+**运行**这一轮也验了一部分——用 Xvfb 虚拟显示真跑了打包产物（`scripts/verify_linux_runtime.py`：
+启动不 panic、建出数据库、10 条迁移全部成功、托盘图标真的渲染出来、deb 与 AppImage 都跑通）。
+**但「真实桌面会话」仍未验**：Xvfb 里没有真实输入、没有面板承载托盘、
+`notify-send` 也被沙箱的 AppArmor 只读限制挡住。详见 [ENVIRONMENT.md §2](ENVIRONMENT.md)。
 
 若要支持 Linux，需额外完成：
 
@@ -667,8 +678,8 @@ Gmail 将来有需求再开独立决策：授权流程、scope、个人使用与
   - 脚本本身做了变异测试：把期望迁移数改错，它会立刻报「对不上」
   - **未做**：**rpm**（本机没有 `rpmbuild`）；`tauri build` 不带 `--bundles`
     时 `targets: "all"` 在 Linux 上会同时试 deb 与 appimage，两者都快，可以照常跑
-  - **未验证**：在**真正的桌面会话**里双击启动（Xvfb 下托盘起不来，见下一条）；
-    以及 Fedora 等非 Debian 系发行版
+  - **未验证**：在**真正的桌面会话**里双击启动（Xvfb 下跑得起来，托盘也能建出来——
+    见 P5-L 托盘那条；缺的是真实输入与面板承载）；以及 Fedora 等非 Debian 系发行版
 - [ ] 至少 2 个主流发行版的真机运行验证（Ubuntu / Fedora 系）
 
 > 优先级低于 P4 的 Windows/Android 验收。**在用户明确提出需求前不投入。**

@@ -951,3 +951,43 @@ fn truncation_only_cuts_the_tail_and_says_so() {
     assert_eq!(expanded, vec![5, 6, 7]);
     assert!(!truncated, "没砍东西就不能说砍了");
 }
+
+/// **恰好用满上限不算截断**（R47 的等号边界）。
+///
+/// 这一条是审计时被指出来的：第一版实现写成「`out.len() >= LIMIT` 就置
+/// `truncated`」，于是**恰好用满、后面一个成员都不剩**时也报「被截断」——
+/// 那会让一份完好的 `COPYUID` 被判成不可用，写回白白丢一次。
+///
+/// 反过来，真的多出东西时必须报真：多一个成员就算丢。
+#[test]
+fn filling_the_limit_exactly_is_not_truncation() {
+    use imap_proto::rfc4315::UidSetMember;
+    use xremail_protocol_imap::transfer::expand_uid_set_checked;
+
+    // 恰好 10 000 个（上限），后面没有任何成员。
+    let exactly = vec![UidSetMember::UidRange(1..=10_000)];
+    let (expanded, truncated) = expand_uid_set_checked(&exactly);
+    assert_eq!(expanded.len(), 10_000);
+    assert!(
+        !truncated,
+        "恰好用满上限、后面没有成员，什么都没丢——不能报截断"
+    );
+
+    // 单个成员就用满，再跟一个单值：那个多出来的放不下，必须报截断。
+    let one_more = vec![
+        UidSetMember::UidRange(1..=10_000),
+        UidSetMember::Uid(10_001),
+    ];
+    let (expanded, truncated) = expand_uid_set_checked(&one_more);
+    assert_eq!(expanded.len(), 10_000);
+    assert!(truncated, "多出一个成员就是丢了东西，必须报截断");
+
+    // 两个成员**恰好**拼满：加起来正好 10 000，不该报截断。
+    let split = vec![
+        UidSetMember::UidRange(1..=5_000),
+        UidSetMember::UidRange(5_001..=10_000),
+    ];
+    let (expanded, truncated) = expand_uid_set_checked(&split);
+    assert_eq!(expanded.len(), 10_000);
+    assert!(!truncated, "两个成员正好拼满，同样什么都没丢");
+}
