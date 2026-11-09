@@ -138,6 +138,7 @@ async fn seed_account_and_folder(pool: &SqlitePool) -> (SqlitePool, Folder) {
         last_uid: None,
         highest_modseq: None,
         uidvalidity: None,
+        role: None,
     };
     folder_dao::upsert_folder(pool, &folder)
         .await

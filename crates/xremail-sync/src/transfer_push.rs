@@ -24,8 +24,20 @@
 //! ## 删除 = 进垃圾箱（保守优先）
 //!
 //! 用户点「删除」不等于「永久删除」。有垃圾箱就**挪进去**（等于 `Move`），
-//! 没有才就地标删。垃圾箱靠文件夹名推断（[`role_by_name`]）——
-//! 本地库目前不存 `\Trash` 属性，这一点已在文档里写明。
+//! 没有才就地标删。垃圾箱按下面的顺序认（[`trash_candidates`]）：
+//!
+//! 1. **本地库里记着的 `trash` 角色**——`LIST` 宣告了 `\Trash`，同步时写进
+//!    `folder.role`（0010 迁移）。这是**服务器自己说的**，最可靠；
+//! 2. 库里的角色是 `NULL`（这一轮同步没认出来，或者是升级前就落库的老行）
+//!    时，**才**退回按文件夹名推断（[`role_by_name`]）。
+//!
+//! 顺序不能反过来：名字推断是猜测，宣告是事实。也不能省掉第 2 步：
+//! `NULL` 的语义是「还不知道」，不是「没有垃圾箱」——省掉它的话，
+//! 升级后还没同步过的账户会突然从「删除 = 进垃圾箱」变成「就地标删」，
+//! 用户那边看起来就是**改了个版本，删除再也撤销不回来了**。
+//!
+//! 两道线索都没有时，删除就地标删（可撤销性无从谈起时，至少不把信挪到
+//! 一个名字碰巧像垃圾箱的文件夹里去）。
 //!
 //! ## 失败分类
 //!
@@ -37,15 +49,47 @@
 //! 就认为**已经移动成功**。可能是我们上一次尝试生效了（应答丢了），
 //! 也可能是别人挪走了——两种情况下「再挪一次」都是错的
 //! （RFC 6851 的 `MOVE` 不是幂等的）。
+//!
+//! ## 目标文件夹的新 UID：拿得到就连同 epoch 一起写回（R39）
+//!
+//! 移动成功后，源文件夹的本地行删掉、目标文件夹立刻补一行——
+//! 不补的话，那封信要等**下一轮全量同步**才出现在目标文件夹里，
+//! 这期间本地对目标侧的 UID 一无所知：用户看到的是「挪了，但哪也找不到」，
+//! 甚至可能被重复下载。
+//!
+//! 写回需要三样东西，缺一样就不写（**宁可空，不造假**）：
+//!
+//! 1. **目标侧的新 UID**：来自 `COPYUID`（RFC 4315）。`MOVE` 与 `COPY` 两条路由
+//!    都可能有它；服务器不给就没有。旧 UID 在目标文件夹里是**另一个 UID 空间**，
+//!    拿源 UID 去写等于凭空造一行。
+//! 2. **目标文件夹的 epoch**：`COPYUID` 只带**源**文件夹的 UIDVALIDITY，
+//!    目标的一律不给（见 `xremail_protocol_imap::transfer` 的说明）。
+//!    本地 `message` 的身份是 `(account_id, folder_id, uidvalidity, uid)`，
+//!    没有 epoch 就没有地方放这个 UID。于是一次 `EXAMINE` 目标文件夹把它取出来
+//!    （见 [`destination_epoch`]）。取不到就不写。
+//! 3. **本地库认识的同一个 epoch**：`EXAMINE` 拿到的 epoch 与库里目标文件夹
+//!    记着的那个不一样时，说明目标文件夹刚被服务器重建过，下一个 UID 的含义
+//!    已经不再是这次 `COPYUID` 说的那个（见 [`write_back`]）。同样不写。
+//!
+//! 三种情况都只记日志、不报错：移动**本身**已经成功了，一行缓存没写回去
+//! 不是失败——代价是那封信晚一轮同步才出现（下一轮拉取会把它补上），
+//! 而不是把操作记成失败让用户重试（`MOVE` 重发就是第二份副本）。
+//!
+//! 写回的那一行**新生成 `id`**，不搬源端那封的 `id`：`id` 是本地生成的，
+//! 与 `(folder_id, uid)` 绑在一起、被 `message_body` / `attachment` 用外键引用，
+//! 搬过去等于让「目标文件夹里的这封」顶着「源文件夹里那封」的名字，
+//! 正文与附件都会挂到错的地方（理由见 [`write_back`]）。
 
 use std::time::Duration;
 
-use xremail_core::model::{Folder, MailOperation, OperationKind, OperationState};
+use xremail_core::model::{Folder, MailOperation, Message, OperationKind, OperationState};
 use xremail_core::{AppError, AppResult};
 use xremail_protocol_imap::folders::role_by_name;
+use xremail_protocol_imap::transfer::TransferOutcome;
 use xremail_protocol_imap::{
-    CommandOutcome, Session, copy_messages_with_timeout, has_capability, mark_deleted_with_timeout,
-    move_messages_with_timeout, uid_expunge_with_timeout,
+    CommandOutcome, Session, copy_messages_with_timeout, examine_checked_with_timeout,
+    has_capability, mark_deleted_with_timeout, move_messages_with_timeout,
+    uid_expunge_with_timeout,
 };
 use xremail_store::dao::{folder as folder_dao, message as message_dao, operation};
 
@@ -69,6 +113,16 @@ pub struct TransferPushReport {
     pub quarantined: usize,
     /// 一条命令都没发就成功的（服务器上已经是目标状态）。
     pub noop: usize,
+    /// 服务器报告搬走了、但目标侧的新 UID 没能写回本地几封（R39）。
+    ///
+    /// **不是失败**：移动已经生效，只是目标文件夹的本地行要等下一轮同步才出现。
+    /// 单独计数是为了让它能从日志里查出来——否则「挪过去之后有一阵子找不到」
+    /// 只能靠用户反馈才知道。
+    ///
+    /// 它**不计入** [`Self::total`]：那一项数的是「本轮处理了几条操作」，
+    /// 而这里是其中几封操作的一个附注。算进去的话，一条 `uncertain` 操作
+    /// 会被数两遍，界面上的合计就对不上了。
+    pub not_written_back: usize,
 }
 
 impl TransferPushReport {
@@ -82,6 +136,9 @@ impl TransferPushReport {
     }
 
     /// 本轮一共处理了几条操作（应当是七项之和）。
+    ///
+    /// 只数七个互斥的结局，**不含** [`Self::not_written_back`]（那不是结局，
+    /// 是 `moved` / `deleted` 的附注，见那个字段的说明）。
     pub fn total(&self) -> usize {
         self.moved
             + self.deleted
@@ -437,6 +494,13 @@ pub async fn push_transfers_as_with_options(
             }
         }
 
+        // 本地那封的内容**先抄下来**，再提交。
+        //
+        // 顺序不能反：源端本地行在提交成功后要删（那是「本地跟得上服务器」
+        // 的那一步），删了就没有内容可抄给目标文件夹了。先抄进内存不动库，
+        // 提交失败时直接丢掉——它只是个值，不是写了一半的行。
+        let source = load_message(pool, &folder.account_id, &folder.id, epoch, op.uid).await;
+
         match submit(session, op.uid, &route, copy_already_done, timeout).await {
             Ok(result) => {
                 // 本地视图跟着服务器走：源文件夹里这封邮件已经不该显示了。
@@ -449,6 +513,71 @@ pub async fn push_transfers_as_with_options(
                 )
                 .await?;
 
+                // 源端清理之后，把目标文件夹的本地行补上（R39）。
+                //
+                // 排在这里而不是提交之前：先补目标再删源，万一中间出错，
+                // 同一封信会短暂地出现在两个文件夹里；反过来最坏的情况是
+                // 两个文件夹里都没有——而那种状态下一轮同步会自己修好。
+                //
+                // 只有**移动**才有目标侧那一行。就地删除（`Route::Expunge`）的
+                // `transfer` 本来就是 `None`，它不该走进写回，更不该被计成
+                // 「没写回」——那会让界面上出现一笔莫名其妙的「1 封没跟上」。
+                let writeback_target = match (&result, op.kind) {
+                    (
+                        SubmitResult::Submitted {
+                            transfer: Some(transfer),
+                        },
+                        OperationKind::Move,
+                    ) => Some((transfer, op.destination_folder_id.as_deref())),
+                    _ => None,
+                };
+
+                if let Some((transfer, destination_folder_id)) = writeback_target
+                    && let Err(not_written) = write_back(
+                        pool,
+                        session,
+                        destination_folder_id,
+                        source.as_ref(),
+                        op.uid,
+                        Some(transfer),
+                        timeout,
+                    )
+                    .await
+                {
+                    report.not_written_back += 1;
+                    tracing::debug!(
+                        account = %folder.account_id,
+                        source = %folder.remote_name,
+                        uid = op.uid,
+                        reason = %not_written,
+                        "移动已生效，但目标文件夹的本地行没能写回，等下一轮同步补上"
+                    );
+                }
+
+                // 写回多半 `EXAMINE` 过目标文件夹，会话现在停在**别的**文件夹上
+                // （就连 `EXAMINE` 失败时停在哪里也不确定）。
+                //
+                // 下一条操作的前提是「选中的是源文件夹」：带着错的选中状态继续跑，
+                // `source_has_uid` 会对着**目标**文件夹查**源** UID，把它误判成
+                // 「已经不在了」而记成 `noop`——一封没搬的信被当成搬走了。
+                // 这一条搬运**已经成功**，只是收不了尾，所以记 `uncertain`：
+                // 不确定的是**连接状态**，不是邮件在哪。剩下的留给重连后再处理。
+                //
+                // 切不回去就直接收口（见下面 `return`）：连「这条操做的状态」
+                // 都写不进去时，继续往下跑只会让报告与库里对不上。
+                let reselected = select_for_write(session, &folder.remote_name, timeout).await;
+
+                // 计数**互斥**（R36）：一封「服务器上本来就没有了」的信
+                // 一条命令都没发，只能算 `noop`，不能同时算 `moved`/`deleted`。
+                // 否则界面上的「N 封已移动」会把没发生的事也算进去。
+                match &result {
+                    SubmitResult::AlreadyGone => report.noop += 1,
+                    SubmitResult::Submitted { .. } => match op.kind {
+                        OperationKind::Delete => report.deleted += 1,
+                        _ => report.moved += 1,
+                    },
+                }
+
                 operation::update_operation_state(
                     pool,
                     &op.id,
@@ -459,13 +588,16 @@ pub async fn push_transfers_as_with_options(
                 )
                 .await?;
 
-                // 计数**互斥**（R36）：一封「服务器上本来就没有了」的信
-                // 一条命令都没发，只能算 `noop`，不能同时算 `moved`/`deleted`。
-                // 否则界面上的「N 封已移动」会把没发生的事也算进去。
-                match (result, op.kind) {
-                    (SubmitResult::AlreadyGone, _) => report.noop += 1,
-                    (SubmitResult::Submitted, OperationKind::Delete) => report.deleted += 1,
-                    (SubmitResult::Submitted, _) => report.moved += 1,
+                if let Err(error) = reselected {
+                    let message = submit_error_message(&error);
+                    for rest in &transfers[index + 1..] {
+                        operation::mark_operation_uncertain(
+                            pool, &rest.id, "unknown", message, now_ms,
+                        )
+                        .await?;
+                        report.uncertain += 1;
+                    }
+                    return Ok(report);
                 }
             }
             Err(SubmitError::Retryable { message }) => {
@@ -506,10 +638,17 @@ pub async fn push_transfers_as_with_options(
 }
 
 /// 提交成功的方式。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SubmitResult {
     /// 命令生效了。
-    Submitted,
+    Submitted {
+        /// 服务器回的 `COPYUID`（含目标侧的新 UID）。
+        ///
+        /// `None` 有三种情况，对写回来说都一样（不写）：
+        /// 就地删除（没有目标）、服务器没给 `COPYUID`、这一轮跳过了 `COPY`
+        /// 那一半（副本是上一轮复制的，那次的 `COPYUID` 早随应答一起丢了）。
+        transfer: Option<TransferOutcome>,
+    },
     /// 服务器上源文件夹里已经没有这封邮件了，不必再发命令。
     AlreadyGone,
 }
@@ -518,7 +657,10 @@ enum SubmitResult {
 ///
 /// `copy_already_done` 为真时跳过 `COPY` 那一半（调用方已经用 `Message-ID`
 /// 在目标文件夹里探到副本了），只补完源文件夹的删除。
-/// 取出 [`SubmitError`] 里的人话部分（三个分支都只有一个 `message`）。
+///
+/// 返回值里带上 `COPYUID` 的解析结果（`destination_uids` 与 `source_uids`
+/// 按下标一一对应，RFC 4315）：调用方要靠它把目标侧的新 UID 写回本地（R39）。
+/// 以前这里把它解构掉扔了——「解析得很完整」和「生产路径用上了」是两件事。
 fn submit_error_message(error: &SubmitError) -> &str {
     match error {
         SubmitError::Retryable { message }
@@ -546,19 +688,31 @@ async fn submit(
         return Ok(SubmitResult::AlreadyGone);
     }
 
+    // 只有 `COPY` / `MOVE` 会给 `COPYUID`；就地删除没有目标，也就没有映射。
+    let mut transfer: Option<TransferOutcome> = None;
+
     match route {
         Route::Move { destination } => {
-            move_messages_with_timeout(session, &[uid32], destination, timeout)
-                .await
-                .map_err(classify_submit_error)?;
+            transfer = Some(
+                move_messages_with_timeout(session, &[uid32], destination, timeout)
+                    .await
+                    .map_err(classify_submit_error)?,
+            );
             confirm(session, uid32, timeout).await?;
         }
         Route::CopyDelete { destination } => {
             // 探测已经确认目标文件夹里有这封，再发一次 `COPY` 就多一份。
+            //
+            // 跳过的那一次也意味着没有 `COPYUID`：目标侧的新 UID 是**上一轮**
+            // 复制出来的，当时应答就丢了。猜一个（例如「目标文件夹的 max+1」）不行：
+            // 那种猜测一旦落库就是一个指着别的信的 UID，下一轮同步还未必能纠正它
+            // （见 [`write_back`] 的说明），所以这一轮不写回。
             if !copy_already_done {
-                copy_messages_with_timeout(session, &[uid32], destination, timeout)
-                    .await
-                    .map_err(classify_submit_error)?;
+                transfer = Some(
+                    copy_messages_with_timeout(session, &[uid32], destination, timeout)
+                        .await
+                        .map_err(classify_submit_error)?,
+                );
             }
             mark_deleted_with_timeout(session, &[uid32], timeout)
                 .await
@@ -580,7 +734,7 @@ async fn submit(
         }
     }
 
-    Ok(SubmitResult::Submitted)
+    Ok(SubmitResult::Submitted { transfer })
 }
 
 /// 目标文件夹里是否已经有这封（按 `Message-ID` 认）。
@@ -694,6 +848,210 @@ async fn examine_for_probe(
         })
 }
 
+/// 为什么目标文件夹的本地行没能补上（R39）。
+///
+/// **不是错误类型**：移动已经生效了，这里每一条都只是「这一轮不写回,
+/// 等下一轮同步补上」的理由。做成枚举是为了让调用方能计数、也让日志一眼看出
+/// 是「服务器没给」还是「我们不敢用」——两者的下一步完全不同（前者没救，
+/// 后者可能下一轮就正常了）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotWritten {
+    /// 操作没记目标文件夹（删除，或者移动的目标行在本地没了）。
+    NoDestination,
+    /// 服务器没给 `COPYUID`（163 与沃都不保证给）。
+    NoUidMapping,
+    /// 打不开目标文件夹，拿不到它的 epoch。
+    DestinationUnreachable,
+    /// 服务器没给目标文件夹的 `UIDVALIDITY`。
+    NoEpoch,
+    /// 库里目标文件夹的 epoch 与服务器此刻的不一致（目标刚被重建过）。
+    EpochMismatch,
+    /// 本地连源端那一行都没有：没有可抄的内容。
+    SourceMissing,
+    /// 本地库读写失败。
+    Store,
+}
+
+impl std::fmt::Display for NotWritten {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            Self::NoDestination => "操作没有记录目标文件夹",
+            Self::NoUidMapping => "服务器没有给出 COPYUID 映射",
+            Self::DestinationUnreachable => "打不开目标文件夹，拿不到它的 epoch",
+            Self::NoEpoch => "服务器没有给出目标文件夹的 UIDVALIDITY",
+            Self::EpochMismatch => "目标文件夹的 epoch 与库里记着的不一致（刚被重建过）",
+            Self::SourceMissing => "本地已经没有源端那一行，没有可抄的内容",
+            Self::Store => "本地库读写失败",
+        };
+        f.write_str(text)
+    }
+}
+
+/// 把「挪过去的那封信」写进目标文件夹的本地库（R39）。
+///
+/// 调用的前提：服务器已经确认搬走，源端的本地行也已经删了。
+///
+/// ## 为什么必须拿到 epoch 才写
+///
+/// `message` 的身份是 `(account_id, folder_id, uidvalidity, uid)`，而 `COPYUID`
+/// 只带**源**文件夹的 UIDVALIDITY（RFC 4315 §3）。没有目标 epoch 就没有地方
+/// 放这个 UID：填一个凑数的（源 epoch、或 0）会让这一行看起来属于某个**别的**
+/// 世代。那种行下一轮同步既不会认成「已经有」，也不会被当成「服务器已删」清掉
+/// （差分是**在服务器给出的 epoch 之下**算的，别的世代的行走不到那一步），
+/// 只有当目标文件夹**恰好**正好之后被重建时才顺带清掉——在那之前它会一直
+/// 挂在列表里，点开就是一封对不上的信。而目标文件夹的 UID 空间与源毫无关系，
+/// 拿源 epoch 去猜它更没意义。
+///
+/// 所以：拿不到 epoch 就什么都不写。代价是这封信晚一轮同步才出现在目标文件夹，
+/// 而不是库里先多一条错的行、再指望某次对账删掉它。
+///
+/// ## 为什么不把源端那封的 `id` 搬过来
+///
+/// `id` 是本地生成的，和 `(folder_id, uid)` 绑在一起，而且 `message_body` /
+/// `attachment` 都以它为外键。搬过去的话，目标文件夹里这一行会顶着源端那封
+/// 名字——而源端那行刚被删掉，它的正文与附件正**级联删除**着。于是「同一封信」
+/// 在两个文件夹里各自只对了一半：目标侧行看着对，正文却随源端一起没了；
+/// 更糟的是源端那行删除的那一刻起，任何还拿着旧 `id` 的引用（界面、请求、
+/// 发送队列）指向的都是不存在的行。
+///
+/// 所以这里**新生成 `id`**、只抄内容字段。正文**不**抄：`upsert_message_body`
+/// 对已存在的行是覆盖，抄过去等于改写那一行已有的正文；要正文时按需重新拉一次
+/// （与同步拉下来的那封一样）。
+///
+/// ## 为什么目标 epoch 与库里记着的不一致就不写
+///
+/// 这里 `EXAMINE` 拿到的是**此刻**服务器上的 epoch，库里记着的是**上一个看到它
+/// 的地方**（通常是上一轮同步）的。不一致只有一种解释：目标文件夹在这中间被
+/// 服务器重建过（RFC 3501 §6.3.1：UIDVALIDITY 只在重建时变）。此时 `COPYUID`
+/// 里的那个 UID 到底属于新旧哪个世代、本地该按哪个世代落库，两边都说不准——
+/// 而下面「写回之后下一轮同步不会重复」这件事恰恰建立在「本地与服务器对
+/// epoch 的看法一致」之上。按对的写能省一次拉取，按错的写就是一行永远对不上的
+/// 数据；两者收益不对称，所以这里不赌：等下一轮同步自己 `EXAMINE`、自己按
+/// 它看到的 epoch 拉下来——那一轮没有「中间隔了一次同步」这个时间差。
+///
+/// ## 会碰会话的那一步：`EXAMINE`
+///
+/// 只读，不改 UID、不改标记，但它会**换掉会话上选中的文件夹**（失败时停在哪里
+/// 更是不确定）。调用方在之后必须 [`select_for_write`] 切回源文件夹，
+/// 否则下一次 `source_has_uid` 会对着目标文件夹查源 UID，把没搬的信判成
+/// 「已经不在了」。
+///
+/// `source` 是**提交之前**从本地抄下来的那封（提交成功后源端的行已经删了）。
+///
+/// 返回 `Err(NotWritten)` 表示「这一轮没写，原因见枚举」；写成功返回 `Ok(())`。
+async fn write_back(
+    pool: &sqlx::SqlitePool,
+    session: &mut Session,
+    destination_folder_id: Option<&str>,
+    source: Option<&Message>,
+    source_uid: i64,
+    transfer: Option<&TransferOutcome>,
+    timeout: Duration,
+) -> Result<(), NotWritten> {
+    // 就地删除：压根没有目标侧，不是「本该补一行却没补上」，不该计进
+    // `not_written_back`（那条计数说的是「挪过去了但本地没跟上」）。
+    let transfer = transfer.ok_or(NotWritten::NoUidMapping)?;
+    let destination_folder_id = destination_folder_id.ok_or(NotWritten::NoDestination)?;
+
+    // 1. 目标侧的新 UID。与 `source_uids` **按下标**对应（RFC 4315），
+    //    不是按大小、也不是「服务器那边的 `{uid}`」。
+    let source_u32 = u32::try_from(source_uid).ok();
+    let destination_uid = match source_u32.and_then(|uid| transfer.destination_uid_of(uid)) {
+        Some(uid) => i64::from(uid),
+        None => return Err(NotWritten::NoUidMapping),
+    };
+
+    // 2. 内容：调用方在提交之前抄下来的那一行。
+    //
+    // 拿不到不是错误——上面已经说了，代价只是晚一轮。
+    let Some(source) = source else {
+        return Err(NotWritten::SourceMissing);
+    };
+
+    // 3. 目标文件夹的 epoch。
+    let epoch = destination_epoch(session, pool, destination_folder_id, timeout).await?;
+
+    // 4. 新行：新 `id`，新 key，内容从源端那一行抄过来。
+    let moved = Message {
+        id: uuid::Uuid::new_v4().to_string(),
+        account_id: source.account_id.clone(),
+        folder_id: destination_folder_id.to_string(),
+        uid: destination_uid,
+        uidvalidity: epoch,
+        message_id: source.message_id.clone(),
+        subject: source.subject.clone(),
+        snippet: source.snippet.clone(),
+        from: source.from.clone(),
+        to: source.to.clone(),
+        cc: source.cc.clone(),
+        bcc: source.bcc.clone(),
+        date_sent: source.date_sent,
+        internal_date: source.internal_date,
+        flags: source.flags,
+        size: source.size,
+        has_attachment: source.has_attachment,
+    };
+
+    // `upsert_message` 的冲突键就是那个四元组：万一目标文件夹里已经有同一 key
+    // 的行（例如目标文件夹恰好被同步过、这一轮又把它当成新邮件写进来了），
+    // 它会**覆盖**那一行而不是插重复——这正是「写回的 key 与下一轮同步算出来的
+    // key 一致」的保证：两边都只认 `(folder, epoch, uid)`。
+    message_dao::upsert_message(pool, &moved)
+        .await
+        .map_err(|_| NotWritten::Store)?;
+
+    Ok(())
+}
+
+/// 本地源端那一行（按远端身份找）。
+///
+/// 先按文件夹列出、再按 `(uid, epoch)` 挑：DAO 没有「按 uid 取整行」的入口，
+/// 而 `list_messages` 只碰元数据（正文在另一张表），一次移动查一下不心疼。
+async fn load_message(
+    pool: &sqlx::SqlitePool,
+    account_id: &str,
+    folder_id: &str,
+    epoch: i64,
+    uid: i64,
+) -> Option<Message> {
+    let messages = message_dao::list_messages(pool, account_id, folder_id)
+        .await
+        .ok()?;
+    messages
+        .into_iter()
+        .find(|message| message.uid == uid && message.uidvalidity == epoch)
+}
+
+/// 目标文件夹此刻的 epoch，且**必须**与库里记着的一致。
+///
+/// 分两件事，两种失败都各有理由，见 [`write_back`] 的文档。
+async fn destination_epoch(
+    session: &mut Session,
+    pool: &sqlx::SqlitePool,
+    destination_folder_id: &str,
+    timeout: Duration,
+) -> Result<i64, NotWritten> {
+    let destination = match folder_dao::get_folder(pool, destination_folder_id).await {
+        Ok(folder) => folder.ok_or(NotWritten::NoDestination)?,
+        Err(_) => return Err(NotWritten::Store),
+    };
+
+    let info = examine_checked_with_timeout(session, &destination.remote_name, timeout)
+        .await
+        .map_err(|_| NotWritten::DestinationUnreachable)?;
+
+    let observed = info
+        .uid_validity
+        .map(i64::from)
+        .filter(|value| *value > 0)
+        .ok_or(NotWritten::NoEpoch)?;
+
+    match destination.uidvalidity {
+        Some(stored) if stored == observed => Ok(observed),
+        _ => Err(NotWritten::EpochMismatch),
+    }
+}
+
 /// `Move` 操作的目标邮箱名（线路上的原名）。
 async fn destination_of(pool: &sqlx::SqlitePool, op: &MailOperation) -> AppResult<Option<String>> {
     let Some(id) = op.destination_folder_id.as_deref() else {
@@ -706,18 +1064,47 @@ async fn destination_of(pool: &sqlx::SqlitePool, op: &MailOperation) -> AppResul
 
 /// 账户里的垃圾箱（线路上的原名）。
 ///
-/// 本地库不存 `\Trash` 属性，只能按名字推断（[`role_by_name`]）。
-/// 推断不出来就返回 `None`——那时候删除会就地标删，**不会**乱挪到某个
+/// 认法见模块文档的「删除 = 进垃圾箱」：库里的 `role` 优先，`NULL` 才按名字猜。
+/// 都认不出来就返回 `None`——那时候删除会就地标删，**不会**乱挪到某个
 /// 名字碰巧像垃圾箱的文件夹里去。
 async fn find_trash(pool: &sqlx::SqlitePool, folder: &Folder) -> AppResult<Option<String>> {
     let folders = folder_dao::list_folders(pool, &folder.account_id).await?;
-    Ok(folders
-        .into_iter()
-        // 当前文件夹自己就是垃圾箱 → 在里面「删除」就是真删，没有更软的去处。
-        .find(|candidate| {
-            candidate.id != folder.id && role_by_name(&candidate.remote_name) == Some("trash")
-        })
-        .map(|folder| folder.remote_name))
+    Ok(trash_candidates(&folders, &folder.id)
+        .first()
+        .map(|folder| folder.remote_name.clone()))
+}
+
+/// 哪些本地文件夹可以当垃圾箱，**按可信程度排好序**。
+///
+/// 排序即决策（[`find_trash`] 取第一个）：
+///
+/// 1. 库里记着 `role = 'trash'` 的——服务器宣告过 `\Trash`，是事实；
+/// 2. 库里的角色未知（`None`）且名字像垃圾箱的——名字是猜测，但比什么都没有强。
+///
+/// 为什么第 2 档只收 `role` 为空的文件夹：角色**已知**却**不是** `trash` 的
+/// 文件夹（比如服务器宣告它是 `\Archive`），名字再像垃圾箱也不该去。
+/// 服务器的宣告比名字权威，两条线索冲突时以宣告为准。
+///
+/// 为什么 `None` 不能直接当成「没有垃圾箱」：升级上来的老行、以及本轮
+/// `LIST` 没认出来的文件夹，`role` 都是 `None`。把它当成否定答案，
+/// 这些账户的删除就会从「进垃圾箱」悄悄降级成「就地标删」——
+/// 一个**不可撤销**的动作，而用户没有任何提示。
+///
+/// 当前文件夹自己排除在外：在垃圾箱里点「删除」就是真删，没有更软的去处，
+/// 挪进自己更是无意义的自环。
+fn trash_candidates<'a>(folders: &'a [Folder], current_folder_id: &str) -> Vec<&'a Folder> {
+    let others = || {
+        folders
+            .iter()
+            .filter(move |candidate| candidate.id != current_folder_id)
+    };
+
+    let declared = others().filter(|candidate| candidate.is_trash());
+    let guessed = others().filter(|candidate| {
+        candidate.role.is_none() && role_by_name(&candidate.remote_name) == Some("trash")
+    });
+
+    declared.chain(guessed).collect()
 }
 
 #[cfg(test)]
@@ -819,6 +1206,91 @@ mod tests {
     #[test]
     fn move_without_destination_is_an_error() {
         assert!(route_for(OperationKind::Move, true, true, None, Some("Trash")).is_err());
+    }
+
+    /// 造一个只关心名字与角色的文件夹。
+    fn folder_with(id: &str, remote_name: &str, role: Option<&str>) -> Folder {
+        Folder {
+            id: id.to_string(),
+            account_id: "acct-1".to_string(),
+            remote_name: remote_name.to_string(),
+            remote_id: None,
+            local_name: None,
+            delimiter: Some("/".to_string()),
+            subscribed: true,
+            selectable: true,
+            last_sync_at: None,
+            last_uid: None,
+            highest_modseq: None,
+            uidvalidity: Some(1),
+            role: role.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_declared_trash_wins_over_a_name_that_looks_like_trash() {
+        // 排序即决策：库里的 role 优先。
+        let folders = vec![
+            folder_with("f-name", "Deleted Items", None),
+            folder_with("f-role", "Rubbish", Some("trash")),
+            folder_with("f-inbox", "INBOX", Some("inbox")),
+        ];
+        let candidates = trash_candidates(&folders, "f-inbox");
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0].id, "f-role",
+            "服务器宣告的 \\Trash 必须排在最前面"
+        );
+        assert_eq!(candidates[1].id, "f-name", "角色未知时才退回名字兜底");
+    }
+
+    #[test]
+    fn an_unknown_role_is_not_the_same_as_no_trash() {
+        // NULL = 不知道。它必须仍然有机会被名字兜底认出来——
+        // 否则升级后还没同步过的账户，删除会从「进垃圾箱」悄悄退化成「就地标删」。
+        let folders = vec![
+            folder_with("f-inbox", "INBOX", Some("inbox")),
+            folder_with("f-old", "已删除", None),
+        ];
+        let candidates = trash_candidates(&folders, "f-inbox");
+        assert_eq!(candidates.len(), 1, "老行的角色为空，但名字能认出来");
+        assert_eq!(candidates[0].id, "f-old");
+    }
+
+    #[test]
+    fn a_known_non_trash_role_is_not_overridden_by_its_name() {
+        // 服务器说它是别的角色，名字再像垃圾箱也不算。
+        let folders = vec![
+            folder_with("f-inbox", "INBOX", Some("inbox")),
+            folder_with("f-archive", "Trash", Some("archive")),
+        ];
+        assert!(
+            trash_candidates(&folders, "f-inbox").is_empty(),
+            "宣告优先于名字：\\Archive 不该被当成垃圾箱"
+        );
+    }
+
+    #[test]
+    fn the_current_folder_is_never_its_own_trash() {
+        // 在垃圾箱里点「删除」就是真删，挪进自己更是无意义的自环。
+        let folders = vec![
+            folder_with("f-trash", "Trash", Some("trash")),
+            folder_with("f-inbox", "INBOX", Some("inbox")),
+        ];
+        assert!(trash_candidates(&folders, "f-trash").is_empty());
+        assert_eq!(trash_candidates(&folders, "f-inbox")[0].id, "f-trash");
+    }
+
+    #[test]
+    fn no_clue_at_all_means_no_trash() {
+        let folders = vec![
+            folder_with("f-inbox", "INBOX", Some("inbox")),
+            folder_with("f-bin", "Rubbish", None),
+        ];
+        assert!(
+            trash_candidates(&folders, "f-inbox").is_empty(),
+            "既没宣告、名字也不像 → 就地标删，不猜"
+        );
     }
 
     #[test]

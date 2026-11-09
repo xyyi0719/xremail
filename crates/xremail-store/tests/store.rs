@@ -85,6 +85,7 @@ fn sample_folder(id: &str, account_id: &str) -> Folder {
         last_uid: None,
         highest_modseq: None,
         uidvalidity: Some(42),
+        role: None,
     }
 }
 

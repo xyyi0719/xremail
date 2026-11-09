@@ -59,6 +59,7 @@ async fn seed(pool: &SqlitePool, message_id: &str) {
         last_uid: None,
         highest_modseq: None,
         uidvalidity: Some(1),
+        role: None,
     };
     xremail_store::dao::folder::upsert_folder(pool, &folder)
         .await

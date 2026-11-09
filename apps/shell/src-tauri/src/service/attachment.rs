@@ -1174,6 +1174,7 @@ mod tests {
             last_uid: Some(9),
             highest_modseq: None,
             uidvalidity: Some(7),
+            role: None,
         };
         xremail_store::dao::folder::upsert_folder(&pool, &folder)
             .await

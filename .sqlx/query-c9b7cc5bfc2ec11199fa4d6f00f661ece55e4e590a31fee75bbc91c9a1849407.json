@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n        SELECT id, account_id, remote_name, remote_id, local_name, delimiter,\n               subscribed, selectable, last_sync_at, last_uid, highest_modseq, uidvalidity\n        FROM folder\n        WHERE id = ?\n        ",
+  "query": "\n        SELECT id, account_id, remote_name, remote_id, local_name, delimiter,\n               subscribed, selectable, last_sync_at, last_uid, highest_modseq, uidvalidity,\n               role\n        FROM folder\n        WHERE account_id = ?\n        ORDER BY remote_name ASC\n        ",
   "describe": {
     "columns": [
       {
@@ -134,6 +134,17 @@
             "name": "uidvalidity"
           }
         }
+      },
+      {
+        "name": "role",
+        "ordinal": 12,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "folder",
+            "name": "role"
+          }
+        }
       }
     ],
     "parameters": {
@@ -151,8 +162,9 @@
       true,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "50b6ff07bd9db33f838254b1177f55f390b525253ef38c3525a307101210a0d4"
+  "hash": "c9b7cc5bfc2ec11199fa4d6f00f661ece55e4e590a31fee75bbc91c9a1849407"
 }

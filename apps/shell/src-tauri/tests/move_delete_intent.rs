@@ -62,6 +62,7 @@ fn folder(id: &str, account_id: &str, remote_name: &str, uidvalidity: Option<i64
         last_uid: None,
         highest_modseq: None,
         uidvalidity,
+        role: None,
     }
 }
 

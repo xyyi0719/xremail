@@ -223,12 +223,33 @@ pub struct Folder {
     ///
     /// `None` 表示尚未与该文件夹完成过一次同步，因而还不知道 epoch。
     pub uidvalidity: Option<i64>,
+    /// 特殊用途角色（RFC 6154）：`inbox` / `sent` / `drafts` / `trash` / `junk` /
+    /// `archive` / `flagged` / `all`，小写，与
+    /// `xremail_protocol_imap::folders::detect_role` 的产出一致。
+    ///
+    /// **`None` 的意思是「还不知道」，不是「没有角色」**：服务器没宣告属性、
+    /// 名字也认不出的文件夹是 `None`；升级上来的老行在下一轮同步重写之前
+    /// 同样是 `None`。
+    ///
+    /// 所以读的人不能把 `None` 当成否定答案。「删除 = 进垃圾箱」的判定就是例子：
+    /// 先看这个字段，`None` 时才退回按文件夹名推断
+    /// （见 `xremail-sync` 的 `transfer_push`）。否则升级后还没同步过的账户
+    /// 会突然「找不到垃圾箱」，删除从可撤销悄悄退化成就地标删。
+    pub role: Option<String>,
 }
 
 impl Folder {
     /// Display name, honouring the user's override.
     pub fn label(&self) -> &str {
         self.local_name.as_deref().unwrap_or(&self.remote_name)
+    }
+
+    /// 是不是垃圾箱（`\Trash`）。
+    ///
+    /// 只看**已知**的角色，不做名字兜底：兜底是「删除往哪儿走」这个决策的一部分，
+    /// 放在同步层（`transfer_push`）里，那里才能把优先顺序写清楚。
+    pub fn is_trash(&self) -> bool {
+        self.role.as_deref() == Some("trash")
     }
 }
 

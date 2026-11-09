@@ -128,6 +128,7 @@ async fn local_store() -> (SqlitePool, Folder) {
         last_uid: None,
         highest_modseq: None,
         uidvalidity: None,
+        role: None,
     };
     folder_dao::upsert_folder(&pool, &folder)
         .await

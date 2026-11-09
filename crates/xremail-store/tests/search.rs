@@ -66,6 +66,7 @@ fn sample_folder(id: &str, account_id: &str) -> Folder {
         last_uid: None,
         highest_modseq: None,
         uidvalidity: Some(42),
+        role: None,
     }
 }
 
@@ -201,6 +202,19 @@ async fn bundled_sqlite_has_trigram_tokenizer() {
 // 基本检索
 // ===========================================================================
 
+/// 往**0001 的 schema**（没有 `folder.role`）里塞一个文件夹。
+async fn insert_old_schema_folder(pool: &SqlitePool, id: &str, account_id: &str) {
+    sqlx::query(
+        "INSERT INTO folder (id, account_id, remote_name, subscribed, selectable) \
+         VALUES (?, ?, 'INBOX', 1, 1)",
+    )
+    .bind(id)
+    .bind(account_id)
+    .execute(pool)
+    .await
+    .expect("写文件夹失败");
+}
+
 #[tokio::test]
 async fn existing_mail_is_backfilled_on_upgrade() {
     // 老库升级场景：邮件在 0004 迁移**之前**就已经落库，
@@ -223,9 +237,9 @@ async fn existing_mail_is_backfilled_on_upgrade() {
     account::upsert_account(&pool, &sample_account("acct"))
         .await
         .expect("写账户失败");
-    folder::upsert_folder(&pool, &sample_folder("fld", "acct"))
-        .await
-        .expect("写文件夹失败");
+    // 文件夹只能用**0001 的列**手工插：DAO 现在会写 `role`（0010 才加），
+    // 而这个库故意停在 0001 —— 这正是「升级前」该有的样子。
+    insert_old_schema_folder(&pool, "fld", "acct").await;
     let mut m1 = sample_message("m1", "acct", "fld", 1);
     m1.subject = Some("Quarterly budget review".to_string());
     message::upsert_message(&pool, &m1)

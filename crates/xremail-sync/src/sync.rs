@@ -153,6 +153,13 @@ pub async fn sync_account_as_with(
             last_uid: existing.as_ref().and_then(|folder| folder.last_uid),
             highest_modseq: existing.as_ref().and_then(|folder| folder.highest_modseq),
             uidvalidity: existing.as_ref().and_then(|folder| folder.uidvalidity),
+            // 角色来自 `LIST` 的结论（`RemoteFolder::role` 已经是
+            // 「属性优先、名字兜底」算过的），**不**沿用本地旧值：
+            // 服务器改了属性或者改了名，这里要跟着变。
+            //
+            // `None` 也照写：那是「这一轮没认出来」，不是「沿用上次的结论」。
+            // 读的一方（删除回写）必须自己处理 `None`，见 `transfer_push`。
+            role: item.role.clone(),
         };
         folder_dao::upsert_folder(pool, &folder).await?;
 

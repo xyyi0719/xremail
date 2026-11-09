@@ -58,6 +58,7 @@ fn folder(account_id: &str, uidvalidity: Option<i64>) -> Folder {
         last_uid: None,
         highest_modseq: None,
         uidvalidity,
+        role: None,
     }
 }
 

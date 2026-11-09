@@ -81,6 +81,7 @@ fn folder(id: &str, remote_name: &str, uidvalidity: Option<i64>) -> Folder {
         last_uid: None,
         highest_modseq: None,
         uidvalidity,
+        role: None,
     }
 }
 

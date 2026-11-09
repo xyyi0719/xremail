@@ -223,6 +223,7 @@ fn make_folder(id: &str, remote_name: &str) -> Folder {
         last_uid: None,
         highest_modseq: None,
         uidvalidity: None,
+        role: None,
     }
 }
 
@@ -945,6 +946,770 @@ async fn sync_account_drains_queued_moves_without_the_ui_open() {
             .await
             .unwrap();
     assert_eq!(count, 1, "操作应当被标成成功");
+
+    fixture.server.shutdown().await;
+}
+
+// ---------------------------------------------------- 垃圾箱判定：role 优先，名字兜底
+
+/// 同上，但垃圾箱**只在属性上叫 `\Trash`**，名字完全不像垃圾箱（`Rubbish`）。
+///
+/// 这正是「靠文件夹名猜」猜不出来的那一类：R04 的残余。
+fn config_with_trash_named_rubbish() -> FakeServerConfig {
+    let mut config = config_with_mail();
+    config
+        .mailboxes
+        .push(MailboxFixture::new("Rubbish").with_attribute("\\Trash"));
+    config
+}
+
+/// 同上，但那个「可能是垃圾箱」的文件夹**不宣告任何属性，名字也不像垃圾箱**。
+///
+/// 名字不在 `role_by_name` 的兜底表里（表里是 `Deleted Items` / `已删除` 之类），
+/// 所以两条线索都不存在。
+///
+/// 用 ASCII 名字是为了让断言能直接比对线路上的原样：假服务器把非 ASCII 名字
+/// 编码成 modified UTF-7 再发（`回收站` → `&Vt5lNnrZ-`），本地库的 `remote_name`
+/// 存的也是这个编码形式。这本身是对的（发命令必须用线路原样），只是测试里
+/// 拿 ASCII 名字读起来更清楚。
+fn config_without_any_trash_hint() -> FakeServerConfig {
+    let mut config = config_with_mail();
+    config.mailboxes.push(MailboxFixture::new("Maybe Bin"));
+    config
+}
+
+/// 同步一轮，让 `LIST` 的结论落进本地 `folder` 表。
+async fn sync_once(fixture: &Fixture, pool: &SqlitePool) {
+    let mut session = login(fixture).await;
+    let account = account_dao::get_account(pool, "acct-1")
+        .await
+        .unwrap()
+        .expect("账户应当还在");
+    sync_account(pool, &mut session, &account, 1_000)
+        .await
+        .expect("同步应当成功");
+}
+
+/// 本地库里 `remote_name` 对应的文件夹（同步之后才存在）。
+async fn local_folder(pool: &SqlitePool, remote_name: &str) -> Folder {
+    folder_dao::list_folders(pool, "acct-1")
+        .await
+        .expect("列出文件夹失败")
+        .into_iter()
+        .find(|f| f.remote_name == remote_name)
+        .unwrap_or_else(|| panic!("本地库里应当有 {remote_name}"))
+}
+
+/// 服务器收到的、把信搬往 `mailbox` 的命令有几条。
+///
+/// 假服务器默认**没有** `MOVE` 能力（163/QQ 那一档），所以「搬过去」实际是
+/// `UID COPY <uid> "<mailbox>"` + 标删 + `UID EXPUNGE`（见模块文档的路由表）。
+/// 有 `MOVE` 时则是 `UID MOVE`。两种都算「搬」。
+fn moves_into(fixture: &Fixture, mailbox: &str) -> usize {
+    fixture
+        .server
+        .command_log()
+        .into_iter()
+        .filter(|line| {
+            (line.starts_with("UID MOVE") || line.starts_with("UID COPY")) && line.contains(mailbox)
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn sync_persists_the_trash_role_even_when_the_name_looks_nothing_like_trash() {
+    // 承诺的第一半：`LIST` 宣告了 `\Trash`，本地库就要**记住**它——
+    // 名字叫 `Rubbish` 也一样。这一步不做，下面那条删除用例就无从谈起。
+    let fixture = start(config_with_trash_named_rubbish()).await;
+    let (pool, _folder) = local_store(false).await;
+
+    sync_once(&fixture, &pool).await;
+
+    let rubbish = local_folder(&pool, "Rubbish").await;
+    assert_eq!(
+        rubbish.role.as_deref(),
+        Some("trash"),
+        "服务器宣告的 \\Trash 必须落进 folder.role（R04 残余的根因）"
+    );
+    assert!(rubbish.is_trash());
+
+    let inbox = local_folder(&pool, "INBOX").await;
+    assert_eq!(
+        inbox.role.as_deref(),
+        Some("inbox"),
+        "INBOX 的角色也要落库（名字兜底那条路径）"
+    );
+
+    fixture.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn delete_goes_into_a_trash_the_name_would_never_reveal() {
+    // **这次改动的核心承诺**：服务器宣告 `\Trash`，但文件夹叫 `Rubbish`。
+    // 按名字猜会猜不出来（于是就地标删、不可撤销）；按库里的 role 就必须挪进去。
+    let fixture = start(config_with_trash_named_rubbish()).await;
+    let (pool, _folder) = local_store(false).await;
+
+    // 先同步一轮：INBOX 与 Rubbish 都进库，Rubbish 的 role 由 `LIST` 宣告。
+    sync_once(&fixture, &pool).await;
+    let inbox = local_folder(&pool, "INBOX").await;
+    assert_eq!(inbox.role.as_deref(), Some("inbox"));
+
+    let mut session = login_inbox(&fixture).await;
+    let inbox = pull_and_reload(&pool, &mut session, &inbox, 1_500).await;
+
+    enqueue_transfer(&pool, &inbox, INBOX_UID, OperationKind::Delete, None, 2_000).await;
+
+    let report = push_transfers(&pool, &mut session, &inbox, 3_000)
+        .await
+        .expect("回写本身不该报错");
+
+    assert_eq!(report.deleted, 1);
+    assert!(
+        !server_has_uid(&fixture, "INBOX", INBOX_UID as u32).await,
+        "源文件夹里不该还有它"
+    );
+    assert_eq!(
+        server_count(&fixture, "Rubbish").await,
+        1,
+        "服务器宣告了 \\Trash，删除就必须进这个文件夹——名字像不像垃圾箱不算数"
+    );
+    assert_eq!(
+        moves_into(&fixture, "Rubbish"),
+        1,
+        "应当搬进 Rubbish（COPY 或 MOVE），而不是就地 EXPUNGE"
+    );
+
+    fixture.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn delete_stays_in_place_when_no_folder_claims_the_trash_role() {
+    // 承诺的第二半：既没有属性、名字也不像（`Maybe Bin` 不在兜底表里），
+    // 就**不能**乱猜——退回「就地标删」，而不是挪进某个碰巧像垃圾箱的文件夹。
+    let fixture = start(config_without_any_trash_hint()).await;
+    let (pool, _folder) = local_store(false).await;
+
+    sync_once(&fixture, &pool).await;
+    let inbox = local_folder(&pool, "INBOX").await;
+    let recycle = local_folder(&pool, "Maybe Bin").await;
+    assert_eq!(
+        recycle.role, None,
+        "没宣告、名字也认不出 → role 是 NULL（「不知道」），不是「不是垃圾箱」"
+    );
+
+    let mut session = login_inbox(&fixture).await;
+    let inbox = pull_and_reload(&pool, &mut session, &inbox, 1_500).await;
+
+    enqueue_transfer(&pool, &inbox, INBOX_UID, OperationKind::Delete, None, 2_000).await;
+
+    let report = push_transfers(&pool, &mut session, &inbox, 3_000)
+        .await
+        .expect("回写本身不该报错");
+
+    assert_eq!(report.deleted, 1);
+    assert!(
+        !server_has_uid(&fixture, "INBOX", INBOX_UID as u32).await,
+        "就地标删：源文件夹里应当没有它了"
+    );
+    assert_eq!(
+        server_count(&fixture, "Maybe Bin").await,
+        0,
+        "两条线索都没有时，绝不能把信挪进一个名字碰巧像垃圾箱的文件夹"
+    );
+    assert_eq!(
+        moves_into(&fixture, "Maybe Bin"),
+        0,
+        "应当一条搬运命令都没有"
+    );
+
+    fixture.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unknown_role_falls_back_to_the_name_instead_of_losing_the_trash() {
+    // **降级顺序**：库里的 role 为 NULL（升级上来的老行、或这一轮没认出来）时，
+    // 才退回按名字猜。这条用例保证「升级之后、还没同步过」的账户不会突然
+    // 从「删除 = 进垃圾箱」退化成「就地标删」——对用户来说那就是删没了。
+    let fixture = start(config_with_trash()).await;
+    let (pool, folder) = local_store(false).await;
+    let folder = {
+        let mut session = login_inbox(&fixture).await;
+        pull_and_reload(&pool, &mut session, &folder, 1_000).await
+    };
+
+    // 手工塞一个 role 为 NULL 的垃圾箱：模拟 0010 之前就落库的老行，
+    // 它的名字在兜底表里（`已删除`）。
+    let mut trash = make_folder("folder-trash", "已删除");
+    trash.uidvalidity = Some(1);
+    assert_eq!(trash.role, None, "老行的 role 就是 NULL");
+    folder_dao::upsert_folder(&pool, &trash)
+        .await
+        .expect("插入垃圾箱失败");
+
+    let mut session = login_inbox(&fixture).await;
+    enqueue_transfer(
+        &pool,
+        &folder,
+        INBOX_UID,
+        OperationKind::Delete,
+        None,
+        2_000,
+    )
+    .await;
+
+    let report = push_transfers(&pool, &mut session, &folder, 3_000)
+        .await
+        .expect("回写本身不该报错");
+
+    assert_eq!(report.deleted, 1);
+    assert_eq!(
+        server_count(&fixture, "已删除").await,
+        1,
+        "role 未知时必须退回名字兜底，否则老账户的删除会变成不可撤销的"
+    );
+
+    fixture.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_known_non_trash_role_beats_a_trash_looking_name() {
+    // 两条线索**冲突**时以宣告为准：服务器说这个文件夹是 `\Archive`，
+    // 哪怕它叫 `Trash`，也不该被当成垃圾箱——那会把信挪进一个用户没指望的地方。
+    let mut config = config_with_mail();
+    config
+        .mailboxes
+        .push(MailboxFixture::new("Trash").with_attribute("\\Archive"));
+    let fixture = start(config).await;
+    let (pool, folder) = local_store(false).await;
+    let folder = {
+        let mut session = login_inbox(&fixture).await;
+        pull_and_reload(&pool, &mut session, &folder, 1_000).await
+    };
+
+    sync_once(&fixture, &pool).await;
+    let archive = local_folder(&pool, "Trash").await;
+    assert_eq!(archive.role.as_deref(), Some("archive"));
+
+    let mut session = login_inbox(&fixture).await;
+    enqueue_transfer(
+        &pool,
+        &folder,
+        INBOX_UID,
+        OperationKind::Delete,
+        None,
+        2_000,
+    )
+    .await;
+
+    let report = push_transfers(&pool, &mut session, &folder, 3_000)
+        .await
+        .expect("回写本身不该报错");
+
+    assert_eq!(report.deleted, 1);
+    assert_eq!(
+        server_count(&fixture, "Trash").await,
+        0,
+        "服务器说它是 \\Archive，名字再像垃圾箱也不许去"
+    );
+    assert_eq!(moves_into(&fixture, "Trash"), 0);
+
+    fixture.server.shutdown().await;
+}
+
+// -------------------------------------- 目标文件夹的新 UID 写回本地（R39）
+//
+// 移动成功后，目标文件夹的本地行要**当场**补上，而不是等下一轮全量同步。
+// 不补的话，那封信在一段时间里哪也找不到（源端已删、目标端未知），
+// 还可能被重复下载。
+//
+// 难点全在「凭什么知道目标侧的那个 UID 是真的」：
+// * `COPYUID` 给目标 UID，但不给目标文件夹的 UIDVALIDITY（RFC 4315 §3）；
+// * 本地 `message` 的身份是 `(account_id, folder_id, uidvalidity, uid)`，
+//   没有 epoch 就没地方放它；
+// * 目标文件夹可能刚被服务器重建过（epoch 变了），这时 `COPYUID` 说的
+//   到底是哪个世代，两边都不确定。
+//
+// 所以下面的用例分两类：**拿得准的就必须写**（MOVE / COPY 两条路由），
+// **拿不准的一律不写**（拿不到 epoch、epoch 对不上），而且不写时不能留下坏数据。
+
+/// 被测的两个文件夹在本地叫什么。
+///
+/// 假服务器的 UIDVALIDITY 是**服务器全局**的（每个文件夹都一样），所以这里
+/// 不能靠「两个 epoch 不同」来证明「写回用的是目标的 epoch」；但可以证明
+/// 写回用的就是服务器**真的**给出的那个值，且与库里目标文件夹记着的一致。
+const INBOX_LOCAL: &str = "folder-1";
+const ARCHIVE_LOCAL: &str = "folder-archive";
+
+/// 目标文件夹里「那封被挪过去的信」在本地的那一行。
+///
+/// 按**远端身份**（epoch + UID）找，不按 `id`：写回不该沿用源端的 `id`，
+/// 所以测试也不能拿 `id` 去认它（那样会把「搬了 id」这种错实现当成对的）。
+async fn local_row_in_archive(
+    pool: &SqlitePool,
+    archive_epoch: i64,
+    archive_uid: i64,
+) -> Option<xremail_core::model::Message> {
+    message_dao::list_messages(pool, "acct-1", ARCHIVE_LOCAL)
+        .await
+        .expect("列出目标文件夹应当成功")
+        .into_iter()
+        .find(|message| message.uid == archive_uid && message.uidvalidity == archive_epoch)
+}
+
+/// 服务器上 `Archive` 文件夹此刻的内容（快照）。
+fn server_archive(fixture: &Fixture) -> MailboxFixture {
+    fixture
+        .server
+        .mailboxes()
+        .into_iter()
+        .find(|mailbox| mailbox.name == "Archive")
+        .expect("服务器上应当有 Archive")
+}
+
+/// 让本地的 `Archive` 文件夹像**已经完整同步过一轮**：epoch 与库里一致。
+///
+/// 写回的门槛之一是「`EXAMINE` 拿到的目标 epoch == 库里记着的那个」，
+/// 所以要先让库里那个值是真的。直接写库而不是跑一轮拉取：这一组用例验的是
+/// 写回，不是拉取（拉取的效果由最后一组「再跑一轮不重复」的用例负责）。
+async fn seed_archive_epoch(pool: &SqlitePool, epoch: i64) {
+    let mut archive = make_folder(ARCHIVE_LOCAL, "Archive");
+    archive.uidvalidity = Some(epoch);
+    folder_dao::upsert_folder(pool, &archive)
+        .await
+        .expect("插入 Archive 失败");
+}
+
+#[tokio::test]
+async fn move_writes_the_destination_row_back_with_the_servers_own_uid() {
+    // 有 `MOVE` 的服务器：一步 `UID MOVE`，`COPYUID` 带目标侧的新 UID。
+    let fixture = start(config_with_move()).await;
+    let mut session = login_inbox(&fixture).await;
+    let (pool, folder) = local_store(true).await;
+    let folder = pull_and_reload(&pool, &mut session, &folder, 1_000).await;
+    let archive_epoch = i64::from(fixture.server.uid_validity());
+    seed_archive_epoch(&pool, archive_epoch).await;
+
+    // 源端那封在本地的那一行：写回**不能**沿用它的 id。
+    let source_row = message_dao::list_messages(&pool, "acct-1", INBOX_LOCAL)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|message| message.uid == INBOX_UID)
+        .expect("源端那封应当在本地");
+
+    enqueue_transfer(
+        &pool,
+        &folder,
+        INBOX_UID,
+        OperationKind::Move,
+        Some(ARCHIVE_LOCAL),
+        2_000,
+    )
+    .await;
+
+    let report = push_transfers(&pool, &mut session, &folder, 3_000)
+        .await
+        .expect("回写本身不该报错");
+
+    assert_eq!(report.moved, 1);
+    assert_eq!(
+        report.not_written_back, 0,
+        "有 COPYUID + 拿得到 epoch，就该写回"
+    );
+
+    // 服务器「实际值」：直接看它的活状态，不看客户端说了什么。
+    let archive = server_archive(&fixture);
+    assert_eq!(archive.messages.len(), 1, "服务器上应当多出一封");
+    let destination_uid = i64::from(archive.messages[0].uid);
+
+    // 本地目标文件夹里**立刻**有它，且 UID / epoch 都是服务器给的值。
+    let archive_rows = message_dao::list_messages(&pool, "acct-1", ARCHIVE_LOCAL)
+        .await
+        .unwrap();
+    let Some(row) = archive_rows
+        .iter()
+        .find(|message| message.uid == destination_uid && message.uidvalidity == archive_epoch)
+    else {
+        panic!(
+            "移动成功后目标文件夹本地应当已经有它（epoch {archive_epoch}，uid {destination_uid}），实际：{:?}",
+            archive_rows
+                .iter()
+                .map(|m| (m.uid, m.uidvalidity))
+                .collect::<Vec<_>>()
+        );
+    };
+    assert_eq!(
+        row.subject.as_deref(),
+        Some("要被搬走的一封"),
+        "内容要跟着搬"
+    );
+    assert_ne!(
+        row.id, source_row.id,
+        "目标端是新的一行，不是把源端那行的 id 搬过来"
+    );
+
+    // 源端本地行照旧删掉（原有行为不变）。
+    let inbox_rows = message_dao::list_messages(&pool, "acct-1", INBOX_LOCAL)
+        .await
+        .unwrap();
+    assert!(inbox_rows.iter().all(|message| message.uid != INBOX_UID));
+    assert_eq!(inbox_rows.len(), 1, "INBOX 里还剩没被搬的那封");
+
+    fixture.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn copy_route_also_writes_the_destination_row_back() {
+    // 163 形态：没有 `MOVE`，`COPY` + 标删 + `UID EXPUNGE`。
+    // `COPY` 同样回 `COPYUID`，目标侧的新 UID 一样要接住——这是最容易漏的一半：
+    // 「只有 MOVE 那条路修了」在 163 用户那里等于没修。
+    let fixture = start(config_with_mail()).await;
+    let mut session = login_inbox(&fixture).await;
+    let (pool, folder) = local_store(true).await;
+    let folder = pull_and_reload(&pool, &mut session, &folder, 1_000).await;
+    let archive_epoch = i64::from(fixture.server.uid_validity());
+    seed_archive_epoch(&pool, archive_epoch).await;
+
+    enqueue_transfer(
+        &pool,
+        &folder,
+        INBOX_UID,
+        OperationKind::Move,
+        Some(ARCHIVE_LOCAL),
+        2_000,
+    )
+    .await;
+
+    let report = push_transfers(&pool, &mut session, &folder, 3_000)
+        .await
+        .expect("回写本身不该报错");
+
+    assert_eq!(report.moved, 1);
+    assert_eq!(report.not_written_back, 0);
+    // 先证明走的确实是 `COPY` 那条路（否则这个用例证明不了「COPY 也接了」）。
+    assert_eq!(copy_commands(&fixture).len(), 1);
+
+    let archive = server_archive(&fixture);
+    assert_eq!(archive.messages.len(), 1);
+    let destination_uid = i64::from(archive.messages[0].uid);
+
+    assert!(
+        local_row_in_archive(&pool, archive_epoch, destination_uid)
+            .await
+            .is_some(),
+        "COPY 路由也要把目标侧的新 UID 写回本地"
+    );
+
+    fixture.server.shutdown().await;
+}
+
+/// **库里记着的**目标 epoch 与服务器此刻的不一致（目标文件夹刚被重建过）。
+async fn push_move_into_archive_with(
+    fixture: &Fixture,
+    local_epoch: Option<i64>,
+) -> (SqlitePool, Folder, TransferPushReport) {
+    let mut session = login_inbox(fixture).await;
+    let (pool, folder) = local_store(true).await;
+    let folder = pull_and_reload(&pool, &mut session, &folder, 1_000).await;
+
+    // `None` 表示「库里还没有这个文件夹的 epoch」。
+    if let Some(epoch) = local_epoch {
+        seed_archive_epoch(&pool, epoch).await;
+    }
+
+    enqueue_transfer(
+        &pool,
+        &folder,
+        INBOX_UID,
+        OperationKind::Move,
+        Some(ARCHIVE_LOCAL),
+        2_000,
+    )
+    .await;
+
+    let report = push_transfers(&pool, &mut session, &folder, 3_000)
+        .await
+        .expect("回写本身不该报错");
+
+    (pool, folder, report)
+}
+
+/// 本地已经有 INBOX 与 Archive**两个**文件夹、且 epoch 都是服务器此刻的值。
+///
+/// 给「`EXAMINE` 被拒」那类服务器用：它们连拉取都只能用 `SELECT`，所以
+/// 这里不走 `pull_and_reload`，而是按**服务器真实宣告的** UIDVALIDITY
+/// 把文件夹写进库——写回的门槛（库里 epoch == 服务器此刻的 epoch）才成立。
+async fn seed_synced_folders(pool: &SqlitePool, fixture: &Fixture, now_ms: i64) -> Folder {
+    let epoch = i64::from(fixture.server.uid_validity());
+    let mut inbox = make_folder(INBOX_LOCAL, "INBOX");
+    inbox.uidvalidity = Some(epoch);
+    inbox.last_sync_at = Some(now_ms);
+    folder_dao::upsert_folder(pool, &inbox)
+        .await
+        .expect("插入 INBOX 失败");
+    seed_archive_epoch(pool, epoch).await;
+    inbox
+}
+
+#[tokio::test]
+async fn a_destination_epoch_that_disagrees_with_the_store_means_no_write_back() {
+    // 库里记着的目标 epoch 是**旧的**：这中间目标文件夹被服务器重建过。
+    // 此刻 `COPYUID` 里的 UID 属于哪个世代说不准 → 一行都不能写，
+    // 交给下一轮同步自己 `EXAMINE` 后从服务器拉。
+    //
+    // （epoch 必须是个正经的正数：库里那一列有 `CHECK (uidvalidity > 0)`。）
+    let fixture = start(config_with_mail()).await;
+    let archive_epoch = i64::from(fixture.server.uid_validity());
+    let (pool, _folder, report) =
+        push_move_into_archive_with(&fixture, Some(archive_epoch + 100)).await;
+
+    assert_eq!(report.moved, 1, "移动本身是成功的");
+    assert_eq!(
+        report.not_written_back, 1,
+        "没写回要计一笔，否则日志里找不到"
+    );
+    assert_eq!(
+        report.total(),
+        1,
+        "`not_written_back` 是附注，不是并列的结局，不能进合计（R36）"
+    );
+
+    let archive_rows = message_dao::list_messages(&pool, "acct-1", ARCHIVE_LOCAL)
+        .await
+        .unwrap();
+    assert!(
+        archive_rows.is_empty(),
+        "epoch 对不上时一行都不许写，实际：{:?}",
+        archive_rows
+            .iter()
+            .map(|m| (m.uid, m.uidvalidity))
+            .collect::<Vec<_>>()
+    );
+
+    // 服务器那边该做的都做了（这不是失败，只是「晚一轮」）。
+    assert_eq!(server_archive(&fixture).messages.len(), 1);
+    let count =
+        operation_dao::count_operations_in_state(&pool, "acct-1", OperationState::Succeeded)
+            .await
+            .unwrap();
+    assert_eq!(count, 1, "写回不了不影响「移动成功」这个结论");
+
+    fixture.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_unknown_destination_epoch_means_no_write_back() {
+    // 库里根本没有目标文件夹的 epoch（从没同步过它）→ 同样不写。
+    let fixture = start(config_with_mail()).await;
+    let (pool, _folder, report) = push_move_into_archive_with(&fixture, None).await;
+
+    assert_eq!(report.moved, 1);
+    assert_eq!(report.not_written_back, 1);
+
+    let archive_rows = message_dao::list_messages(&pool, "acct-1", ARCHIVE_LOCAL)
+        .await
+        .unwrap();
+    assert!(
+        archive_rows.is_empty(),
+        "不知道 epoch 就不写：写进去的会是一行对不上任何世代的数据"
+    );
+
+    fixture.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_destination_that_cannot_be_examined_means_no_write_back() {
+    // 拿不到目标 epoch 的另一种样子：`EXAMINE` 直接回 `NO`
+    // （163 的真实行为之一，见 PROTOCOLS.md）。
+    //
+    // 关键是两点：不写，而且**会话还能用**——下一条操作照着「选中了源文件夹」
+    // 继续发，不能被这一步带偏。
+    //
+    // `reject_examine` 在**第一轮同步**时就要打开（那是 163 的真实形态：
+    // 连拉取都只能用 `SELECT`），所以本地文件夹不能靠 `pull_and_reload` 建。
+    let mut config = config_with_mail();
+    config.reject_examine = true;
+    let fixture = start(config).await;
+
+    // 这台服务器拒绝 `EXAMINE`，所以切文件夹也只能用可写方式（`SELECT`）。
+    let (pool, _folder) = local_store(true).await;
+    let folder = seed_synced_folders(&pool, &fixture, 1_000).await;
+    let mut session = login(&fixture).await;
+    session.select("INBOX").await.expect("SELECT 应当成功");
+
+    enqueue_transfer(
+        &pool,
+        &folder,
+        INBOX_UID,
+        OperationKind::Move,
+        Some(ARCHIVE_LOCAL),
+        2_000,
+    )
+    .await;
+
+    let report = push_transfers(&pool, &mut session, &folder, 3_000)
+        .await
+        .expect("回写本身不该报错");
+
+    assert_eq!(report.moved, 1, "移动本身成功了");
+    assert_eq!(report.not_written_back, 1, "拿不到 epoch → 不写");
+    assert_eq!(report.uncertain, 0, "会话没坏，不该牵连别的计数");
+
+    let archive_rows = message_dao::list_messages(&pool, "acct-1", ARCHIVE_LOCAL)
+        .await
+        .unwrap();
+    assert!(archive_rows.is_empty(), "拿不到 epoch 就一行都不写");
+    // 用服务器自己的活状态验，不用 `server_has_uid`：那个辅助函数靠 `EXAMINE`，
+    // 而这台服务器恰恰拒绝 `EXAMINE`。
+    let inbox = fixture
+        .server
+        .mailboxes()
+        .into_iter()
+        .find(|mailbox| mailbox.name == "INBOX")
+        .expect("服务器上应当有 INBOX");
+    assert!(
+        inbox
+            .messages
+            .iter()
+            .all(|message| message.uid != INBOX_UID as u32),
+        "服务器那边确实搬走了"
+    );
+
+    fixture.server.shutdown().await;
+}
+
+/// 有 `MOVE` 能力的配置（默认那一档是 163 形态：只有 `UIDPLUS`）。
+fn config_with_move() -> FakeServerConfig {
+    let mut config = config_with_mail();
+    config.capabilities.push("MOVE".to_string());
+    config
+}
+
+/// 让服务器像**只有 `MOVE`**：没有 `UIDPLUS`。用来隔开两条路由的副作用。
+///
+/// 有 `UIDPLUS` 时 `UID MOVE` 收尾会再 `EXAMINE` 源文件夹一次（客户端要
+/// 切回去），本地库读写的缓存会被填上；没有它时那一次不会发生，
+/// 「写回自己按对了 key」这件事才不会被别人顺手遮住。
+fn config_with_move_without_uidplus() -> FakeServerConfig {
+    let mut config = config_with_move();
+    config.capabilities.retain(|cap| cap != "UIDPLUS");
+    config
+}
+
+/// 再跑一轮 `sync_account`（用户视角的「下一轮同步」）。
+async fn sync_again(fixture: &Fixture, pool: &SqlitePool, now_ms: i64) {
+    let mut session = login(fixture).await;
+    let account = account_dao::get_account(pool, "acct-1")
+        .await
+        .unwrap()
+        .expect("账户应当还在");
+    sync_account(pool, &mut session, &account, now_ms)
+        .await
+        .expect("同步应当成功");
+}
+
+/// 断言目标文件夹本地只有一行、且就是服务器上那一封。
+///
+/// 「写回的 key 与下一轮同步算出来的 key 一致」是这组用例的全部意义：
+/// 不一致的话，写回的是一个 key、同步算出的是另一个，本地就会出现同一封信
+/// 两行——用户看到重复，正文也可能挂在其中一行上。
+async fn assert_one_row_matching_the_server(
+    fixture: &Fixture,
+    pool: &SqlitePool,
+    archive_epoch: i64,
+) {
+    let archive = server_archive(fixture);
+    assert_eq!(archive.messages.len(), 1, "服务器上只有一封");
+    let server_uid = i64::from(archive.messages[0].uid);
+
+    let rows = message_dao::list_messages(pool, "acct-1", ARCHIVE_LOCAL)
+        .await
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "下一轮同步不该再插一行（写回的 key 必须与同步算出来的一致），实际：{:?}",
+        rows.iter()
+            .map(|m| (m.uid, m.uidvalidity, m.id.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(rows[0].uid, server_uid, "本地这一行指向服务器上那一封");
+    assert_eq!(rows[0].uidvalidity, archive_epoch, "epoch 要对得上");
+}
+
+#[tokio::test]
+async fn a_second_sync_after_the_write_back_does_not_duplicate_the_row() {
+    // 最容易忽略的一条：写回的那一行，下一轮同步必须**认出**它就是同一封。
+    // 认不出来（key 差一点：epoch 错、uid 错、或者干脆按 id 另算了一套）→
+    // 本地多一行，用户看到重复。
+    //
+    // 用「只有 MOVE」的配置：这类服务器没有 `UIDPLUS`，`UID MOVE` 收尾时
+    // 客户端不会再 `EXAMINE` 源文件夹，于是写回那一次本地库读写的缓存是空的——
+    // 若写回的 key 是靠某个缓存凑巧对上，这里就会露馅。
+    let fixture = start(config_with_move_without_uidplus()).await;
+    let archive_epoch = i64::from(fixture.server.uid_validity());
+    let (pool, _folder, report) = push_move_into_archive_with(&fixture, Some(archive_epoch)).await;
+
+    assert_eq!(report.moved, 1);
+    assert_eq!(report.not_written_back, 0, "前提：这一轮确实写回了");
+
+    sync_again(&fixture, &pool, 4_000).await;
+
+    assert_one_row_matching_the_server(&fixture, &pool, archive_epoch).await;
+
+    fixture.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_second_sync_after_the_copy_route_write_back_does_not_duplicate_the_row() {
+    // 同上，走 163 的 `COPY` + 标删那条路。
+    let fixture = start(config_with_mail()).await;
+    let archive_epoch = i64::from(fixture.server.uid_validity());
+    let (pool, _folder, report) = push_move_into_archive_with(&fixture, Some(archive_epoch)).await;
+
+    assert_eq!(report.moved, 1);
+    assert_eq!(report.not_written_back, 0);
+
+    sync_again(&fixture, &pool, 4_000).await;
+
+    assert_one_row_matching_the_server(&fixture, &pool, archive_epoch).await;
+
+    fixture.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_delete_without_a_destination_writes_nothing_back() {
+    // 就地删除（`Route::Expunge`）没有目标侧，不该产生任何写回尝试——
+    // 它连 `EXAMINE` 都不该多打一条。
+    let fixture = start(config_without_any_trash_hint()).await;
+    let (pool, _folder) = local_store(false).await;
+    sync_once(&fixture, &pool).await;
+    let inbox = local_folder(&pool, "INBOX").await;
+
+    let mut session = login_inbox(&fixture).await;
+    let inbox = pull_and_reload(&pool, &mut session, &inbox, 1_500).await;
+    enqueue_transfer(&pool, &inbox, INBOX_UID, OperationKind::Delete, None, 2_000).await;
+
+    let before = fixture.server.command_log().len();
+    let report = push_transfers(&pool, &mut session, &inbox, 3_000)
+        .await
+        .expect("回写本身不该报错");
+
+    assert_eq!(report.deleted, 1);
+    assert_eq!(
+        report.not_written_back, 0,
+        "就地删除没有目标侧，不是「挪过去了但本地没跟上」，不该计这一笔"
+    );
+
+    let after = fixture.server.command_log();
+    let new_commands: Vec<&String> = after.iter().skip(before).collect();
+    assert!(
+        !new_commands
+            .iter()
+            .any(|line| **line == format!("EXAMINE \"{}\"", inbox.remote_name)),
+        "就地删除不该为了写回去 `EXAMINE` 源文件夹自己，实际：{new_commands:?}"
+    );
 
     fixture.server.shutdown().await;
 }

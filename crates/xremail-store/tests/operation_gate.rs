@@ -78,6 +78,7 @@ fn sample_folder(id: &str, account_id: &str, remote_name: &str) -> Folder {
         last_uid: None,
         highest_modseq: None,
         uidvalidity: Some(EPOCH),
+        role: None,
     }
 }
 

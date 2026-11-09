@@ -432,6 +432,7 @@ fn seed_mailbox(app: &tauri::App<MockRuntime>, account_id: &str) {
                 last_uid: None,
                 highest_modseq: None,
                 uidvalidity: Some(42),
+                role: None,
             },
         )
         .await
