@@ -59,3 +59,11 @@ test("截图：深色模式", async ({ page, app }) => {
   await page.waitForTimeout(500);
   await page.screenshot({ path: `${OUT}/04-dark.png`, fullPage: false });
 });
+
+test("截图：设置抽屉", async ({ page, app }) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await app.openFolder();
+  await page.getByTestId("settings-toggle").click();
+  await page.waitForTimeout(400);
+  await page.screenshot({ path: `${OUT}/05-settings-drawer.png`, fullPage: false });
+});

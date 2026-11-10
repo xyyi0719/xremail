@@ -68,6 +68,14 @@ export async function renderApp(backend: Backend): Promise<AppHarness> {
   render(<App />);
   await settle();
 
+  // **打开设置抽屉**：账户管理卡（授权码、DKIM、搜索）现在住在抽屉里
+  // （UI_DESIGN §6.2），抽屉关闭时不挂载。集成测试要操作它们，
+  // 所以脚手架统一先打开——一个入口改，61 条测试不用各改各的。
+  // 抽屉是**非模态**的（不遮罩、不隔离外部），文件夹等主界面元素
+  // 仍然可以正常查询和点击。
+  await user.click(screen.getByTestId("settings-toggle"));
+  await settle();
+
   const openFolder = async (name = "收件箱"): Promise<void> => {
     await user.click(screen.getByRole("button", { name: ACCOUNT_EMAIL }));
     await settle();

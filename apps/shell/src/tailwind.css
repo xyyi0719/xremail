@@ -10,7 +10,12 @@
  * 这一期**没有任何组件**使用 Tailwind 类，本文件不产生实际样式输出——
  * 验收口径见 UI_DESIGN §5.3：CSS gzip ≤ 12 KB。
  */
-@import "tailwindcss" source(none);
+/* 默认从本文件所在目录（src/）自动检测类名——组件都在 src 下，够用。
+   之前写成 `source(none)`（禁用检测）是为了把产物压到最小，结果
+   **所有工具类都没生成**：类名挂在 DOM 上但没有任何样式，抽屉打开后
+   在截图里完全看不见。这是一个"看起来成功、实际全空"的静默失败，
+   靠截图才发现。 */
+@import "tailwindcss";
 
 @theme inline {
   --color-background: var(--background);

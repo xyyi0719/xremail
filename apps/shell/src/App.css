@@ -1517,3 +1517,22 @@ button.secondary:hover {
   color: oklch(78% 0.16 85);
   opacity: 1;
 }
+
+/* 顶栏的设置入口：次级按钮的观感，放在头部一行里。 */
+.settings-toggle {
+  background: var(--background);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.settings-toggle:hover {
+  background: var(--hover);
+}
+
+/* 顶栏的设置入口：不占整行，跟在头部信息后面。 */
+.app-header .settings-toggle {
+  margin-left: auto;
+}

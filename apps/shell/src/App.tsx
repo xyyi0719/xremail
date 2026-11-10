@@ -22,6 +22,7 @@ import type {
 import { describeFlagIntent, isStarred, isUnread } from "./types";
 import { loadAttachmentLimits } from "./attachmentLimits";
 import "./tailwind.css";
+import { Sheet, SheetTrigger, SheetContent, SheetHeader, SheetTitle, SheetBody } from "./components/ui/sheet";
 import "./tokens.css";
 import "./App.css";
 
@@ -337,6 +338,42 @@ function App() {
             <dd className="app-info-path">{info.dataDir ?? "—"}</dd>
           </dl>
         )}
+      {/* 「账户与设置」收进右侧抽屉：设置是低频动作，不该把邮件推走。
+          打开时 Sheet 会挂 Portal 并锁列表滚动；关闭即卸载（UI_DESIGN §5.2）。 */}
+      <Sheet modal={false} open={settingsOpen} onOpenChange={setSettingsOpen}>
+        <SheetTrigger asChild>
+          <button
+            type="button"
+            className="settings-toggle"
+            data-testid="settings-toggle"
+          >
+            ⚙ 账户与设置
+          </button>
+        </SheetTrigger>
+        <SheetContent>
+          <SheetHeader>
+            <SheetTitle className="text-lg font-semibold">账户与设置</SheetTitle>
+          </SheetHeader>
+          <SheetBody className="flex flex-col gap-6">
+            {/* `accounts` 在首帧是 `null`（还没拉回来）。加载态由下面的
+                「加载中…」负责，这里只在拿到了之后才渲染管理卡。 */}
+            {accounts !== null && (
+              <AccountList
+                accounts={accounts}
+                onSelect={(account) => setAccountId(account.id)}
+                onDelete={handleDelete}
+                onSynced={handleSynced}
+                onError={handleError}
+                onNotice={handleNotice}
+                onChanged={refresh}
+              />
+            )}
+            <AccountForm />
+            <SearchPanel onOpen={handleOpenHit} onError={handleError} />
+          </SheetBody>
+        </SheetContent>
+      </Sheet>
+
       </header>
 
       {error && (
@@ -368,36 +405,6 @@ function App() {
           </button>
         </div>
       )}
-
-      <details
-        className="app-settings"
-        open={settingsOpen}
-        onToggle={(event) => setSettingsOpen(event.currentTarget.open)}
-      >
-        <summary className="app-settings-summary" data-testid="settings-toggle">
-          账户与设置
-          <span className="app-settings-hint">
-            （添加账户、导入授权码、DKIM、搜索）
-          </span>
-        </summary>
-        <div className="app-settings-body">
-          {/* `accounts` 在首帧是 `null`（还没拉回来）。加载态由下面的
-              「加载中…」负责，这里只在拿到了之后才渲染管理卡。 */}
-          {accounts !== null && (
-            <AccountList
-              accounts={accounts}
-              onSelect={(account) => setAccountId(account.id)}
-            onDelete={handleDelete}
-            onSynced={handleSynced}
-            onError={handleError}
-            onNotice={handleNotice}
-              onChanged={refresh}
-            />
-          )}
-          <AccountForm />
-          <SearchPanel onOpen={handleOpenHit} onError={handleError} />
-        </div>
-      </details>
 
       {accounts === null ? (
         <p className="app-loading">加载中…</p>
