@@ -1211,6 +1211,10 @@ body {
   /* 让列表吃掉剩余高度，滚动条落在面板内部而不是整个中栏。 */
   min-height: 0;
   height: 100%;
+  /* 中栏本身有 padding，但面板撑满后标题会顶到边框上——补一点内边距，
+     让「邮件（n）」与上边框之间透口气（截图里发现）。 */
+  padding: 0.25rem;
+  box-sizing: border-box;
 }
 
 .message-list {
