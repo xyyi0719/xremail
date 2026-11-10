@@ -8,6 +8,19 @@
 
 ---
 
+## 界面
+
+下面是**真实前端界面**的截图（`apps/shell/e2e/screenshots.spec.ts` 生成，
+复用 E2E 的假后端，数据固定、每次跑都能重出同样的图）：
+
+![邮件列表](docs/screenshots/01-mailbox.png)
+
+![写信面板](docs/screenshots/02-compose.png)
+
+完整一页（账户设置 → 搜索 → 账户与 DKIM → 写信 → 文件夹 → 邮件列表）：
+
+![整页概览](docs/screenshots/03-overview-full.png)
+
 ## 当前状态
 
 > **v0.3.0 · P0–P3 已出关；P4 的 Windows 侧已交付、Android 侧只验到「能编出 APK」；P5-L（Linux）主要工作已落地；P5 增值功能 / P6 未开始**（2026-11-09）
