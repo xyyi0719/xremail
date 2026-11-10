@@ -1,5 +1,6 @@
 import AccountForm from "./components/AccountForm";
 import AccountList from "./components/AccountList";
+import AccountSwitcher from "./components/AccountSwitcher";
 import ComposePanel from "./components/ComposePanel";
 import FolderList from "./components/FolderList";
 import MessageList from "./components/MessageList";
@@ -378,6 +379,19 @@ function App() {
           </span>
         </summary>
         <div className="app-settings-body">
+          {/* `accounts` 在首帧是 `null`（还没拉回来）。加载态由下面的
+              「加载中…」负责，这里只在拿到了之后才渲染管理卡。 */}
+          {accounts !== null && (
+            <AccountList
+              accounts={accounts}
+              onSelect={(account) => setAccountId(account.id)}
+            onDelete={handleDelete}
+            onSynced={handleSynced}
+            onError={handleError}
+            onNotice={handleNotice}
+              onChanged={refresh}
+            />
+          )}
           <AccountForm />
           <SearchPanel onOpen={handleOpenHit} onError={handleError} />
         </div>
@@ -399,14 +413,10 @@ function App() {
                 写邮件
               </button>
 
-              <AccountList
+              <AccountSwitcher
                 accounts={accounts}
+                selectedId={accountId}
                 onSelect={(account) => setAccountId(account.id)}
-                onDelete={handleDelete}
-                onSynced={handleSynced}
-                onError={handleError}
-                onNotice={handleNotice}
-                onChanged={refresh}
               />
 
               {accountId && (
