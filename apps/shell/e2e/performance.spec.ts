@@ -57,8 +57,20 @@ test.describe("性能：长列表滚动", () => {
     await expect(page.getByTestId("message-item").first()).toBeVisible();
 
     const gaps = await page.evaluate(async () => {
-      const pane = document.querySelector(".mail-list-pane") as HTMLElement | null;
-      if (!pane) throw new Error("找不到 .mail-list-pane");
+      // **滚动条在虚拟列表自己身上**，不在外面的 `.mail-list-pane`。
+      // 量错对象的后果是：pane 的 scrollHeight 与 clientHeight 只差几十像素，
+      // 几帧就滚到底了，采到的样本数是个位数——数字看着很好但毫无意义。
+      // （实测：pane 790/724，list 1344/665。）
+      const pane = document.querySelector(
+        '[data-testid="message-list"]',
+      ) as HTMLElement | null;
+      if (!pane) throw new Error("找不到 [data-testid=message-list]");
+      // **虚拟化之后每帧滚的步长必须加大**：一次只滚 40px 的话，
+      // 500 行 × 56px = 28000px 要滚 700 帧；而虚拟列表每帧只重渲染十几行，
+      // 帧率一高就变成「几十毫秒滚完」——采不到几个样本，量出来的数字没意义
+      // （实测只剩 2 帧）。这里按「总高度的 1/120」一步，保证有约 120 个样本。
+      const totalScroll = pane.scrollHeight - pane.clientHeight;
+      const stepPx = Math.max(40, Math.ceil(totalScroll / 120));
       const gaps: number[] = [];
       await new Promise<void>((resolve) => {
         let last = performance.now();
@@ -66,7 +78,7 @@ test.describe("性能：长列表滚动", () => {
           const now = performance.now();
           gaps.push(now - last);
           last = now;
-          pane.scrollTop += 40;
+          pane.scrollTop += stepPx;
           if (pane.scrollTop + pane.clientHeight >= pane.scrollHeight - 4) {
             resolve();
           } else {
@@ -90,6 +102,23 @@ test.describe("性能：长列表滚动", () => {
       `最长一帧 ${worst.toFixed(1)}ms（${over}/${gaps.length} 帧超过 50ms）——` +
         "超过 200ms 说明滚动触发了大范围重排",
     ).toBeLessThan(200);
+
+    // **虚拟化守门**：500 封邮件时渲染的行数必须是「一屏 + 缓冲」的量级，
+    // 不能随邮件总数走。全渲染是 500 行、3148 个 DOM 节点；虚拟化后约 24 行、
+    // 317 个节点（2026-11-10 实测）。
+    //
+    // 阈值取 80 行：留足缓冲（视口 900px / 56px ≈ 16 行，加 overscan 12 行，
+    // 再留余量），但只要有人把虚拟化去掉就会立刻冲到 500 而变红。
+    const rendered = await page.getByTestId("message-item").count();
+    const nodes = await page.evaluate(() => document.querySelectorAll("*").length);
+    test.info().annotations.push(
+      { type: "渲染行数", description: `${rendered}` },
+      { type: "DOM 节点", description: `${nodes}` },
+    );
+    expect(
+      rendered,
+      `渲染了 ${rendered} 行——虚拟化可能被去掉了（全渲染时是 500 行）`,
+    ).toBeLessThan(80);
   });
 });
 
@@ -110,19 +139,21 @@ test.describe("性能：切换邮件", () => {
     await expect(items.first()).toBeVisible();
 
     // 列表按 uid 倒序排，所以**不能**假设第 i 项就是「第 i+1 封」。
-    // 先把每一项要显示的标题读出来，点完之后等这个标题出现在右栏。
-    const titles: string[] = [];
-    for (let i = 0; i < 20; i += 1) {
-      titles.push((await items.nth(i).innerText()).split("\n")[0]!.trim());
-    }
-
+    //
+    // **虚拟化之后**只有视口里那二十几行在 DOM 里，`items.nth(11)` 压根不存在。
+    // 所以每一步都先 `scrollIntoViewIfNeeded`——这本身也是真实用户会做的事
+    // （想点第 15 封就滚下去）。量的是「滚到 + 点开 + 正文换过来」的总时间，
+    // 用它当「切一封邮件要多久」是合理的。
     const timings: number[] = [];
     for (let i = 0; i < 20; i += 1) {
       const started = Date.now();
-      await items.nth(i).click();
+      const item = items.nth(i);
+      await item.scrollIntoViewIfNeeded();
+      const title = (await item.innerText()).split("\n")[0]!.trim();
+      await item.click();
       await page
         .getByRole("heading", { level: 2 })
-        .filter({ hasText: titles[i]! })
+        .filter({ hasText: title })
         .first()
         .waitFor({ state: "visible" });
       timings.push(Date.now() - started);

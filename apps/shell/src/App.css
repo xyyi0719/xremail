@@ -1193,3 +1193,48 @@ body {
   border-color: color-mix(in srgb, currentColor 22%, transparent);
   font-weight: 600;
 }
+
+/* ---------------------------------------------------------------------------
+   虚拟列表的**行高契约**
+   ---------------------------------------------------------------------------
+
+   `VirtualList.tsx` 里的 `ROW_HEIGHT = 56` 与这里的 `height: 56px`
+   必须是同一个数。两个数值不同步的表现是：滚到底部时最后几行露不出来，
+   或者中间出现一条空白缝隙——两种都很难一眼看出根因。
+
+   所以这里是**定高**：主题与发件人各占一行、超出省略。要改成两行主题的话，
+   虚拟化就得换成测量式实现（见 VirtualList 的注释）。
+   --------------------------------------------------------------------------- */
+.message-panel {
+  display: flex;
+  flex-direction: column;
+  /* 让列表吃掉剩余高度，滚动条落在面板内部而不是整个中栏。 */
+  min-height: 0;
+  height: 100%;
+}
+
+.message-list {
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+.message-row {
+  height: 56px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.message-item {
+  min-width: 0;
+  flex: 1 1 auto;
+  height: 100%;
+}
+
+.message-subject,
+.message-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
