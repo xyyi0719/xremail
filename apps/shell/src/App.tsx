@@ -21,6 +21,7 @@ import type {
 } from "./types";
 import { describeFlagIntent, isStarred, isUnread } from "./types";
 import { loadAttachmentLimits } from "./attachmentLimits";
+import "./tailwind.css";
 import "./tokens.css";
 import "./App.css";
 

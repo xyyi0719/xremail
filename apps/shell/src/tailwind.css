@@ -1,0 +1,34 @@
+/* Tailwind v4 的入口。
+ *
+ * 设计文档：docs/UI_DESIGN.md §6.1（第一期：只铺地基，不动像素）。
+ *
+ * `@theme inline` 把 Tailwind 的工具类（`bg-background`、`text-foreground`、
+ * `rounded-lg`…）**映射到 tokens.css 里已有的 CSS 变量**——不是重新定义颜色。
+ * 这样 shadcn 风格的类名与现有手写 CSS 用的是同一套值；第二期组件迁移时
+ * 两套样式天然一致，将来删掉手写 CSS 也不会变颜色。
+ *
+ * 这一期**没有任何组件**使用 Tailwind 类，本文件不产生实际样式输出——
+ * 验收口径见 UI_DESIGN §5.3：CSS gzip ≤ 12 KB。
+ */
+@import "tailwindcss" source(none);
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--danger);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --radius-lg: var(--radius-lg);
+  --radius-md: var(--radius);
+  --radius-sm: var(--radius-sm);
+}
