@@ -22,6 +22,7 @@ import type {
 import { describeFlagIntent, isStarred, isUnread } from "./types";
 import { loadAttachmentLimits } from "./attachmentLimits";
 import "./tailwind.css";
+import { Skeleton } from "./components/ui/skeleton";
 import { Sheet, SheetTrigger, SheetContent, SheetHeader, SheetTitle, SheetBody } from "./components/ui/sheet";
 import "./tokens.css";
 import "./App.css";
@@ -69,6 +70,16 @@ function App() {
   // 「命令成功了，但结果有区别」的反馈走这条通道，跟 `error` 分开：
   // 成功的操作不能显示成错误。
   const [notice, setNotice] = useState<Notice | null>(null);
+
+  // 成功类提示 6 秒后自动消失；error / warn 留着（用户必须看到，且可手动关）。
+  // 定时器随 notice 变化重建——连续两条成功提示时，重置计时而不是叠加。
+  useEffect(() => {
+    if (notice === null || (notice.kind !== "ok" && notice.kind !== "info")) {
+      return;
+    }
+    const timer = window.setTimeout(() => setNotice(null), 6_000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
 
   // 当前浏览的账户 / 文件夹 / 邮件。
   const [accountId, setAccountId] = useState<string | null>(null);
@@ -406,8 +417,26 @@ function App() {
         </div>
       )}
 
+      {/* 骨架屏：占位与真实三栏**同形状**，数据到位后布局不跳。
+          比「加载中…」三个字好——那会让首屏从一行字突变成整页。 */}
       {accounts === null ? (
-        <p className="app-loading">加载中…</p>
+        <div className="mail-layout" aria-label="加载中">
+          <aside className="mail-sidebar">
+            <Skeleton className="h-9 w-full" />
+            <Skeleton className="h-8 w-3/4" />
+            <Skeleton className="h-24 w-full" />
+          </aside>
+          <section className="mail-list-pane">
+            <Skeleton className="mb-3 h-6 w-24" />
+            <Skeleton className="mb-2 h-12 w-full" />
+            <Skeleton className="mb-2 h-12 w-full" />
+            <Skeleton className="h-12 w-full" />
+          </section>
+          <section className="mail-reading-pane">
+            <Skeleton className="mb-3 h-7 w-1/2" />
+            <Skeleton className="h-20 w-full" />
+          </section>
+        </div>
       ) : (
         <>
           <div className="mail-layout" data-testid="mail-layout">

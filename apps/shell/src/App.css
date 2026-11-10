@@ -1536,3 +1536,25 @@ button.secondary:hover {
 .app-header .settings-toggle {
   margin-left: auto;
 }
+
+/* ---------------------------------------------------------------------------
+   通知条 → 浮层 Toast
+   ---------------------------------------------------------------------------
+
+   以前 `.app-notice` 是文档流里的一条横幅，会把三栏整体往下推一条——
+   每次同步完成界面都跳一下。现在浮在**左下角**（写信浮层在右下角，
+   两个不相撞），不再参与布局。
+
+   成功/信息类 6 秒自动消失（App.tsx 里的定时器）；错误/警告常驻待手动关。
+   testid 与 `app-notice-ok/error` 类名是**测试契约**，不许改。
+   --------------------------------------------------------------------------- */
+.app-notice {
+  position: fixed;
+  left: 1rem;
+  bottom: 1rem;
+  z-index: 40;
+  max-width: min(24rem, calc(100vw - 2rem));
+  box-shadow: 0 4px 16px rgb(0 0 0 / 14%);
+  border-radius: var(--radius);
+  animation: none;
+}
