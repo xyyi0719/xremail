@@ -49,3 +49,13 @@ test("截图：整页概览", async ({ page, app }) => {
   // 整页图：一次看完账户设置 → 文件夹 → 邮件列表的结构。
   await page.screenshot({ path: `${OUT}/03-overview-full.png`, fullPage: true });
 });
+
+test("截图：深色模式", async ({ page, app }) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  // 深色走的是 `prefers-color-scheme`，Playwright 可以整体模拟。
+  await page.emulateMedia({ colorScheme: "dark" });
+  await app.openFolder();
+  await page.getByTestId("message-item").first().click();
+  await page.waitForTimeout(500);
+  await page.screenshot({ path: `${OUT}/04-dark.png`, fullPage: false });
+});

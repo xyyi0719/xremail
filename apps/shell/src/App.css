@@ -1185,12 +1185,16 @@ body {
 }
 
 .account-switcher-item:hover {
-  background: color-mix(in srgb, currentColor 6%, transparent);
+  background: var(--hover);
 }
 
+/* 选中态用**主色**而不是 `currentColor`：
+   `currentColor 10%` 在深色模式下是「白色叠 10%」，整块发亮、跟周围的
+   深色面板打架（深色截图里一眼能看到）。主色的低透明度叠加在两种模式下
+   都读得出「这是当前账户」。 */
 .account-switcher-item-active {
-  background: color-mix(in srgb, currentColor 10%, transparent);
-  border-color: color-mix(in srgb, currentColor 22%, transparent);
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  border-color: color-mix(in srgb, var(--primary) 40%, transparent);
   font-weight: 600;
 }
 
