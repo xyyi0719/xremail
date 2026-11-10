@@ -189,20 +189,24 @@ body {
   opacity: 0.7;
 }
 
+/* 输入框：**白底 + 细边框**，不用灰底。
+   灰底（`currentColor 6%`）看起来像「禁用态」——截图里正文框整块灰，
+   用户第一反应是「这里不能输入」。而且 currentColor 在深浅两套配色里会反号，
+   深色模式下灰底变成发亮的浅块。
+   焦点环统一交给下面 tokens 层的 `:focus-visible`，这里不再重复写。 */
 .field input,
 .field select {
-  padding: 0.4rem 0.55rem;
+  padding: var(--space-2) var(--space-3);
   font: inherit;
-  color: inherit;
-  background: color-mix(in srgb, currentColor 6%, transparent);
-  border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
-  border-radius: 0.4rem;
+  color: var(--foreground);
+  background: var(--background);
+  border: 1px solid var(--input);
+  border-radius: var(--radius-sm);
 }
 
-.field input:focus-visible,
-.field select:focus-visible {
-  outline: 2px solid color-mix(in srgb, currentColor 45%, transparent);
-  outline-offset: 1px;
+.field input:hover,
+.field select:hover {
+  border-color: var(--muted-foreground);
 }
 
 .form-actions {
@@ -215,7 +219,7 @@ body {
   padding: 0.45rem 1.25rem;
   font: inherit;
   color: inherit;
-  background: color-mix(in srgb, currentColor 12%, transparent);
+  background: var(--hover);
   border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
   border-radius: 0.4rem;
   cursor: pointer;
@@ -342,13 +346,13 @@ body {
 
 .folder-item:hover,
 .message-item:hover {
-  background: color-mix(in srgb, currentColor 6%, transparent);
+  background: var(--hover);
 }
 
 .folder-item-active,
 .message-item-active {
   border-color: color-mix(in srgb, currentColor 35%, transparent);
-  background: color-mix(in srgb, currentColor 10%, transparent);
+  background: var(--hover);
 }
 
 .folder-name {
@@ -403,7 +407,7 @@ body {
 }
 
 .message-star-toggle:hover:not(:disabled) {
-  background: color-mix(in srgb, currentColor 10%, transparent);
+  background: var(--hover);
   color: currentColor;
 }
 
@@ -435,14 +439,14 @@ body {
   font: inherit;
   font-size: 0.875rem;
   color: inherit;
-  background: color-mix(in srgb, currentColor 8%, transparent);
+  background: var(--hover);
   border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
   border-radius: 0.4rem;
   cursor: pointer;
 }
 
 .message-flag-button:hover {
-  background: color-mix(in srgb, currentColor 14%, transparent);
+  background: var(--hover);
 }
 
 .message-body {
@@ -453,7 +457,7 @@ body {
   margin: 0;
   padding: 12px;
   border-radius: 8px;
-  background: color-mix(in srgb, currentColor 5%, transparent);
+  background: var(--hover);
 }
 
 /*
@@ -540,7 +544,7 @@ body {
   gap: 0.5rem 0.75rem;
   padding: 0.5rem 0.6rem;
   border-radius: 0.5rem;
-  background: color-mix(in srgb, currentColor 5%, transparent);
+  background: var(--hover);
 }
 
 .message-attachment-name {
@@ -602,7 +606,7 @@ body {
   font: inherit;
   font-size: var(--text-sm);
   color: inherit;
-  background: color-mix(in srgb, currentColor 8%, transparent);
+  background: var(--hover);
   border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
   border-radius: 0.35rem;
   cursor: pointer;
@@ -649,7 +653,7 @@ body {
   padding: 6px 8px;
   border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
   border-radius: 6px;
-  background: color-mix(in srgb, currentColor 4%, transparent);
+  background: var(--hover);
   color: inherit;
   font: inherit;
 }
@@ -669,7 +673,7 @@ body {
   padding: 0.45rem 1.25rem;
   font: inherit;
   color: inherit;
-  background: color-mix(in srgb, currentColor 12%, transparent);
+  background: var(--hover);
   border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
   border-radius: 0.4rem;
   cursor: pointer;
@@ -707,7 +711,7 @@ body {
 }
 
 .compose-close:hover {
-  background: color-mix(in srgb, currentColor 10%, transparent);
+  background: var(--hover);
 }
 
 .compose-fields {
@@ -734,7 +738,7 @@ body {
 }
 
 .compose-bcc-toggle:hover {
-  background: color-mix(in srgb, currentColor 10%, transparent);
+  background: var(--hover);
 }
 
 /* 「密送不会显示在收件人列表里」——这句提示必须一直在。 */
@@ -749,7 +753,7 @@ body {
   padding: 0.4rem 0.55rem;
   font: inherit;
   color: inherit;
-  background: color-mix(in srgb, currentColor 6%, transparent);
+  background: var(--hover);
   border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
   border-radius: 0.4rem;
   resize: vertical;
@@ -824,7 +828,7 @@ body {
   padding: 0.45rem 1.5rem;
   font: inherit;
   color: inherit;
-  background: color-mix(in srgb, currentColor 12%, transparent);
+  background: var(--hover);
   border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
   border-radius: 0.4rem;
   cursor: pointer;
@@ -1107,7 +1111,13 @@ body {
   bottom: 1rem;
   width: min(38rem, calc(100vw - 2rem));
   max-height: min(85vh, calc(100vh - 2rem));
-  overflow-y: auto;
+  /* **flex 列 + 只有正文滚动**：面板本身不滚。
+     之前整个面板 `overflow-y: auto`，内容一多「发送」按钮就被推到视口外，
+     得先滚到底才能发信——写邮件时最不该出现的摩擦（截图里能看到按钮不见了）。 */
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  padding: var(--space-4);
   z-index: 20;
   /* 浮层容易触发大范围重绘，这里把它限制在自己身上。 */
   contain: layout paint;
@@ -1120,6 +1130,54 @@ body {
 .compose-panel .rich-text-editor {
   width: 100%;
   box-sizing: border-box;
+}
+
+/* ---------------------------------------------------------------
+   写信面板：内容整体滚动，按钮 **sticky 在底部**
+
+   试过两版都不行：
+   v1 整个面板 `overflow-y: auto` → 内容一多「发送」被推到视口外；
+   v2 flex 分配（内容区 flex:1 + 按钮区 flex:0）→ 正文块吃掉高度，
+      「添加附件」被截断。
+
+   最可靠的是最朴素的：面板整体滚，按钮 `position: sticky; bottom: 0`。
+   无论内容多少，滚动时按钮始终贴在面板底部。
+   --------------------------------------------------------------- */
+.compose-panel > .compose-actions {
+  position: sticky;
+  bottom: 0;
+  background: var(--card);
+  border-top: 1px solid var(--border);
+  padding: var(--space-3) 0 var(--space-1);
+  margin-top: var(--space-2);
+}
+
+/* 面板总高度上限再收一点，保证「标题 + 地址区 + 正文 + 按钮」放得下。 */
+.compose-panel {
+  max-height: min(80vh, calc(100vh - 2rem));
+}
+
+.compose-panel > .compose-actions {
+  flex: 0 0 auto;
+  /* 按钮区始终在底部，且与上面的滚动内容用一条线分开。 */
+  border-top: 1px solid var(--border);
+  padding-top: var(--space-3);
+  margin-top: var(--space-2);
+}
+
+.compose-body {
+  resize: vertical;
+  min-height: 6rem;
+}
+
+/* 写信面板的标题栏：与内容之间加一条分隔线，视觉上「这是一个整体」。 */
+.compose-panel .panel-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: var(--space-3);
 }
 
 @media (max-width: 900px) {
