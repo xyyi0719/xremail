@@ -64,15 +64,15 @@ body {
 .app-error {
   padding: 0.75rem 1rem;
   border-radius: 0.5rem;
-  background: color-mix(in srgb, #dc2626 12%, transparent);
-  color: #b91c1c;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
 }
 
 .app-ok {
   padding: 0.75rem 1rem;
   border-radius: 0.5rem;
-  background: color-mix(in srgb, #16a34a 12%, transparent);
-  color: #15803d;
+  background: color-mix(in srgb, var(--success) 12%, transparent);
+  color: var(--success);
 }
 
 /* -------------------------------------------------- 提示条（成功 / 中间态） */
@@ -85,7 +85,7 @@ body {
  * 深色主题下自动变亮，两种主题都读得清。
  */
 .app-notice {
-  --notice-accent: #2563eb;
+  --notice-accent: var(--primary);
   display: flex;
   align-items: baseline;
   justify-content: space-between;
@@ -100,24 +100,24 @@ body {
 }
 
 .app-notice-ok {
-  --notice-accent: #16a34a;
+  --notice-accent: var(--success);
 }
 
 .app-notice-info {
-  --notice-accent: #2563eb;
+  --notice-accent: var(--primary);
 }
 
 .app-notice-warn {
-  --notice-accent: #d97706;
+  --notice-accent: var(--primary);
 }
 
 /* 「不知道服务器执行了没」跟「服务器明确没接受」不是一回事，配色也分开。 */
 .app-notice-unknown {
-  --notice-accent: #7c3aed;
+  --notice-accent: var(--primary);
 }
 
 .app-notice-error {
-  --notice-accent: #dc2626;
+  --notice-accent: var(--danger);
 }
 
 .app-notice-close {
@@ -268,7 +268,7 @@ body {
 
 .account-detail {
   margin-top: 0.3rem;
-  font-size: 0.8125rem;
+  font-size: var(--text-sm);
   opacity: 0.8;
 }
 
@@ -282,7 +282,7 @@ body {
   right: 0.75rem;
   padding: 0.2rem 0.6rem;
   font: inherit;
-  font-size: 0.8125rem;
+  font-size: var(--text-sm);
   color: inherit;
   background: transparent;
   border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
@@ -291,15 +291,15 @@ body {
 }
 
 .account-delete:hover {
-  background: color-mix(in srgb, #dc2626 12%, transparent);
-  color: #b91c1c;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
 }
 
 /* 「忘记凭据」：从系统钥匙串里删掉授权码。 */
 .account-forget {
   padding: 4px 12px;
   font: inherit;
-  font-size: 0.8125rem;
+  font-size: var(--text-sm);
   color: inherit;
   background: transparent;
   border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
@@ -308,8 +308,8 @@ body {
 }
 
 .account-forget:hover {
-  background: color-mix(in srgb, #dc2626 12%, transparent);
-  color: color-mix(in srgb, #dc2626 70%, currentColor);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: color-mix(in srgb, var(--danger) 70%, currentColor);
 }
 
 /* ---------------- 文件夹 / 邮件 / 正文 ---------------- */
@@ -370,7 +370,7 @@ body {
 }
 
 .message-star {
-  color: #d9a300;
+  color: var(--primary);
   margin-right: 4px;
 }
 
@@ -413,12 +413,12 @@ body {
 }
 
 .message-star-toggle-on {
-  color: color-mix(in srgb, #d9a300 80%, currentColor);
+  color: color-mix(in srgb, var(--primary) 80%, currentColor);
 }
 
 .message-star-toggle .message-star {
   margin-right: 0;
-  color: color-mix(in srgb, #d9a300 80%, currentColor);
+  color: color-mix(in srgb, var(--primary) 80%, currentColor);
 }
 
 /* 正文面板里的「标记为已读 / 未读」。 */
@@ -600,7 +600,7 @@ body {
 .account-save-credential {
   padding: 4px 12px;
   font: inherit;
-  font-size: 0.8125rem;
+  font-size: var(--text-sm);
   color: inherit;
   background: color-mix(in srgb, currentColor 8%, transparent);
   border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
@@ -614,7 +614,7 @@ body {
 }
 
 .sync-hint {
-  font-size: 0.8125rem;
+  font-size: var(--text-sm);
   opacity: 0.7;
 }
 
@@ -680,7 +680,7 @@ body {
 }
 
 .compose-launch-hint {
-  font-size: 0.8125rem;
+  font-size: var(--text-sm);
   opacity: 0.7;
 }
 
@@ -698,7 +698,7 @@ body {
 .compose-close {
   padding: 0.25rem 0.7rem;
   font: inherit;
-  font-size: 0.8125rem;
+  font-size: var(--text-sm);
   color: inherit;
   background: transparent;
   border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
@@ -725,7 +725,7 @@ body {
   justify-self: start;
   padding: 0.25rem 0.7rem;
   font: inherit;
-  font-size: 0.8125rem;
+  font-size: var(--text-sm);
   color: inherit;
   background: transparent;
   border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
@@ -740,7 +740,7 @@ body {
 /* 「密送不会显示在收件人列表里」——这句提示必须一直在。 */
 .compose-hint {
   margin: 0.5rem 0 0.9rem;
-  font-size: 0.8125rem;
+  font-size: var(--text-sm);
   opacity: 0.7;
 }
 
@@ -792,7 +792,7 @@ body {
   flex: 0 0 auto;
   padding: 2px 8px;
   font: inherit;
-  font-size: 0.8125rem;
+  font-size: var(--text-sm);
   color: inherit;
   background: transparent;
   border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
@@ -801,8 +801,8 @@ body {
 }
 
 .compose-attachment-remove:hover {
-  background: color-mix(in srgb, #dc2626 12%, transparent);
-  color: color-mix(in srgb, #dc2626 70%, currentColor);
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: color-mix(in srgb, var(--danger) 70%, currentColor);
 }
 
 .compose-actions {
@@ -815,7 +815,7 @@ body {
 }
 
 .compose-saved {
-  font-size: 0.8125rem;
+  font-size: var(--text-sm);
   opacity: 0.7;
   font-variant-numeric: tabular-nums;
 }
@@ -841,7 +841,7 @@ body {
  * 「确定发出去了」和「不知道发出去了」——后者不能随便重发。
  */
 .compose-result {
-  --compose-accent: #2563eb;
+  --compose-accent: var(--primary);
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
@@ -854,15 +854,15 @@ body {
 }
 
 .compose-result-sent {
-  --compose-accent: #16a34a;
+  --compose-accent: var(--success);
 }
 
 .compose-result-uncertain {
-  --compose-accent: #d97706;
+  --compose-accent: var(--primary);
 }
 
 .compose-result-failed {
-  --compose-accent: #dc2626;
+  --compose-accent: var(--danger);
 }
 
 .compose-result-detail {
@@ -873,8 +873,8 @@ body {
   margin-top: 0.75rem;
   padding: 0.75rem 1rem;
   border-radius: 0.5rem;
-  background: color-mix(in srgb, #dc2626 12%, transparent);
-  color: #b91c1c;
+  background: color-mix(in srgb, var(--danger) 12%, transparent);
+  color: var(--danger);
 }
 
 /* ---------------------------------------------------------------- 搜索面板 */
@@ -888,16 +888,16 @@ body {
 .search-form input {
   flex: 1;
   padding: 0.4rem 0.6rem;
-  border: 1px solid #cbd5e1;
+  border: 1px solid var(--input);
   border-radius: 0.375rem;
   font: inherit;
 }
 
 .search-form button {
   padding: 0.4rem 0.9rem;
-  border: 1px solid #cbd5e1;
+  border: 1px solid var(--input);
   border-radius: 0.375rem;
-  background: #f1f5f9;
+  background: var(--muted);
   font: inherit;
   cursor: pointer;
 }
@@ -931,8 +931,8 @@ body {
 }
 
 .search-result-button:hover {
-  background: #f8fafc;
-  border-color: #e2e8f0;
+  background: var(--muted);
+  border-color: var(--border);
 }
 
 .search-result-subject {
@@ -940,18 +940,18 @@ body {
 }
 
 .search-result-meta {
-  font-size: 0.8125rem;
-  color: #64748b;
+  font-size: var(--text-sm);
+  color: var(--muted-foreground);
 }
 
 .search-result-snippet {
-  font-size: 0.8125rem;
-  color: #475569;
+  font-size: var(--text-sm);
+  color: var(--muted-foreground);
   overflow-wrap: anywhere;
 }
 
 .search-result-snippet mark {
-  background: #fef08a;
+  background: var(--accent);
   color: inherit;
   padding: 0 0.1em;
 }
@@ -996,7 +996,7 @@ body {
 
 .app-settings {
   margin: 0 1.25rem 0.5rem;
-  border: 1px solid var(--app-border, #d8d8d8);
+  border: 1px solid var(--app-border, var(--border));
   border-radius: 8px;
   /* 收起时只占一行——这是「首屏就能看到邮件」的关键。 */
   flex: 0 0 auto;
@@ -1027,7 +1027,7 @@ body {
   grid-template-columns: minmax(11rem, 14rem) minmax(16rem, 22rem) minmax(0, 1fr);
   min-height: 0; /* grid 子项要能收缩，否则内部 overflow 不生效 */
   overflow: hidden;
-  border-top: 1px solid var(--app-border, #d8d8d8);
+  border-top: 1px solid var(--app-border, var(--border));
 }
 
 .mail-sidebar,
@@ -1041,14 +1041,14 @@ body {
 }
 
 .mail-sidebar {
-  border-right: 1px solid var(--app-border, #d8d8d8);
+  border-right: 1px solid var(--app-border, var(--border));
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
 }
 
 .mail-list-pane {
-  border-right: 1px solid var(--app-border, #d8d8d8);
+  border-right: 1px solid var(--app-border, var(--border));
 }
 
 .compose-launch-button {
@@ -1073,7 +1073,7 @@ body {
     overflow: visible;
     contain: none;
     border-right: none;
-    border-bottom: 1px solid var(--app-border, #d8d8d8);
+    border-bottom: 1px solid var(--app-border, var(--border));
   }
 }
 
@@ -1112,7 +1112,7 @@ body {
   /* 浮层容易触发大范围重绘，这里把它限制在自己身上。 */
   contain: layout paint;
   box-shadow: 0 8px 32px rgb(0 0 0 / 22%);
-  background: var(--app-surface, #fff);
+  background: var(--app-surface, var(--background));
 }
 
 /* 浮层里那个正文框不要再固定宽度——跟着面板走。 */
@@ -1241,4 +1241,217 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* ===========================================================================
+   视觉统一层（参考 shadcn/ui 的形状与交互规范）
+   ===========================================================================
+
+   这一层只做三件事，不新增任何依赖：
+
+   1. **圆角与边框统一**：所有可点的、可点的容器用 `--radius`，内部原子件用
+      `--radius-sm`。以前是 4px / 6px / 8px / 999px 混着用，看起来「不齐」。
+   2. **焦点可见**：键盘 Tab 到哪里必须看得见。用 `:focus-visible` 而不是
+      `:focus`——鼠标点完不该留一圈蓝边，那是「廉价感」的主要来源之一。
+   3. **hover 只用一层低透明度叠加**：不再逐个写颜色，深浅色模式下自动一致。
+*/
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  border-radius: var(--radius-sm);
+}
+
+/* 过渡**只给不在长列表里的按钮**。
+   一开始写的是无差别的 `button { transition: … }`，结果虚拟列表滚动时
+   每一行进出视口都带着 120ms 的过渡——滚动用例的耗时从 1.0s 涨到 11.9s
+   （2026-11-10 实测，帧时间没变但总时长翻十倍）。
+   列表行的 hover 反馈靠颜色变化就够了，不需要过渡。 */
+button:not(.message-item):not(.message-star-toggle):not(.folder-item) {
+  transition: background-color 120ms ease, border-color 120ms ease;
+}
+
+/* 键盘焦点：只有键盘操作才显示。 */
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+input,
+textarea,
+select {
+  border: 1px solid var(--input);
+  border-radius: var(--radius-sm);
+  background: var(--background);
+  padding: var(--space-2);
+}
+
+input:hover,
+textarea:hover,
+select:hover {
+  border-color: var(--muted-foreground);
+}
+
+/* 主按钮：整页只有「写邮件」和「发送」用主色，其余都是次级。 */
+.compose-launch-button,
+.account-save-dkim,
+.compose-send,
+button[type="submit"] {
+  background: var(--primary);
+  color: var(--primary-foreground);
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-4);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.compose-launch-button:hover:not(:disabled),
+.account-save-dkim:hover:not(:disabled),
+.compose-send:hover:not(:disabled),
+button[type="submit"]:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--primary) 88%, black);
+}
+
+.compose-launch-button:disabled,
+.account-save-dkim:disabled,
+.compose-send:disabled,
+button[type="submit"]:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* 次级按钮：白底描边，hover 只叠一层。 */
+.account-delete,
+.account-clear-dkim,
+.compose-drafts-new,
+button.secondary {
+  background: var(--background);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-1) var(--space-3);
+  cursor: pointer;
+}
+
+.account-delete:hover,
+.account-clear-dkim:hover,
+.compose-drafts-new:hover,
+button.secondary:hover {
+  background: var(--hover);
+}
+
+/* 面板：靠 1px 边框分层，不用阴影——阴影多了就是「不简洁」。 */
+.panel {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.panel-title {
+  font-size: var(--text-lg);
+  font-weight: 600;
+  margin: 0 0 var(--space-2);
+}
+
+/* 三栏之间的分隔线用 token，别再用 --app-border 的兜底值。 */
+.mail-sidebar,
+.mail-list-pane,
+.mail-reading-pane {
+  border-color: var(--border);
+}
+
+/* 选中的行：用主色的低透明度叠加，而不是整块铺满主色——铺满会把文字
+   压得看不清，也不利于扫读。 */
+.message-item-active {
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  border-color: color-mix(in srgb, var(--primary) 40%, transparent);
+}
+
+.folder-item-active {
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  border-color: color-mix(in srgb, var(--primary) 40%, transparent);
+  font-weight: 600;
+}
+
+/* ---------------------------------------------------------------------------
+   列表与文件夹的密度：参考 Gmail 的紧凑节奏
+   ---------------------------------------------------------------------------
+
+   之前每行 56px、内边距 8/10px，在 500 行的情况下显得松。Gmail 的行高
+   大约 40–48px，一屏能放下更多——「一屏看到更多」本身就是「快」的体感来源。
+
+   改行高必须**同时**改 `VirtualList.tsx` 的 `ROW_HEIGHT`（同一份契约）。
+   这里取 48px。
+   --------------------------------------------------------------------------- */
+.message-row {
+  height: 48px;
+}
+
+.message-item {
+  padding: 4px 10px;
+  gap: 1px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+}
+
+.message-item:hover {
+  background: var(--hover);
+}
+
+.message-subject {
+  font-size: var(--text-base);
+  line-height: 1.35;
+}
+
+.message-detail {
+  font-size: var(--text-xs);
+  color: var(--muted-foreground);
+  line-height: 1.3;
+}
+
+/* 未读：靠字重与颜色区分，不额外加圆点——列表里已经够多元素了。 */
+.message-unread {
+  font-weight: 650;
+  color: var(--foreground);
+}
+
+.folder-item {
+  border-radius: var(--radius-sm);
+  padding: 6px 10px;
+  font-size: var(--text-base);
+}
+
+.folder-item:hover {
+  background: var(--hover);
+}
+
+/* 星标：默认弱化，加星后才醒目——避免整列都是黄星。 */
+.message-star-toggle {
+  border: none;
+  background: none;
+  color: var(--muted-foreground);
+  opacity: 0.55;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+}
+
+.message-star-toggle:hover {
+  opacity: 1;
+  background: var(--hover);
+}
+
+.message-star-toggle-on {
+  color: oklch(78% 0.16 85);
+  opacity: 1;
 }

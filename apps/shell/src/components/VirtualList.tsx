@@ -22,7 +22,7 @@ import { useCallback, useLayoutEffect, useRef, useState } from "react";
  * 这个组件就用不了，得换成测量式的虚拟化。`ROW_HEIGHT` 与 CSS 里的
  * `.message-row { height: … }` 是**同一份契约**，改一个必须改另一个。
  */
-export const ROW_HEIGHT = 56;
+export const ROW_HEIGHT = 48;
 
 /** 视口上下各多渲染几行——快速滚动时不会看到空白。 */
 const OVERSCAN = 6;

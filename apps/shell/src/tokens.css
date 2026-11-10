@@ -1,0 +1,109 @@
+/* ===========================================================================
+   设计 token（参考 shadcn/ui 的命名与配色思路）
+   ===========================================================================
+
+   ## 为什么是「抄设计」而不是「引入 shadcn/ui」
+
+   shadcn/ui 不是一个可以 `npm i` 的组件库——它是一套**把组件源码复制进项目**
+   的方案，前提是 Tailwind CSS。真接进来要付：
+
+   * `tailwindcss` + `@radix-ui/*`，`node_modules` 里两个组件就是 13 MB；
+   * 构建链从「Vite 处理一份手写 CSS」变成「Tailwind JIT 扫描 + 生成」；
+   * 运行时多一层 Radix 的组合式组件（弹层、焦点陷阱……）。
+
+   而这个项目当前**打包后的 CSS 只有 19 KB**、前端依赖只有 5 个，用户的核心
+   诉求又是「页面一定要快」。所以这里只**照搬它的设计语言**：
+
+   * 同一套 token 命名（`--background` / `--foreground` / `--primary` /
+     `--muted` / `--border` / `--ring` / `--radius`）；
+   * 同一套 `oklch()` 配色（比 hex 好调亮度与色度，也更容易做到深浅一致的对比度）；
+   * 同一套形状与间距节奏（圆角 0.5rem、边框 1px、hover 用低透明度叠加）。
+
+   **换来的**：零新增依赖、零运行时、CSS 体积仍是个位数 KB 量级。
+   **代价**：shadcn 那些成品组件（Dialog、Select、Toast）要自己写——但它们本来
+   也只是一层 Tailwind 类名的组合，视觉规范才是「看起来高级」的来源。
+
+   ## 用法约定
+
+   * **不要**再往组件里写死颜色。一律用这里的变量，否则深浅色会各崩一半；
+   * 强调色只用 `--primary` 一处。多个强调色是「不够简洁」的最常见原因。
+*/
+
+:root {
+  /* 底色 */
+  --background: oklch(100% 0 0);
+  --foreground: oklch(24% 0.01 265);
+
+  /* 面板 / 卡片：比底色略灰一点，用来分层，而不是靠阴影 */
+  --card: oklch(100% 0 0);
+  --card-foreground: var(--foreground);
+  --muted: oklch(97% 0.002 265);
+  --muted-foreground: oklch(52% 0.012 265);
+
+  /* 主色：只用在「当前账户」「当前文件夹」「主按钮」三处 */
+  --primary: oklch(52% 0.15 255);
+  --primary-foreground: oklch(99% 0 0);
+
+  /* 交互态 */
+  --accent: oklch(95% 0.012 255);
+  --accent-foreground: oklch(30% 0.02 255);
+  --hover: oklch(0% 0 0 / 4%);
+
+  /* 线 */
+  --border: oklch(91% 0.004 265);
+  --input: oklch(89% 0.005 265);
+  --ring: oklch(52% 0.15 255 / 45%);
+
+  /* 状态色 */
+  --danger: oklch(55% 0.19 25);
+  --danger-soft: oklch(96% 0.02 25);
+  --success: oklch(52% 0.13 150);
+
+  /* 形状 */
+  --radius: 0.5rem;
+  --radius-sm: 0.375rem;
+  --radius-lg: 0.75rem;
+
+  /* 字号：邮件列表与正文用的是同一套节奏，不要一件一个大小 */
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.875rem;
+  --text-lg: 1rem;
+  --text-xl: 1.25rem;
+
+  /* 间距节奏：4 的倍数，避免 7px / 9px 这种随手值 */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+}
+
+/* 深色：只调 L（亮度）与 C（色度），色相保持一致——这样同一套变量在两种模式下
+   是「同一套配色」，而不是两套各调各的。 */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: oklch(18% 0.008 265);
+    --foreground: oklch(93% 0.004 265);
+
+    --card: oklch(22% 0.009 265);
+    --card-foreground: var(--foreground);
+    --muted: oklch(26% 0.009 265);
+    --muted-foreground: oklch(70% 0.012 265);
+
+    --primary: oklch(68% 0.14 255);
+    --primary-foreground: oklch(18% 0.008 265);
+
+    --accent: oklch(30% 0.02 255);
+    --accent-foreground: oklch(92% 0.01 255);
+    --hover: oklch(100% 0 0 / 6%);
+
+    --border: oklch(32% 0.008 265);
+    --input: oklch(34% 0.009 265);
+    --ring: oklch(68% 0.14 255 / 50%);
+
+    --danger: oklch(70% 0.17 25);
+    --danger-soft: oklch(30% 0.05 25);
+    --success: oklch(70% 0.12 150);
+  }
+}
