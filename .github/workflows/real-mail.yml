@@ -60,15 +60,18 @@ jobs:
       - name: Write test credentials
         run: |
           mkdir -p "$HOME/.xremail"
-          cat > "$HOME/.xremail/accounts.txt" <<EOF
-          [163]
-          user = ${XREMAIL_TEST_163_USER}
-          password = ${XREMAIL_TEST_163_PASS}
-
-          [qq]
-          user = ${XREMAIL_TEST_QQ_USER}
-          password = ${XREMAIL_TEST_QQ_PASS}
-          EOF
+          # **heredoc 的结束符必须顶格**（`<<EOF` 不是 `<<-EOF`）：
+          # 缩进版会把每行前导空格原样写进文件，解析出来的 user 全是空白 ——
+          # 第一次跑就是 61 秒编译完之后报「[163] 段的 user 是空的」。
+          {
+            echo "[163]"
+            echo "user = ${XREMAIL_TEST_163_USER}"
+            echo "password = ${XREMAIL_TEST_163_PASS}"
+            echo ""
+            echo "[qq]"
+            echo "user = ${XREMAIL_TEST_QQ_USER}"
+            echo "password = ${XREMAIL_TEST_QQ_PASS}"
+          } > "$HOME/.xremail/accounts.txt"
           chmod 600 "$HOME/.xremail/accounts.txt"
         env:
           XREMAIL_TEST_163_USER: ${{ secrets.XREMAIL_TEST_163_USER }}
