@@ -1,0 +1,15 @@
+name: Probe secrets
+on:
+  workflow_dispatch:
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Echo lengths only
+        env:
+          U: ${{ secrets.XREMAIL_TEST_163_USER }}
+          P: ${{ secrets.XREMAIL_TEST_163_PASS }}
+        run: |
+          echo "user_len=${#U} pass_len=${#P}"
+          printf '%s\n' "[163]" "user = ${U}" "password = ${P}" > /tmp/a.txt
+          head -c 40 /tmp/a.txt | sed -E 's/(user = ).*/\1REDACTED/; s/(password = ).*/\1REDACTED/'
