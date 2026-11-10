@@ -335,6 +335,19 @@ function App() {
     [messages],
   );
 
+  // 把列表里第 index 行滚进视野。
+  //
+  // **必须做 `typeof` 守卫**：jsdom 没有实现 `Element.prototype.scrollIntoView`，
+  // 直接调用在 CI 的单元测试里是 TypeError（本地有 polyfill 时发现不了——
+  // 2026-11-10 CI 上 Frontend job 因此红过一次）。键盘导航的核心是
+  // 「选中会变」，滚动只是锦上添花，环境不支持就安静跳过。
+  const scrollToIndex = (index: number) => {
+    const row = document.querySelectorAll('[data-testid="message-item"]')[index];
+    if (row && typeof row.scrollIntoView === "function") {
+      row.scrollIntoView({ block: "nearest" });
+    }
+  };
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
@@ -376,10 +389,7 @@ function App() {
           if (next) {
             event.preventDefault();
             setMessage(next);
-            const index = orderedForKeys.indexOf(next);
-            document
-              .querySelectorAll('[data-testid="message-item"]')
-              [index]?.scrollIntoView({ block: "nearest" });
+            scrollToIndex(orderedForKeys.indexOf(next));
           }
           return;
         }
@@ -389,10 +399,7 @@ function App() {
           if (prev) {
             event.preventDefault();
             setMessage(prev);
-            const index = orderedForKeys.indexOf(prev);
-            document
-              .querySelectorAll('[data-testid="message-item"]')
-              [index]?.scrollIntoView({ block: "nearest" });
+            scrollToIndex(orderedForKeys.indexOf(prev));
           }
           return;
         }
