@@ -77,6 +77,9 @@ export function installDaemon(config: TauriDaemonConfig): void {
 
   const commandHandlers: Record<string, (args: Args) => unknown> = {
     list_accounts: () => config.accounts,
+    // DKIM 未配置时后端返回 `null`（面板显示「未配置，发出的邮件不带签名」）。
+    // 缺这个桩会让面板顶部出现一条红色报错，把截图弄脏。
+    get_dkim_config: () => null,
     app_info: () => ({
       name: "Xremail",
       version: "0.1.0",
@@ -169,6 +172,16 @@ export function installDaemon(config: TauriDaemonConfig): void {
     // 「点邮件里的链接不会让应用窗口跳走」。
     "plugin:opener|open_url": (args) => {
       daemon.opened.push(String(args.url));
+      return undefined;
+    },
+    // 事件订阅。应用在挂载时注册后端事件（`import_mail` 之类的刷新提示）。
+    // 没有这个桩时页面上会出现一条红色的「操作失败」——**那不是产品缺陷，
+    // 是这套假后端缺命令**（2026-11-10 做截图时才发现）。
+    "plugin:event|listen": () => 0,
+    "plugin:event|unlisten": () => undefined,
+    // 「用文件管理器打开」。真插件会拉起文件管理器，这里只记账。
+    "plugin:opener|open_path": (args) => {
+      daemon.opened.push(String(args.path ?? ""));
       return undefined;
     },
   };
