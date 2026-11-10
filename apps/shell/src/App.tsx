@@ -51,6 +51,12 @@ type SyncStateEvent = {
 };
 
 function App() {
+  // 设置区（添加账户 / 搜索 / 账户与 DKIM）默认**收起**。
+  //
+  // 以前它们是和邮件列表一起纵向堆在同一页里的：登录之后要先滚过大半屏的
+  // 设置区才看到邮件——日常收发时那半屏是纯粹的干扰，而且每次滚动都要
+  // 重新布局整页。收起之后首屏就是「文件夹 + 列表 + 正文」三栏。
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const [accounts, setAccounts] = useState<Account[] | null>(null);
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -360,75 +366,91 @@ function App() {
         </div>
       )}
 
-      <AccountForm />
-
-      <SearchPanel onOpen={handleOpenHit} onError={handleError} />
+      <details
+        className="app-settings"
+        open={settingsOpen}
+        onToggle={(event) => setSettingsOpen(event.currentTarget.open)}
+      >
+        <summary className="app-settings-summary" data-testid="settings-toggle">
+          账户与设置
+          <span className="app-settings-hint">
+            （添加账户、导入授权码、DKIM、搜索）
+          </span>
+        </summary>
+        <div className="app-settings-body">
+          <AccountForm />
+          <SearchPanel onOpen={handleOpenHit} onError={handleError} />
+        </div>
+      </details>
 
       {accounts === null ? (
         <p className="app-loading">加载中…</p>
       ) : (
         <>
-          <AccountList
-            accounts={accounts}
-            onSelect={(account) => setAccountId(account.id)}
-            onDelete={handleDelete}
-            onSynced={handleSynced}
-            onError={handleError}
-            onNotice={handleNotice}
-            onChanged={refresh}
-          />
+          <div className="mail-layout" data-testid="mail-layout">
+            {/* 左栏：账户 + 文件夹 + 写信入口。窄、不怎么变，不随滚动重排。 */}
+            <aside className="mail-sidebar">
+              <button
+                type="button"
+                className="compose-launch-button"
+                onClick={() => accountId && setComposeAccountId(accountId)}
+                disabled={!accountId}
+              >
+                写邮件
+              </button>
 
-          {accountId && (
-            <>
-              <div className="compose-launch">
-                <button
-                  type="button"
-                  className="compose-launch-button"
-                  onClick={() => setComposeAccountId(accountId)}
-                >
-                  写邮件
-                </button>
-                <span className="compose-launch-hint">
-                  用选中的账户发信，改动会自动存草稿
-                </span>
-              </div>
-
-              {composeAccountId && composeAccount && (
-                <ComposePanel
-                  accountId={composeAccount.id}
-                  accountEmail={composeAccount.email}
-                  onClose={() => setComposeAccountId(null)}
-                />
-              )}
-
-              <FolderList
-                folders={folders}
-                selectedId={folderId}
-                onSelect={(folder) => setFolderId(folder.id)}
+              <AccountList
+                accounts={accounts}
+                onSelect={(account) => setAccountId(account.id)}
+                onDelete={handleDelete}
+                onSynced={handleSynced}
+                onError={handleError}
+                onNotice={handleNotice}
+                onChanged={refresh}
               />
 
-              {folderId && (
-                <>
-                  <MessageList
-                    messages={messages}
-                    selectedUid={message?.uid ?? null}
-                    onSelect={setMessage}
-                    onToggleStar={handleToggleStar}
-                  />
-
-                  {message && (
-                    <MessageView
-                      accountId={accountId}
-                      folderId={folderId}
-                      message={message}
-                      onToggleSeen={handleToggleSeen}
-                      onError={handleError}
-                      onAttachmentError={handleAttachmentError}
-                    />
-                  )}
-                </>
+              {accountId && (
+                <FolderList
+                  folders={folders}
+                  selectedId={folderId}
+                  onSelect={(folder) => setFolderId(folder.id)}
+                />
               )}
-            </>
+            </aside>
+
+            {/* 中栏：邮件列表。只渲染摘要，点开正文不重建这一列。 */}
+            <section className="mail-list-pane" aria-label="邮件列表">
+              {accountId && folderId && (
+                <MessageList
+                  messages={messages}
+                  selectedUid={message?.uid ?? null}
+                  onSelect={setMessage}
+                  onToggleStar={handleToggleStar}
+                />
+              )}
+            </section>
+
+            {/* 右栏：正文。 */}
+            <section className="mail-reading-pane" aria-label="邮件正文">
+              {accountId && folderId && message && (
+                <MessageView
+                  accountId={accountId}
+                  folderId={folderId}
+                  message={message}
+                  onToggleSeen={handleToggleSeen}
+                  onError={handleError}
+                  onAttachmentError={handleAttachmentError}
+                />
+              )}
+            </section>
+          </div>
+
+          {composeAccountId && composeAccount && (
+            <ComposePanel
+              accountId={composeAccount.id}
+              accountEmail={composeAccount.email}
+              onClose={() => setComposeAccountId(null)}
+            />
           )}
         </>
       )}

@@ -80,6 +80,9 @@ export function installDaemon(config: TauriDaemonConfig): void {
     // DKIM 未配置时后端返回 `null`（面板显示「未配置，发出的邮件不带签名」）。
     // 缺这个桩会让面板顶部出现一条红色报错，把截图弄脏。
     get_dkim_config: () => null,
+    // 附件列表：fixtures 里的邮件没有附件，返回空数组。
+    // 缺这个桩会让正文上方出现一条红色「附件：…」报错。
+    list_attachments: () => [],
     app_info: () => ({
       name: "Xremail",
       version: "0.1.0",

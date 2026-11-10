@@ -952,3 +952,136 @@ body {
   color: inherit;
   padding: 0 0.1em;
 }
+
+/* ===========================================================================
+   三栏邮件布局（参考 Gmail 的「文件夹 | 列表 | 正文」）
+   ===========================================================================
+
+   改造前所有区块纵向堆在一页里：登录后要先滚过大半屏的设置区才看到邮件，
+   而且每次滚动都要重新布局整页。这里改成：
+
+   * 整页是 `height: 100vh` 的 **grid**，只有中栏和右栏各自滚动；
+   * 左栏（文件夹）宽度固定、不参与滚动——它几乎不变，让它跟着滚是浪费；
+   * 设置区默认收起（见 App.tsx 的 `settingsOpen`）。
+
+   **性能上的三点**：
+   1. `contain: layout paint` 把每一栏的重排/重绘限制在栏内——点开一封邮件
+      只重绘右栏，不会让左栏和中栏跟着算一遍布局；
+   2. 各栏各自 `overflow: auto`，滚动时不会触发整页回流；
+   3. 不给列表项加 `transition` / `box-shadow` 之类的动画属性——那会让
+      滚动时的每一帧都重新合成，长列表上很容易掉帧。
+*/
+
+.app-shell {
+  max-width: none;
+  height: 100vh;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  /* 头部/提示自适应，主体吃掉剩下的高度。 */
+  grid-template-rows: auto auto auto auto 1fr;
+  overflow: hidden;
+}
+
+.app-header {
+  padding: 0.75rem 1.25rem 0.5rem;
+}
+
+.app-title {
+  font-size: 1.5rem;
+}
+
+.app-settings {
+  margin: 0 1.25rem 0.5rem;
+  border: 1px solid var(--app-border, #d8d8d8);
+  border-radius: 8px;
+  /* 收起时只占一行——这是「首屏就能看到邮件」的关键。 */
+  flex: 0 0 auto;
+}
+
+.app-settings-summary {
+  cursor: pointer;
+  padding: 0.5rem 0.75rem;
+  font-weight: 600;
+  user-select: none;
+}
+
+.app-settings-hint {
+  font-weight: 400;
+  opacity: 0.65;
+  margin-left: 0.5rem;
+}
+
+.app-settings-body {
+  padding: 0 0.75rem 0.75rem;
+  max-height: 45vh;
+  overflow: auto;
+}
+
+.mail-layout {
+  display: grid;
+  /* 左窄、中中、右宽——与 Gmail 的比例接近。 */
+  grid-template-columns: minmax(11rem, 14rem) minmax(16rem, 22rem) minmax(0, 1fr);
+  min-height: 0; /* grid 子项要能收缩，否则内部 overflow 不生效 */
+  overflow: hidden;
+  border-top: 1px solid var(--app-border, #d8d8d8);
+}
+
+.mail-sidebar,
+.mail-list-pane,
+.mail-reading-pane {
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0.75rem;
+  /* 把重排/重绘限制在栏内：点开邮件只重绘右栏。 */
+  contain: layout paint;
+}
+
+.mail-sidebar {
+  border-right: 1px solid var(--app-border, #d8d8d8);
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.mail-list-pane {
+  border-right: 1px solid var(--app-border, #d8d8d8);
+}
+
+.compose-launch-button {
+  width: 100%;
+}
+
+/* 窄屏（窗口小于 900px）退回单栏堆叠：宁可要能看，也不要挤成三条缝。 */
+@media (max-width: 900px) {
+  .app-shell {
+    height: auto;
+    overflow: visible;
+  }
+
+  .mail-layout {
+    grid-template-columns: minmax(0, 1fr);
+    overflow: visible;
+  }
+
+  .mail-sidebar,
+  .mail-list-pane,
+  .mail-reading-pane {
+    overflow: visible;
+    contain: none;
+    border-right: none;
+    border-bottom: 1px solid var(--app-border, #d8d8d8);
+  }
+}
+
+/* DKIM 表单默认收起：状态行始终可见，展开才占地方。 */
+.dkim-details {
+  margin-top: 0.5rem;
+}
+
+.dkim-summary {
+  cursor: pointer;
+  user-select: none;
+  font-size: 0.9rem;
+  opacity: 0.8;
+}

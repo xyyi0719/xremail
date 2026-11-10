@@ -105,6 +105,12 @@ function DkimPanel({ account, onNotice }: Props) {
           : `DKIM：已配置 ${config.selector}@${config.domain}（${config.headerAlg}）`}
       </div>
 
+      {/* 表单默认**收起**：状态行始终看得见（一行字），要点开才占地方。
+          这个组件的注释一早就写着「默认折叠」，但代码里一直是全展开的
+          ——单页布局时看不出来，改成三栏之后它把左栏整个撑满了（R73）。 */}
+      <details className="dkim-details">
+        <summary className="dkim-summary">配置 DKIM 签名</summary>
+
       {config !== null && config.dnsName !== null && (
         <div className="dkim-dns" data-testid="dkim-dns">
           在 DNS 里添加 TXT 记录 <code>{config.dnsName}</code>：
@@ -183,6 +189,7 @@ function DkimPanel({ account, onNotice }: Props) {
           只想换选择器或域名？留空私钥直接保存即可，钥匙串里的私钥不会被改动。
         </span>
       )}
+      </details>
     </div>
   );
 }
