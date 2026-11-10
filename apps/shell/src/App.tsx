@@ -6,7 +6,7 @@ import FolderList from "./components/FolderList";
 import MessageList from "./components/MessageList";
 import MessageView from "./components/MessageView";
 import SearchPanel, { type SearchHit } from "./components/SearchPanel";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
@@ -62,6 +62,8 @@ function App() {
   // 设置区才看到邮件——日常收发时那半屏是纯粹的干扰，而且每次滚动都要
   // 重新布局整页。收起之后首屏就是「文件夹 + 列表 + 正文」三栏。
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Ctrl+K 打开抽屉时，`onOpenAutoFocus` 里要把焦点交给**搜索框**而不是默认的第一格。
+  const focusSearchOnOpen = useRef(false);
   const [accounts, setAccounts] = useState<Account[] | null>(null);
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -318,6 +320,123 @@ function App() {
     [handleSetFlag],
   );
 
+  // =========================================================================
+  // 键盘导航（UI_DESIGN §2.3）
+  //
+  // **硬规则：焦点在输入类元素里时必须全部失效**——用户在写收件人时按 `s`
+  // 是打字母，不是加星标。判断的是 `event.target`，不是 document.activeElement：
+  // 事件从哪发出就从哪拦。
+  //
+  // 列表顺序与 MessageList 的展示顺序一致（uid 倒序，新的在上）；
+  // 这里用 useMemo 与它共享同一份排序结果。
+  // =========================================================================
+  const orderedForKeys = useMemo(
+    () => [...messages].sort((a, b) => b.uid - a.uid),
+    [messages],
+  );
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const editable =
+        target !== null &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.tagName === "SELECT" ||
+          target.isContentEditable);
+      if (editable) {
+        return;
+      }
+
+      // `Ctrl/⌘+K`：聚焦搜索框。搜索框住在设置抽屉里，先开抽屉再聚焦——
+      // 抽屉是非模态的（UI_DESIGN §4.1），聚焦后主界面仍可用。
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        focusSearchOnOpen.current = true;
+        setSettingsOpen(true);
+        return;
+      }
+
+      if (event.ctrlKey || event.metaKey || event.altKey) {
+        return;
+      }
+
+      // 设置抽屉开着时，单键导航让位（抽屉里有自己的表单快捷键语义）。
+      if (settingsOpen) {
+        return;
+      }
+
+      const currentIndex = message === null ? -1 : orderedForKeys.findIndex((m) => m.uid === message.uid);
+
+      switch (event.key) {
+        case "j":
+        case "ArrowDown": {
+          // 从「未选中」按 j：选中第一封（最新的）。
+          const next = orderedForKeys[currentIndex + 1] ?? orderedForKeys[0];
+          if (next) {
+            event.preventDefault();
+            setMessage(next);
+            const index = orderedForKeys.indexOf(next);
+            document
+              .querySelectorAll('[data-testid="message-item"]')
+              [index]?.scrollIntoView({ block: "nearest" });
+          }
+          return;
+        }
+        case "k":
+        case "ArrowUp": {
+          const prev = currentIndex <= 0 ? null : orderedForKeys[currentIndex - 1];
+          if (prev) {
+            event.preventDefault();
+            setMessage(prev);
+            const index = orderedForKeys.indexOf(prev);
+            document
+              .querySelectorAll('[data-testid="message-item"]')
+              [index]?.scrollIntoView({ block: "nearest" });
+          }
+          return;
+        }
+        case "s": {
+          if (message !== null) {
+            event.preventDefault();
+            void handleToggleStar(message);
+          }
+          return;
+        }
+        case "c": {
+          // 写新邮件：需要先有账户。
+          if (accountId !== null) {
+            event.preventDefault();
+            setComposeAccountId(accountId);
+          }
+          return;
+        }
+        case "Escape": {
+          // 关最上层：先关写信浮层，再清空正文选择。
+          if (composeAccountId !== null) {
+            event.preventDefault();
+            setComposeAccountId(null);
+          } else if (message !== null) {
+            event.preventDefault();
+            setMessage(null);
+          }
+          return;
+        }
+        default:
+          return;
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [
+    orderedForKeys,
+    message,
+    accountId,
+    composeAccountId,
+    settingsOpen,
+    handleToggleStar,
+  ]);
+
   const handleToggleSeen = useCallback(
     // `value = true` 的含义是「加上 IMAP 的 \Seen 位」＝标记已读，
     // 所以当前**未读**时传 true、已读时传 false。
@@ -361,7 +480,21 @@ function App() {
             ⚙ 账户与设置
           </button>
         </SheetTrigger>
-        <SheetContent>
+        <SheetContent
+          onOpenAutoFocus={(event) => {
+            if (!focusSearchOnOpen.current) {
+              // ⚙ 点开：让 Radix 默认聚焦第一格表单。
+              return;
+            }
+            // **Ctrl+K 进来：焦点必须落在搜索框上**。
+            // 不能用 setTimeout/rAF 去抢——Radix 的默认聚焦会在挂载后
+            // 再移一次焦点，比任何定时器都晚（实测输入落空）。
+            // 正确姿势是拦下它自己的 onOpenAutoFocus，此刻内容已挂载。
+            event.preventDefault();
+            focusSearchOnOpen.current = false;
+            document.querySelector<HTMLInputElement>('input[type="search"]')?.focus();
+          }}
+        >
           <SheetHeader>
             <SheetTitle className="text-lg font-semibold">账户与设置</SheetTitle>
           </SheetHeader>
