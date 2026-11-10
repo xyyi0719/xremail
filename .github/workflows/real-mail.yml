@@ -1,0 +1,91 @@
+# 真实邮箱往返验收（**手动触发**，绝不进普通 PR CI）。
+#
+# 方案与门槛见 docs/TESTING_STRATEGY.md §6.1、docs/UI_DESIGN.md 无关。
+# 这条工作流做的事：
+#
+# 1. 从 GitHub Encrypted secrets 读两个专用测试账户（163 发 → QQ 收）；
+# 2. 在 runner 上落成 `$HOME/.xremail/accounts.txt`（权限 600，跑完即删）；
+# 3. 跑 `real_round_trip_between_two_mailboxes`（#[ignore] 的那条）：
+#    真实 SMTP 提交 → 对方 IMAP 收到（正文含标记）→ 发件方「已发送」正好一份。
+#
+# ## 为什么是 workflow_dispatch
+#
+# 发信是**有副作用**的动作：网络抖动不该把仓库标红，更不该在每次 push 时
+# 都真实发一封邮件。所以只允许手动触发，失败只红这里，不影响分支保护。
+#
+# ## secrets
+#
+# XREMAIL_TEST_163_USER / XREMAIL_TEST_163_PASS
+# XREMAIL_TEST_QQ_USER  / XREMAIL_TEST_QQ_PASS
+#
+# 口令是服务商的**客户端授权码**（不是登录密码），且只写在 Encrypted secrets 里，
+# 永不进仓库。测试文件从 `[163]` / `[qq]` 两段读，段名写死（见
+# apps/shell/src-tauri/tests/real_mail_roundtrip.rs 的 require_mailbox）。
+
+name: Real mail roundtrip
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: real-mail-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  roundtrip:
+    name: Real mail roundtrip (163 → QQ)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # xremail-shell 依赖 tauri → 编译需要 webkit2gtk 系统库（与 ci.yml 的
+      # ubuntu job 相同的一组；SQLX_OFFLINE 之下不需要起数据库）。
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev patchelf
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            crates/* -> target
+
+      # 凭据落盘：默认 HOME（/home/runner）可写。测试自己读
+      # `$HOME/.xremail/accounts.txt`（仓库之外，见 real_mail_roundtrip.rs）。
+      - name: Write test credentials
+        run: |
+          mkdir -p "$HOME/.xremail"
+          cat > "$HOME/.xremail/accounts.txt" <<EOF
+          [163]
+          user = ${XREMAIL_TEST_163_USER}
+          password = ${XREMAIL_TEST_163_PASS}
+
+          [qq]
+          user = ${XREMAIL_TEST_QQ_USER}
+          password = ${XREMAIL_TEST_QQ_PASS}
+          EOF
+          chmod 600 "$HOME/.xremail/accounts.txt"
+        env:
+          XREMAIL_TEST_163_USER: ${{ secrets.XREMAIL_TEST_163_USER }}
+          XREMAIL_TEST_163_PASS: ${{ secrets.XREMAIL_TEST_163_PASS }}
+          XREMAIL_TEST_QQ_USER: ${{ secrets.XREMAIL_TEST_QQ_USER }}
+          XREMAIL_TEST_QQ_PASS: ${{ secrets.XREMAIL_TEST_QQ_PASS }}
+
+      # 离线数据已提交在 .sqlx/，SQLX_OFFLINE 下无需数据库。
+      - name: Run real mail roundtrip
+        env:
+          XREMAIL_REAL_ACCOUNTS: "1"
+          SQLX_OFFLINE: "true"
+          CARGO_TERM_COLOR: always
+        run: |
+          cargo test -p xremail-shell --test real_mail_roundtrip -- --ignored --nocapture
+
+      # **always()**：测试失败也要清掉凭据文件，不让它留在 runner 上。
+      - name: Remove credentials
+        if: always()
+        run: rm -f "$HOME/.xremail/accounts.txt"
