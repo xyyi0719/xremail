@@ -153,8 +153,13 @@ jobs:
           mkdir -p "$HOME/keystore"
           echo "$KEYSTORE" | base64 -d > "$HOME/keystore/xremail-release.jks"
 
-      # tauri android build 会把 APK 打到 gen/android/app/build/outputs/apk/。
-      # 签名参数经环境变量传给 gradle（见 gen/android 的 build.gradle.kts）。
+      # `gen/android/` 整个被 .gitignore（CI 上由 `tauri android init` 重新生成），
+      # 所以签名配置**不能靠改仓库里的 build.gradle.kts**——必须在生成之后注入。
+      # 这一段把 signingConfigs 插进 android {} 块，并把 release buildType 绑上它。
+      - name: Inject signing config into generated gradle
+        if: steps.check.outputs.ready == 'true'
+        run: python3 scripts/inject_android_signing.py
+
       - name: Build signed APK
         if: steps.check.outputs.ready == 'true'
         working-directory: apps/shell
