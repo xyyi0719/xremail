@@ -407,6 +407,10 @@
 - [x] **安全存储**（2026-10-26）：Windows 凭据管理器适配已落地（`secrets/windows_store.rs`），
       不静默降级。
 - [ ] **早期可并行** Android PoC：构建、Rust 调用、Keystore 适配路线、前台/后台/息屏/进程恢复。
+  - [x] **Keystore 适配（代码就位，2026-11-11）**：`secrets/android_store.rs`，
+    经 `android-keyring`（`keyring` 的 Keystore 构建器）实现 get/set/delete，
+    与 Linux/Windows 同一套错误语义。`cargo check --target aarch64-linux-android` 通过。
+    **但真机读写一次都没跑过**——没有设备/模拟器。
   - **已完成的是「构建」这一格**（2026-11-09，见下面的「Android PoC 第一轮」）：
         工程能生成、APK 能产出、全部 Rust crate 在 `aarch64-linux-android` 上编过、
         托盘确被排除、**平台钥匙串在 Android 上是桩**这条也在二进制里坐实

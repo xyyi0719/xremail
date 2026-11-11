@@ -83,7 +83,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 只在 Linux 上编译：其它平台有自己的原生后端（Windows 用 windows crate 直接调
 # CredWriteW，见 apps/shell/src-tauri/src/secrets/windows_store.rs）。
 # 选 sync-secret-service 而不是链 libsecret：见 secrets/linux_store.rs 的模块文档。
-keyring = { version = "3", features = ["sync-secret-service"] }
+# keyring 的**平台特性由使用方挑**：Linux 要 `sync-secret-service`（D-Bus），
+# Android 走 `android-keyring` 构建器（不需要 D-Bus）。把它写在这里会让
+# Android 目标也强行拉进 Linux 的 D-Bus 依赖——`cargo check --target
+# aarch64-linux-android` 实测报 `unresolved import keyring`。
+keyring = { version = "3", default-features = false }
 
 
 # SQLite 访问层。特性说明：

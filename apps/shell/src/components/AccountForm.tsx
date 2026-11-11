@@ -9,6 +9,8 @@ import type {
 } from "../types";
 import {
   PROVIDER_LABELS,
+  PROVIDER_PRESETS,
+  type ProviderPreset,
   SMTP_AUTH_LABELS,
   SYNC_MODE_LABELS,
   TLS_LABELS,
@@ -34,9 +36,12 @@ const EMPTY: NewAccountRequest = {
 /**
  * 新增账户表单。
  *
- * **服务器地址不按品牌自动填**：各服务商的 IMAP/SMTP 参数要实测确认
- * （见 ISSUES_AND_RISKS R01/R02），在实测之前宁可让用户手填，
- * 也不能拿一个看起来合理的默认值糊弄过去。
+ * **服务器地址按品牌自动填，但只填实测过的**：163 / 企业邮 / QQ / 沃 的参数
+ * 已在 R01/R02 里实测闭环（记于 docs/PROTOCOLS.md），选中服务商即预填。
+ * 126 / Gmail / Exchange / 自定义**没有可信预设**，仍然让用户手填——
+ * 宁可多填一行，也不拿看起来合理的值糊弄。
+ *
+ * 用户手改过的字段不会被切换服务商覆盖（见 `applyProvider`）。
  */
 function AccountForm() {
   const [form, setForm] = useState<NewAccountRequest>(EMPTY);
@@ -49,6 +54,43 @@ function AccountForm() {
     value: NewAccountRequest[K],
   ) => {
     setForm((prev) => ({ ...prev, [key]: value }));
+  };
+
+  /**
+   * 选服务商时把**实测过的**服务器参数填进去。
+   *
+   * 语义要点：
+   * - **只填还有空的字段**（或该字段本来就等于上一个预设），不覆盖用户手改过
+   *   的值——用户从 163 改成 QQ、又想保留自己填的端口，不该被抢回去。
+   * - 选到**没有预设**的服务商（126 / Gmail / Exchange / 其它）时，**不清空**
+   *   已填内容，只是不再自动改——用户可能只改了个标签。
+   * - `generic` 是「自定义 IMAP」，本来就要手填，行为与上一条相同。
+   */
+  const applyProvider = (next: ProviderKind) => {
+    const previousPreset = PROVIDER_PRESETS[form.provider];
+    const preset = PROVIDER_PRESETS[next];
+
+    setForm((current) => {
+      const base = { ...current, provider: next };
+      if (!preset) {
+        return base;
+      }
+      // 「用户没动过」= 当前值等于上一个预设的值（或为空）。只在这种情况下覆盖。
+      const untouched = (key: keyof ProviderPreset, currentValue: unknown) => {
+        const prev = previousPreset?.[key];
+        return prev === undefined || currentValue === prev || currentValue === "";
+      };
+      return {
+        ...base,
+        imapHost: untouched("imapHost", current.imapHost) ? preset.imapHost : current.imapHost,
+        imapPort: untouched("imapPort", current.imapPort) ? preset.imapPort : current.imapPort,
+        imapTls: untouched("imapTls", current.imapTls) ? preset.imapTls : current.imapTls,
+        smtpHost: untouched("smtpHost", current.smtpHost) ? preset.smtpHost : current.smtpHost,
+        smtpPort: untouched("smtpPort", current.smtpPort) ? preset.smtpPort : current.smtpPort,
+        smtpTls: untouched("smtpTls", current.smtpTls) ? preset.smtpTls : current.smtpTls,
+        smtpAuth: untouched("smtpAuth", current.smtpAuth) ? preset.smtpAuth : current.smtpAuth,
+      };
+    });
   };
 
   const handleSubmit = async (event: React.FormEvent) => {
@@ -92,7 +134,7 @@ function AccountForm() {
           <span>服务商</span>
           <select
             value={form.provider}
-            onChange={(e) => set("provider", e.target.value as ProviderKind)}
+            onChange={(e) => applyProvider(e.target.value as ProviderKind)}
           >
             {(Object.keys(PROVIDER_LABELS) as ProviderKind[]).map((key) => (
               <option key={key} value={key}>

@@ -22,7 +22,9 @@
 //! * Windows：凭据管理器（Credential Manager）——见 [`windows_store`]。
 //! * Linux：Secret Service（D-Bus）——见 [`linux_store`]。GNOME Keyring / KWallet
 //!   都实现了这个接口；没有守护进程时**明确报错**，而不是落盘。
-//! * 其它平台（Android / macOS）：**暂不支持**（见 [`unsupported`]）——存取都明确报错，
+//! * Android：Keystore（JNI，经 `android-keyring` 构建器）——见 [`android_store`]。
+//!   **注意：这一层还没有真机验证**（R08）。
+//! * 其它平台（macOS 等）：**暂不支持**（见 [`unsupported`]）——存取都明确报错，
 //!   **不静默降级**成"内存里存着"或"存到文件里"。
 //!
 //! 静默降级会让人以为凭据已经落盘，实际却没有——那正是本模块要避免的事。
@@ -49,6 +51,10 @@ use std::sync::{Arc, RwLock};
 
 use xremail_api::SecretStore;
 
+/// Android Keystore 适配（R08）。见该文件的模块文档——**那里写明了
+/// 这一层还没有真机验证**。
+#[cfg(target_os = "android")]
+pub mod android_store;
 #[cfg(target_os = "linux")]
 pub mod linux_store;
 pub mod test_hooks;
@@ -101,12 +107,21 @@ pub fn platform_default_store() -> Arc<dyn SecretStore> {
     Arc::new(linux_store::LinuxSecretStore)
 }
 
+/// 平台**默认**实现（不看覆盖槽）。Android 上是 Keystore。
+///
+/// 与 Linux 那份是同一套 `keyring` 代码，只是构建器由 `android-keyring`
+/// 接管（JNI → Android Keystore）。见 [`android_store`] 的模块文档。
+#[cfg(target_os = "android")]
+pub fn platform_default_store() -> Arc<dyn SecretStore> {
+    Arc::new(android_store::AndroidSecretStore)
+}
+
 /// 平台**默认**实现（不看覆盖槽）。其余非 Windows 平台上是 [`unsupported`]。
 ///
 /// 这里刻意用「既不是 Windows、也不是 Linux」而不是笼统的 `not(windows)`：
 /// 两个分支同时存在时，`not(windows)` 会和 Linux 那条**同时成立**，
 /// 编译器报重定义。
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(not(any(windows, target_os = "linux", target_os = "android")))]
 pub fn platform_default_store() -> Arc<dyn SecretStore> {
     Arc::new(unsupported::UnsupportedSecretStore)
 }

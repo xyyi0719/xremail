@@ -64,7 +64,9 @@ windows = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux 的 Secret Service 钥匙串适配（见 src/secrets/linux_store.rs）。
 # 只在 Linux 上编译；Windows 走 windows crate，Android/macOS 仍是明确的桩。
-keyring = { workspace = true }
+# Linux 用 D-Bus（Secret Service）；其它平台不带这个特性。
+# Android 的构建器由下面的 android-keyring 提供。
+keyring = { workspace = true, features = ["sync-secret-service"] }
 
 [dev-dependencies]
 # 临时目录用于测试库文件。
@@ -78,3 +80,15 @@ xremail-protocol-smtp = { workspace = true }
 # tauri 的 test 特性：提供 mock_builder / get_ipc_response，
 # 用来测 Command 层的 IPC 序列化（见 tests/command_ipc.rs）。
 tauri = { version = "2", features = ["test", "tray-icon"] }
+
+# ---------------------------------------------------------------------------
+# Android：keyring 的 Keystore 构建器。
+#
+# `android-keyring` 把 `keyring::Entry` 的操作转到 Android Keystore（JNI），
+# 于是 `secrets/android_store.rs` 与 Linux 那份几乎逐行相同。
+# 写成 target-specific：其它平台不会拉进 JNI / NDK 相关依赖。
+# ---------------------------------------------------------------------------
+[target.'cfg(target_os = "android")'.dependencies]
+android-keyring = "0.2"
+# Android 下的 keyring 本体：**不带** Linux 的 D-Bus 特性。
+keyring = { workspace = true }

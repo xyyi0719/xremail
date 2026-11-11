@@ -65,6 +65,65 @@ impl ProviderKind {
     pub const fn requires_oauth(self) -> bool {
         matches!(self, ProviderKind::Google | ProviderKind::Exchange)
     }
+
+    /// 该服务商的 IMAP/SMTP 预设参数（**已实测**的才给）。
+    ///
+    /// ## 为什么现在可以预填
+    ///
+    /// 早先 `AccountForm` 的注释写着「服务器地址不按品牌自动填」——
+    /// 因为当时 R01/R02 还没实测，宁可让用户手填也不能拿"看起来合理"的值糊弄。
+    /// 那两个风险在 2026-10-23 已闭环（三家分别实测，记于 PROTOCOLS.md），
+    /// 所以现在可以预填**实测过的**那几家；没实测的（126 / Gmail / Exchange）
+    /// 仍然返回 `None`，UI 让用户自己填——**不猜**。
+    ///
+    /// 返回 `None` 语义是「没有可信预设」，不是「这个服务商不能用」。
+    pub const fn presets(self) -> Option<ProviderPresets> {
+        // 这些值逐条来自 docs/PROTOCOLS.md 的实测记录，改动它们等于改产品行为。
+        let (imap_host, smtp_host, smtp_auth) = match self {
+            // 163：IMAPS 993 / SMTPS 465，授权码走 AUTH LOGIN。
+            ProviderKind::Netease163 => ("imap.163.com", "smtp.163.com", SmtpAuth::Login),
+            // 企业邮：同一套 Coremail 体系，host 换成 qiye 前缀。
+            ProviderKind::NeteaseEnterprise => {
+                ("imap.qiye.163.com", "smtp.qiye.163.com", SmtpAuth::Login)
+            }
+            // QQ：IMAPS 993 / SMTPS 465；独有 IDLE + MOVE。
+            ProviderKind::Tencent => ("imap.qq.com", "smtp.qq.com", SmtpAuth::Login),
+            // 沃邮箱：IMAP 已实测可用；SMTP 只接受静态 RSA，rustls 连不上（R21），
+            // 但仍把 host 填上——用户至少不用猜 IMAP 那一段，SMTP 会如实报错。
+            ProviderKind::Wo => ("imap.wo.cn", "smtp.wo.cn", SmtpAuth::Login),
+            // 126 未实测、Gmail/Exchange 要 OAuth2、Generic 无预设。
+            ProviderKind::Netease126
+            | ProviderKind::Google
+            | ProviderKind::Exchange
+            | ProviderKind::Generic => {
+                return None;
+            }
+        };
+        Some(ProviderPresets {
+            imap_host,
+            imap_port: 993,
+            imap_tls: TlsMode::Implicit,
+            smtp_host,
+            smtp_port: 465,
+            smtp_tls: TlsMode::Implicit,
+            smtp_auth,
+        })
+    }
+}
+
+/// 一个服务商的服务器预设。
+///
+/// 端口与加密方式在这里是常量（993/465 + 隐式 TLS 是这几家的共同点，
+/// 也都实测过）。若某家将来要 STARTTLS，把它挪成字段而不是在这里加分支。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderPresets {
+    pub imap_host: &'static str,
+    pub imap_port: u16,
+    pub imap_tls: TlsMode,
+    pub smtp_host: &'static str,
+    pub smtp_port: u16,
+    pub smtp_tls: TlsMode,
+    pub smtp_auth: SmtpAuth,
 }
 
 /// How the client authenticates against IMAP/SMTP.
@@ -934,5 +993,53 @@ mod send_state_tests {
         assert!(!SendState::Failed.is_auto_retryable());
         assert!(!SendState::Succeeded.is_auto_retryable());
         assert!(!SendState::Draft.is_auto_retryable());
+    }
+}
+
+#[cfg(test)]
+mod provider_preset_tests {
+    use super::*;
+
+    /// 预填的值**逐条**对应 docs/PROTOCOLS.md 的实测记录。
+    /// 这条用例的作用是：谁改了预设却忘了更新文档（或反过来），这里立刻红。
+    #[test]
+    fn measured_providers_have_their_documented_endpoints() {
+        let p163 = ProviderKind::Netease163.presets().expect("163 已实测");
+        assert_eq!(p163.imap_host, "imap.163.com");
+        assert_eq!(p163.imap_port, 993);
+        assert_eq!(p163.smtp_host, "smtp.163.com");
+        assert_eq!(p163.smtp_port, 465);
+        assert_eq!(p163.imap_tls, TlsMode::Implicit);
+        assert_eq!(p163.smtp_tls, TlsMode::Implicit);
+        assert_eq!(p163.smtp_auth, SmtpAuth::Login);
+
+        let qq = ProviderKind::Tencent.presets().expect("QQ 已实测");
+        assert_eq!((qq.imap_host, qq.imap_port), ("imap.qq.com", 993));
+        assert_eq!((qq.smtp_host, qq.smtp_port), ("smtp.qq.com", 465));
+
+        let wo = ProviderKind::Wo.presets().expect("沃 IMAP 已实测");
+        assert_eq!((wo.imap_host, wo.smtp_host), ("imap.wo.cn", "smtp.wo.cn"));
+
+        let qiye = ProviderKind::NeteaseEnterprise
+            .presets()
+            .expect("企业邮有官方手册");
+        assert_eq!(qiye.imap_host, "imap.qiye.163.com");
+    }
+
+    /// **没实测过的不能瞎填**：126 缺凭据未实测、Gmail/Exchange 要 OAuth2、
+    /// Generic 本来就没有预设。它们必须返回 `None`，UI 才不会拿假值糊弄用户。
+    #[test]
+    fn unmeasured_providers_have_no_presets() {
+        for kind in [
+            ProviderKind::Netease126,
+            ProviderKind::Google,
+            ProviderKind::Exchange,
+            ProviderKind::Generic,
+        ] {
+            assert!(
+                kind.presets().is_none(),
+                "{kind:?} 没有实测预设，不该返回 Some",
+            );
+        }
     }
 }

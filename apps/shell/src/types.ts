@@ -459,3 +459,68 @@ export function describeFlagIntent(result: FlagIntentResult): Notice {
       return { kind: "error", text: "后端返回了不认识的状态" };
   }
 }
+
+/**
+ * 各服务商的服务器预设（**必须与 `xremail-core::model::ProviderKind::presets()`
+ * 逐字段一致**——那边是权威来源，这里是给表单即时预填的镜像）。
+ *
+ * ## 为什么要在前端镜像一份
+ *
+ * 预填发生在**用户选下拉的那一瞬间**，走一趟 IPC 会让界面先闪一下再填上。
+ * 复制一份到前端是换取「即时」。代价是要防漂移——`provider-presets.test.ts`
+ * 里有一条用例逐家比对，Rust 侧 `provider_preset_tests` 锁住同一组值；
+ * 两边任何一处改了而另一处没改，都会红。
+ *
+ * ## 只有实测过的才在里面
+ *
+ * 126 未实测、Gmail/Exchange 要 OAuth2、Generic 无预设——它们**不在表里**，
+ * 表单就不预填。宁可让用户手填，也不能拿看起来合理的值糊弄（R01/R02 的教训）。
+ */
+export interface ProviderPreset {
+  imapHost: string;
+  imapPort: number;
+  imapTls: TlsMode;
+  smtpHost: string;
+  smtpPort: number;
+  smtpTls: TlsMode;
+  smtpAuth: SmtpAuth;
+}
+
+export const PROVIDER_PRESETS: Partial<Record<ProviderKind, ProviderPreset>> = {
+  netease_163: {
+    imapHost: "imap.163.com",
+    imapPort: 993,
+    imapTls: "implicit",
+    smtpHost: "smtp.163.com",
+    smtpPort: 465,
+    smtpTls: "implicit",
+    smtpAuth: "login",
+  },
+  netease_enterprise: {
+    imapHost: "imap.qiye.163.com",
+    imapPort: 993,
+    imapTls: "implicit",
+    smtpHost: "smtp.qiye.163.com",
+    smtpPort: 465,
+    smtpTls: "implicit",
+    smtpAuth: "login",
+  },
+  tencent: {
+    imapHost: "imap.qq.com",
+    imapPort: 993,
+    imapTls: "implicit",
+    smtpHost: "smtp.qq.com",
+    smtpPort: 465,
+    smtpTls: "implicit",
+    smtpAuth: "login",
+  },
+  wo: {
+    imapHost: "imap.wo.cn",
+    imapPort: 993,
+    imapTls: "implicit",
+    smtpHost: "smtp.wo.cn",
+    smtpPort: 465,
+    smtpTls: "implicit",
+    smtpAuth: "login",
+  },
+};
