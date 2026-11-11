@@ -81,7 +81,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-bundles
+          # **产物在 workspace 根的 target/**：这是 Cargo workspace，
+          # `cargo build` 的输出目录是仓库根的 `target/`，不是
+          # `apps/shell/src-tauri/target/`（第一次上传就因此找不到文件）。
+          # 用通配兜住两种可能，避免下次因目录挪动又断。
           path: |
+            target/release/bundle/msi/*.msi
+            target/release/bundle/nsis/*.exe
             apps/shell/src-tauri/target/release/bundle/msi/*.msi
             apps/shell/src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
