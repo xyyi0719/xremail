@@ -211,7 +211,12 @@ jobs:
   # ---------------------------------------------------------------- Release
   publish:
     name: 挂到 Release
-    needs: [windows]        # Android 是「有密钥才产」，不阻塞发布
+    # **两个都等**：Android 虽可能被跳过（无 secrets），但成功时它的 APK 必须挂上去。
+    # 之前只写了 `needs: [windows]`，结果 Release 里只有 exe/msi，APK 被漏掉。
+    needs: [windows, android]
+    # Android 在没有 secrets 时是 `skipped`（不是 failure）。`always()` 让 publish
+    # 在这两种情况下都继续；`!failure() && !cancelled()` 保证真的失败时不发。
+    if: always() && !failure() && !cancelled()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
