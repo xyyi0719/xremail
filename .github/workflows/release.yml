@@ -172,6 +172,17 @@ jobs:
       # `gen/android/` 整个被 .gitignore（CI 上由 `tauri android init` 重新生成），
       # 所以签名配置**不能靠改仓库里的 build.gradle.kts**——必须在生成之后注入。
       # 这一段把 signingConfigs 插进 android {} 块，并把 release buildType 绑上它。
+      # **必须先 init 出工程再注入，最后才 build**：
+      # `gen/android/` 不在版本库里（.gitignore），而 `tauri android build`
+      # 是一体的（生成 + 编译）。如果等 build 时才注入，注入脚本找不到文件——
+      # 第一次就这么失败的（失败步是「Inject signing config」，不是构建本身）。
+      - name: Init Android project
+        if: steps.check.outputs.ready == 'true'
+        working-directory: apps/shell
+        env:
+          SQLX_OFFLINE: "true"
+        run: npx tauri android init
+
       - name: Inject signing config into generated gradle
         if: steps.check.outputs.ready == 'true'
         run: python3 scripts/inject_android_signing.py
@@ -181,6 +192,7 @@ jobs:
         working-directory: apps/shell
         env:
           SQLX_OFFLINE: "true"
+          ANDROID_KEYSTORE_PATH: ${{ github.workspace }}/keystore/xremail-release.jks
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
