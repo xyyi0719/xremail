@@ -1,0 +1,220 @@
+# 发布工作流：构建 Windows 与 Android 安装包，并挂到 GitHub Release。
+#
+# ## 为什么是手动触发
+#
+# 发布是有副作用的对外动作（生成 Release、留下载链接）。不跟 push 绑定，
+# 免得每次提交都产一个"版本"。
+#
+# ## 两个平台怎么出包
+#
+# * **Windows**：跑在 `windows-latest` 原生 runner 上。Windows 安装包（MSI/NSIS）
+#   必须在 Windows 上打——Linux 交叉编译 Tauri 的 Windows 目标要额外配
+#   NSIS + wix + 交叉工具链，本机没有也不该硬凑。
+# * **Android**：跑在 `ubuntu-latest`。APK 用仓库 secrets 里的签名密钥签，
+#   **未签名的 release APK 装不上任何真实设备**。
+#
+# ## 需要的 secrets（6 个）
+#
+#   ANDROID_KEYSTORE_BASE64   xremail-release.jks 的 base64
+#   ANDROID_KEYSTORE_PASSWORD keystore 密码
+#   ANDROID_KEY_ALIAS         别名（xremail）
+#   ANDROID_KEY_PASSWORD      密钥密码（与 store 密码相同）
+#
+# 若 secrets 缺失，Android job 会**跳过**而不是产出一个装不上的包——
+# 静默发布一个不可安装的 APK 比不发布更糟。
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "发布标签（如 v0.1.0）。留空则用 v<tauri.conf.json 的 version>"
+        required: false
+        default: ""
+      draft:
+        description: "先存为草稿（不公开）"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------- Windows
+  windows:
+    name: Windows 安装包
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            crates/* -> target
+
+      - name: Install frontend dependencies
+        working-directory: apps/shell
+        run: npm ci
+
+      # Tauri 的 Windows 打包（MSI 走 WiX、NSIS 走 nsis）由 tauri-cli 自带下载，
+      # SQLX_OFFLINE 之下不需要数据库（离线数据在 .sqlx/）。
+      - name: Build Windows bundles
+        working-directory: apps/shell
+        env:
+          SQLX_OFFLINE: "true"
+        run: npx tauri build --bundles msi,nsis
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-bundles
+          path: |
+            apps/shell/src-tauri/target/release/bundle/msi/*.msi
+            apps/shell/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- Android
+  android:
+    name: Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 先看密钥在不在。不在就跳过整个 Android job —— 不产出一个装不上的包。
+      - name: Check signing secrets
+        id: check
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE" ]; then
+            echo "::warning::缺少 ANDROID_KEYSTORE_BASE64，跳过 Android 打包"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Linux dependencies
+        if: steps.check.outputs.ready == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev librsvg2-dev patchelf
+
+      - name: Install Rust toolchain
+        if: steps.check.outputs.ready == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - uses: actions/setup-node@v4
+        if: steps.check.outputs.ready == 'true'
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        if: steps.check.outputs.ready == 'true'
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK
+        if: steps.check.outputs.ready == 'true'
+        uses: android-actions/setup-android@v3
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.check.outputs.ready == 'true'
+        with:
+          workspaces: |
+            . -> target
+            crates/* -> target
+
+      - name: Install frontend dependencies
+        if: steps.check.outputs.ready == 'true'
+        working-directory: apps/shell
+        run: npm ci
+
+      - name: Restore signing keystore
+        if: steps.check.outputs.ready == 'true'
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          mkdir -p "$HOME/keystore"
+          echo "$KEYSTORE" | base64 -d > "$HOME/keystore/xremail-release.jks"
+
+      # tauri android build 会把 APK 打到 gen/android/app/build/outputs/apk/。
+      # 签名参数经环境变量传给 gradle（见 gen/android 的 build.gradle.kts）。
+      - name: Build signed APK
+        if: steps.check.outputs.ready == 'true'
+        working-directory: apps/shell
+        env:
+          SQLX_OFFLINE: "true"
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          export ANDROID_KEYSTORE_PATH="$HOME/keystore/xremail-release.jks"
+          npx tauri android build --apk
+
+      - name: Upload APK
+        if: steps.check.outputs.ready == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: apps/shell/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- Release
+  publish:
+    name: 挂到 Release
+    needs: [windows]        # Android 是「有密钥才产」，不阻塞发布
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version tag
+        id: ver
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then
+            V=$(python3 -c "import json;print(json.load(open('apps/shell/src-tauri/tauri.conf.json'))['version'])")
+            TAG="v$V"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "发布标签：$TAG"
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-bundles
+          path: dist/windows
+
+      - name: Download Android artifacts (if any)
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: android-apk
+          path: dist/android
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: Xremail ${{ steps.ver.outputs.tag }}
+          draft: ${{ inputs.draft }}
+          generate_release_notes: true
+          files: |
+            dist/windows/**/*.msi
+            dist/windows/**/*.exe
+            dist/android/**/*.apk
