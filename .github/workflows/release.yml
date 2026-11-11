@@ -129,9 +129,19 @@ jobs:
           distribution: temurin
           java-version: 17
 
+      # 用 setup-android 而不是手写 sdkmanager：runner 上预装了 SDK 命令行工具，
+      # 这个 action 只做「生成 licenses + 设好 ANDROID_HOME/ANDROID_SDK_ROOT」。
+      # v3 之前一次失败在它内部（拉 cmdline-tools 的清单），所以显式指定
+      # `cmdline-tools-version` 并加 `accept-android-sdk-licenses`。
       - name: Setup Android SDK
         if: steps.check.outputs.ready == 'true'
         uses: android-actions/setup-android@v3
+        with:
+          # 只让它把 cmdline-tools 与环境变量准备好。**不指定 packages**：
+          # Gradle 的 compileSdk 是 37（见生成工程的 build.gradle.kts），
+          # 需要的确切版本由 Android Gradle Plugin 自己下，这里硬写反而容易打架。
+          cmdline-tools-version: "12266719"
+          accept-android-sdk-licenses: "true"
 
       - uses: Swatinem/rust-cache@v2
         if: steps.check.outputs.ready == 'true'
