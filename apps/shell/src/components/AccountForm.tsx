@@ -51,7 +51,7 @@ const EMPTY: NewAccountRequest = {
  *
  * 用户手改过的字段不会被切换服务商覆盖（见 `applyProvider`）。
  */
-function AccountForm() {
+function AccountForm({ onCreated }: { onCreated?: () => void } = {}) {
   const [form, setForm] = useState<NewAccountRequest>(EMPTY);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -171,6 +171,11 @@ function AccountForm() {
 
       setForm(EMPTY);
       setCredential("");
+      // **必须通知外层刷新账户列表**：否则账户卡片显示的是创建前的旧快照，
+      // 会写着「凭据未落盘」，和刚刚的「已存入系统凭据库」自相矛盾，
+      // 用户会以为没存上而重复操作（2026-11-12 Android 实测发现）。
+      onCreated?.();
+
       setDone(
         credential.trim() === ""
           ? "已添加。尚未填写授权码，暂不能收发邮件。"

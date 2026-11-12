@@ -1729,3 +1729,81 @@ button.secondary:hover {
   background: var(--card); color: var(--foreground); font-size: var(--text-sm); cursor: pointer;
 }
 .message-view .chip:hover { background: var(--hover); }
+
+/* ===========================================================================
+   移动端（窄屏 < 700px）：列表 ↔ 详情「整页切换」
+   ===========================================================================
+
+   参考 Gmail 手机端（2026 版）：
+   * 浅灰底 + 每封邮件独立白卡片
+   * **列表和正文不是并排**，而是整页切换——手机上三栏并排每栏只剩一百多像素，
+     文字全被挤成一列。
+   * 进正文后顶部有返回箭头回列表
+   * 写信是右下角的圆角胶囊浮层
+
+   实现：用 `.mail-layout[data-mobile-view]` 决定显示哪一栏，纯 CSS，
+   不改任何组件逻辑、也不加 JS 监听（滚动/尺寸变化不触发重排）。
+   =========================================================================== */
+@media (max-width: 700px) {
+  /* 骨架屏/主布局都变单列 */
+  .app-shell { grid-template-rows: auto 1fr auto; height: 100vh; }
+
+  /* 顶栏压缩：版本/数据目录那堆信息在手机上没价值 */
+  .app-header { padding: var(--space-2) var(--space-3); gap: var(--space-2); }
+  .app-info { display: none; }
+  .topbar-accounts .account-switcher-item { max-width: 8rem; }
+
+  .mail-layout {
+    /* 单栏：图标轨 + 内容区。文件夹仍以图标形式常驻左侧（56px 足够窄）。 */
+    grid-template-columns: 56px minmax(0, 1fr);
+    min-height: 0;
+  }
+
+  /* 列表与详情：按 data-mobile-view 二选一 */
+  .mail-layout[data-mobile-view="list"] .mail-reading-pane { display: none; }
+  .mail-layout[data-mobile-view="detail"] .mail-list-pane { display: none; }
+
+  /* 单栏时去掉中栏的右边框（它是给三栏分隔用的） */
+  .mail-list-pane { border-right: 0; }
+
+  /* 列表卡片：更松的触控目标，圆角更大（Gmail 手机端的观感） */
+  .message-row { height: 64px; margin-bottom: 8px; border-radius: 12px; }
+  .message-item { padding: 8px 12px; }
+  .message-subject { font-size: 15px; }
+  .message-detail { font-size: 12.5px; }
+
+  /* 列表标题栏 */
+  .message-panel .panel-title { font-size: 19px; padding-bottom: var(--space-3); }
+
+  /* 正文：铺满、去掉阅读列的左右大留白 */
+  .reader-inner { padding: var(--space-4) var(--space-4) 80px; max-width: none; }
+  .message-view .subject { font-size: 19px; }
+  .message-view .message-body { font-size: 16px; line-height: 1.85; }
+
+  /* 正文工具条：贴顶、按钮放大到可点 */
+  .reader-bar { padding: var(--space-2) var(--space-3); }
+  .reader-bar .icon-btn { width: 40px; height: 40px; }
+
+  /* 移动端返回按钮：只在窄屏出现 */
+  .mobile-back {
+    display: flex; align-items: center; gap: 6px;
+    position: sticky; top: 0; z-index: 3;
+    width: 100%; padding: var(--space-2) var(--space-3);
+    border: 0; border-bottom: 1px solid var(--border);
+    background: var(--card); color: var(--primary);
+    font-size: var(--text-base); font-weight: 600; cursor: pointer;
+  }
+  .mobile-back:active { background: var(--hover); }
+
+  /* 写信浮层：全屏化（手机上没有"右下角小窗"的空间） */
+  .compose-panel {
+    inset: 0; right: 0; bottom: 0; width: 100%; max-height: 100vh;
+    border-radius: 0; padding: var(--space-4);
+  }
+
+  /* 设置抽屉：全宽 */
+  .mail-layout ~ * , .app-shell > * { min-width: 0; }
+}
+
+/* 桌面端默认隐藏返回按钮 */
+.mobile-back { display: none; }

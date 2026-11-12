@@ -532,7 +532,7 @@ function App() {
                 onChanged={refresh}
               />
             )}
-            <AccountForm />
+            <AccountForm onCreated={refresh} />
             <SearchPanel onOpen={handleOpenHit} onError={handleError} />
           </SheetBody>
         </SheetContent>
@@ -592,7 +592,14 @@ function App() {
         </div>
       ) : (
         <>
-          <div className="mail-layout" data-testid="mail-layout">
+          {/* `data-mobile-view` 让 CSS 在窄屏做「列表 ↔ 详情」整页切换：
+              选中邮件时只显示正文，否则只显示列表。参考 Gmail 移动端——
+              手机上三栏并排是没法用的（每栏只剩一百多像素）。 */}
+          <div
+            className="mail-layout"
+            data-testid="mail-layout"
+            data-mobile-view={message !== null ? "detail" : "list"}
+          >
             {/* 左栏：账户 + 文件夹 + 写信入口。窄、不怎么变，不随滚动重排。 */}
             <aside className="mail-sidebar">
               <FolderRail
@@ -618,6 +625,15 @@ function App() {
 
             {/* 右栏：正文。 */}
             <section className="mail-reading-pane" aria-label="邮件正文">
+              {/* 移动端专用：返回列表。桌面端由 CSS 隐藏（三栏并排时不需要）。 */}
+              <button
+                type="button"
+                className="mobile-back"
+                onClick={() => setMessage(null)}
+                aria-label="返回列表"
+              >
+                ← 返回
+              </button>
               {accountId && folderId && message && (
                 <MessageView
                   accountId={accountId}
