@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  Account,
   NewAccountRequest,
   ProviderKind,
   SmtpAuth,
@@ -55,6 +56,10 @@ function AccountForm() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState<string | null>(null);
+  // 授权码与账户**一起填**：以前要「先建账户 → 再去卡片里存授权码」两步，
+  // 用户建完账户发现还不能收发，得再找一次入口（2026-11-12 用户反馈）。
+  // 现在创建成功后立刻调 save_credential 存进平台钥匙串。
+  const [credential, setCredential] = useState("");
 
   const set = <K extends keyof NewAccountRequest>(
     key: K,
@@ -141,9 +146,36 @@ function AccountForm() {
     setDone(null);
 
     try {
-      await invoke("create_account", { request: form });
+      // **先建账户，再存凭据**：两者是两个 IPC（账户落库 / 凭据进钥匙串），
+      // 顺序不能反——`save_credential` 会校验账户是否存在。
+      const account = await invoke<Account>("create_account", { request: form });
+
+      if (credential.trim() !== "") {
+        try {
+          await invoke("save_credential", {
+            accountId: account.id,
+            credential: credential.trim(),
+          });
+        } catch (credentialError) {
+          // 账户已经建好了，凭据没存进去——**不能假装成功**。
+          // 库里账户还在，但 `secretRef` 为空，调用方必须知道"还差一步"。
+          setForm(EMPTY);
+          setCredential("");
+          setError(
+            `账户已创建，但授权码没能存进系统凭据库：${String(credentialError)}。` +
+              `请在设置的账户卡片里重新填写授权码。`,
+          );
+          return;
+        }
+      }
+
       setForm(EMPTY);
-      setDone("已添加。凭据尚未接入，暂不能收发邮件。");
+      setCredential("");
+      setDone(
+        credential.trim() === ""
+          ? "已添加。尚未填写授权码，暂不能收发邮件。"
+          : "已添加，授权码已存入系统凭据库，可以开始收发邮件了。",
+      );
     } catch (e) {
       setError(String(e));
     } finally {
@@ -168,6 +200,19 @@ function AccountForm() {
             onChange={(e) => applyEmail(e.target.value)}
             placeholder="user@example.com"
             required
+          />
+        </label>
+
+        {/* 授权码紧跟邮箱：建账户时要用的两样东西放在一起，一次填完。 */}
+        <label className="field">
+          <span>授权码</span>
+          <input
+            type="password"
+            value={credential}
+            onChange={(e) => setCredential(e.target.value)}
+            placeholder="邮箱的客户端授权码（不是登录密码）"
+            autoComplete="off"
+            spellCheck={false}
           />
         </label>
 

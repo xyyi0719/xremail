@@ -6262,7 +6262,7 @@ dependencies = [
 
 [[package]]
 name = "xremail-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -6275,7 +6275,7 @@ dependencies = [
 
 [[package]]
 name = "xremail-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -6284,7 +6284,7 @@ dependencies = [
 
 [[package]]
 name = "xremail-crypto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -6296,7 +6296,7 @@ dependencies = [
 
 [[package]]
 name = "xremail-diagnostics"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "tokio",
@@ -6313,7 +6313,7 @@ dependencies = [
 
 [[package]]
 name = "xremail-dkim"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "ring",
@@ -6323,7 +6323,7 @@ dependencies = [
 
 [[package]]
 name = "xremail-message"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "encoding_rs",
@@ -6333,7 +6333,7 @@ dependencies = [
 
 [[package]]
 name = "xremail-protocol-imap"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-imap",
  "futures-util",
@@ -6352,7 +6352,7 @@ dependencies = [
 
 [[package]]
 name = "xremail-protocol-smtp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "rustls",
@@ -6368,7 +6368,7 @@ dependencies = [
 
 [[package]]
 name = "xremail-shell"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "android-keyring",
  "async-trait",
@@ -6403,7 +6403,7 @@ dependencies = [
 
 [[package]]
 name = "xremail-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -6417,7 +6417,7 @@ dependencies = [
 
 [[package]]
 name = "xremail-sync"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "futures-util",
  "sqlx",
@@ -6434,7 +6434,7 @@ dependencies = [
 
 [[package]]
 name = "xremail-testkit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "rcgen",

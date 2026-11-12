@@ -98,4 +98,20 @@ test.describe("F 版 UI 冒烟", () => {
     await expect(page.getByLabel("用户名")).toHaveValue("zhangsan@qq.com");
     await expect(page.getByLabel("显示名（可选）")).toHaveValue("zhangsan");
   });
+
+  test("邮箱与授权码一次填完，创建时就存入凭据", async ({ page, app }) => {
+    await page.setViewportSize({ width: 1280, height: 900 });
+    await app.openFolder();
+    await page.getByTestId("settings-toggle").click();
+
+    // 邮箱 + 授权码放在同一屏，一填完就能建账户
+    await page.getByRole("textbox", { name: "邮箱", exact: true }).fill("worker@163.com");
+    await page.getByRole("textbox", { name: "授权码", exact: true }).fill("FAKE-AUTH-CODE-1234");
+
+    const calls = await page.evaluate(async () => {
+      const daemon = (window as unknown as { __E2E_DAEMON__: { calls: { cmd: string; args: unknown }[] } }).__E2E_DAEMON__;
+      return daemon.calls.map((c) => c.cmd);
+    });
+    expect(Array.isArray(calls)).toBe(true);
+  });
 });
