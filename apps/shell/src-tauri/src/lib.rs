@@ -163,6 +163,27 @@ fn start_background_sync(app: &tauri::AppHandle) {
         }
     };
 
+    // **必须在 `async_runtime::spawn` 里起 actor**。
+    //
+    // `scheduler.start()` 内部调用 `tokio::spawn`，而它需要一个**正在运行的
+    // Tokio runtime**。上面那个 `block_on(...)` 返回后 runtime 上下文就结束了，
+    // 直接调用会 panic：「there is no reactor running」。
+    //
+    // 桌面端侥幸没炸是因为 Tauri 桌面把 `block_on` 挂在一个常驻 runtime 上；
+    // **Android 上不是**——2026-11-12 在模拟器上实测，创建第一个账户后立刻
+    // native crash（`actor.rs:1080 panicked`）→ 进程 abort。
+    //
+    // 放进 `spawn` 之后，actor 在 runtime 的 worker 线程里起，不受调用栈约束。
+    // `State` 借用自 app，不能 move 进 async 块；`AppHandle` 可以 clone。
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let state = app_handle.state::<AppState>();
+        start_actors_for(&state, accounts);
+    });
+}
+
+/// 真正起 actor 的部分（在 runtime 上下文中执行）。
+fn start_actors_for(state: &AppState, accounts: Vec<xremail_core::model::Account>) {
     for account in accounts {
         // 有会话凭据或有钥匙串引用才值得起。
         if state.credential(&account.id).is_none() && account.secret_ref.is_none() {

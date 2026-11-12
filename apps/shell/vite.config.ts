@@ -9,6 +9,18 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(() => ({
   plugins: [react(), tailwindcss()],
 
+  // **JS 目标降到 ES2020**（而不是 Vite 默认的 esnext/es2022）。
+  //
+  // 原因：Android 系统 WebView 可能是很旧的版本。实测模拟器 android-30 镜像
+  // 自带 **WebView 83.0.4103.106（Chrome 83，2020 年）**，而 Vite 默认产物用了
+  // `||=` / `&&=` / `??=`（ES2021 逻辑赋值，Chrome 85+ 才有）。WebView 83 解析
+  // 直接 `SyntaxError: Unexpected token '='`，整个脚本不执行 → 白屏。
+  //
+  // ES2020 覆盖到 Chrome 80，足以跑旧 WebView。代价是产物略大一点点。
+  build: {
+    target: "es2020",
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors
