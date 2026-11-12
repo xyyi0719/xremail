@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import AttachmentPanel from "./AttachmentPanel";
+import { Archive, Trash2, ChevronDown } from "lucide-react";
 import type { Message, MessageBody } from "../types";
 import { isUnread } from "../types";
 
@@ -115,55 +116,82 @@ function MessageView({
   };
 
   return (
-    <section className="panel">
-      <h2 className="panel-title">{message.subject || "（无主题）"}</h2>
-      <p className="message-detail">
-        {message.from.join(", ") || "（未知发件人）"}
-        {message.to.length > 0 && ` → ${message.to.join(", ")}`}
-      </p>
-
-      <div className="message-actions">
-        <button
-          type="button"
-          className="message-flag-button"
-          onClick={() => void onToggleSeen(message)}
-        >
-          {isUnread(message) ? "标记为已读" : "标记为未读"}
+    <section className="panel message-view">
+      {/* 顶部工具条：**sticky**，读长邮件时"归档/删除/标记"始终在眼前。
+          以前这些操作在标题下方，滚到正文中段就找不到了。 */}
+      <div className="reader-bar">
+        <button type="button" className="icon-btn" title="归档" aria-label="归档">
+          <Archive size={16} strokeWidth={1.9} />
         </button>
-        <span className="message-detail">
-          当前：{isUnread(message) ? "未读" : "已读"}
+        <button type="button" className="icon-btn" title="删除" aria-label="删除">
+          <Trash2 size={16} strokeWidth={1.9} />
+        </button>
+        <span className="grow" />
+        <span className="reader-status">
+          {isUnread(message) ? "未读" : "已读"}
         </span>
+        <button type="button" className="icon-btn" title="更多" aria-label="更多">
+          <ChevronDown size={16} strokeWidth={1.9} />
+        </button>
       </div>
 
-      {loading && <p className="panel-empty">正在取正文…</p>}
+      <div className="reader-inner">
+        <h2 className="subject">{message.subject || "（无主题）"}</h2>
 
-      {!loading && html && (
-        // 消毒过的 HTML：标签与属性都在白名单里，
-        // 脚本、事件处理器、远程图片都没了（ARCHITECTURE §9.1）。
-        <div
-          className="message-body message-body-html"
-          onClick={handleBodyClick}
-          dangerouslySetInnerHTML={{ __html: html }}
-        />
-      )}
+        <div className="sender">
+          <span className="av" aria-hidden="true">
+            {(message.from[0] ?? "?").trim().charAt(0).toUpperCase() || "?"}
+          </span>
+          <div className="who">
+            <b>{message.from.join(", ") || "（未知发件人）"}</b>
+            <span>
+              {message.to.length > 0 ? `发给 ${message.to.join(", ")}` : "（无收件人）"}
+            </span>
+          </div>
+          <div className="acts">
+            {/* 标记已读/未读仍在这里保留一个文字按钮——它是测试与键盘都依赖的入口 */}
+            <button
+              type="button"
+              className="chip message-flag-button"
+              onClick={() => void onToggleSeen(message)}
+            >
+              {isUnread(message) ? "标记为已读" : "标记为未读"}
+            </button>
+          </div>
+        </div>
 
-      {!loading && !html && plain && <pre className="message-body">{plain}</pre>}
+        {loading && <p className="panel-empty">正在取正文…</p>}
 
-      {!loading && !html && !plain && (
-        <p className="panel-empty">这封邮件没有正文。</p>
-      )}
+        {!loading && html && (
+          // 消毒过的 HTML：标签与属性都在白名单里，
+          // 脚本、事件处理器、远程图片都没了（ARCHITECTURE §9.1）。
+          <div
+            className="message-body message-body-html"
+            onClick={handleBodyClick}
+            dangerouslySetInnerHTML={{ __html: html }}
+          />
+        )}
+
+        {!loading && !html && plain && <pre className="message-body">{plain}</pre>}
+
+        {!loading && !html && !plain && (
+          <p className="panel-empty">这封邮件没有正文。</p>
+        )}
+      </div>
 
       {/*
         附件在正文**下面**：先读信再看附件，和所有邮件客户端一样。
         正文还在取的时候先不问附件（省一次往返）。
       */}
-      <AttachmentPanel
-        accountId={accountId}
-        folderId={folderId}
-        message={message}
-        ready={!loading}
-        onError={onAttachmentError}
-      />
+      <div className="reader-inner reader-attachments">
+        <AttachmentPanel
+          accountId={accountId}
+          folderId={folderId}
+          message={message}
+          ready={!loading}
+          onError={onAttachmentError}
+        />
+      </div>
     </section>
   );
 }

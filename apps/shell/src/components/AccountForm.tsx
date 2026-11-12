@@ -17,17 +17,24 @@ import {
 } from "../types";
 
 /** 表单的初始值。 */
+// **初始就要填好默认服务商（163）的服务器参数**。
+//
+// 之前这里是空串，而预填只在「切换下拉」时触发——默认就是 163，用户从没切过，
+// 于是 IMAP/SMTP 地址永远是空的（2026-11-12 用户反馈的真 bug）。
+// 直接从 PROVIDER_PRESETS 取，保证与切换逻辑同源。
+const DEFAULT_PRESET = PROVIDER_PRESETS.netease_163!;
+
 const EMPTY: NewAccountRequest = {
   email: "",
   provider: "netease_163",
   displayName: "",
-  imapHost: "",
-  imapPort: 993,
-  imapTls: "implicit",
-  smtpHost: "",
-  smtpPort: 465,
-  smtpTls: "implicit",
-  smtpAuth: "login",
+  imapHost: DEFAULT_PRESET.imapHost,
+  imapPort: DEFAULT_PRESET.imapPort,
+  imapTls: DEFAULT_PRESET.imapTls,
+  smtpHost: DEFAULT_PRESET.smtpHost,
+  smtpPort: DEFAULT_PRESET.smtpPort,
+  smtpTls: DEFAULT_PRESET.smtpTls,
+  smtpAuth: DEFAULT_PRESET.smtpAuth,
   username: "",
   syncMode: "poll",
   pollIntervalSecs: 300,
@@ -54,6 +61,40 @@ function AccountForm() {
     value: NewAccountRequest[K],
   ) => {
     setForm((prev) => ({ ...prev, [key]: value }));
+  };
+
+  /**
+   * 输入邮箱时，**顺带填好用户名与显示名**（用户通常不用改）。
+   *
+   * 规则：
+   * - **用户名**默认与邮箱相同（163/QQ 都是拿完整邮箱登录；QQ 的纯数字账号
+   *   也由后端按域名补齐，与真实用例一致）。
+   * - **显示名**取 `@` 前的部分，作为账户在侧栏的标签。
+   * - **只在用户没单独改过时跟随**：如果用户手工把显示名改成"工作邮箱"，
+   *   之后再来改邮箱，不能把他的自定义名覆盖掉。判据是「当前值是否仍等于
+   *   上一个邮箱推导出来的值」。
+   */
+  const applyEmail = (next: string) => {
+    setForm((current) => {
+      const local = next.includes("@") ? next.split("@")[0]! : next;
+      const prevLocal = current.email.includes("@")
+        ? current.email.split("@")[0]!
+        : current.email;
+
+      // 用户名：空着、或仍等于上一个邮箱 → 跟着走。
+      const usernameUntouched =
+        current.username === "" || current.username === current.email;
+      // 显示名：空着、或仍等于上一个邮箱的 local part → 跟着走。
+      const displayUntouched =
+        (current.displayName ?? "") === "" || (current.displayName ?? "") === prevLocal;
+
+      return {
+        ...current,
+        email: next,
+        username: usernameUntouched ? next : current.username,
+        displayName: displayUntouched ? local : (current.displayName ?? ""),
+      };
+    });
   };
 
   /**
@@ -124,7 +165,7 @@ function AccountForm() {
           <input
             type="email"
             value={form.email}
-            onChange={(e) => set("email", e.target.value)}
+            onChange={(e) => applyEmail(e.target.value)}
             placeholder="user@example.com"
             required
           />

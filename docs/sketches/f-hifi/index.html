@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>Xremail · F 版高保真</title>
+
+<style>
+:root{
+  --bg:#eef1f4; --surface:#fff; --surface-2:#f7f9fb; --ink:#16181d; --ink-2:#5c6570;
+  --ink-3:#98a2b0; --line:#e3e8ee; --line-2:#eef2f6;
+  --accent:#2563eb; --accent-soft:#eef4ff; --danger:#dc2626;
+  --radius:10px; --radius-sm:7px; --radius-pill:999px;
+  --shadow-sm:0 1px 2px rgba(16,24,40,.05);
+  --shadow-card:0 1px 2px rgba(16,24,40,.04), 0 1px 3px rgba(16,24,40,.03);
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;font:14px/1.5 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+  color:var(--ink);background:var(--bg);-webkit-font-smoothing:antialiased}
+.app{display:grid;grid-template-rows:56px 1fr 30px;height:100vh}
+
+/* ---------- 顶栏 ---------- */
+.topbar{display:flex;align-items:center;gap:14px;padding:0 16px;background:var(--surface);
+  border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:9px;font-weight:650;font-size:16px;letter-spacing:-.01em}
+.brand .mark{width:26px;height:26px;border-radius:8px;background:linear-gradient(135deg,#2563eb,#60a5fa);
+  display:grid;place-items:center;color:#fff}
+.search{flex:1;max-width:520px;display:flex;align-items:center;gap:8px;height:36px;padding:0 14px;
+  background:var(--surface-2);border:1px solid transparent;border-radius:var(--radius-pill);
+  color:var(--ink-3);transition:border-color .15s,background .15s}
+.search:hover{border-color:var(--line)}
+.search input{border:0;background:none;outline:none;flex:1;font:inherit;color:var(--ink)}
+.search kbd{font:11px/1 inherit;padding:3px 6px;border:1px solid var(--line);border-radius:4px;color:var(--ink-3)}
+.top-actions{margin-left:auto;display:flex;align-items:center;gap:6px}
+.icon-btn{width:34px;height:34px;border:0;background:none;border-radius:var(--radius-sm);
+  display:grid;place-items:center;color:var(--ink-2);cursor:pointer}
+.icon-btn:hover{background:var(--surface-2);color:var(--ink)}
+.avatar{width:30px;height:30px;border-radius:50%;background:#dbeafe;color:#1d4ed8;
+  display:grid;place-items:center;font-size:12px;font-weight:650}
+
+/* ---------- 主体：图标轨 + 列表 + 正文 ---------- */
+.main{display:grid;grid-template-columns:56px 316px 1fr;min-height:0}
+
+/* 图标轨 */
+.rail{display:flex;flex-direction:column;align-items:center;gap:4px;padding:10px 0;
+  background:var(--surface);border-right:1px solid var(--line)}
+.rail .compose{width:38px;height:38px;border:0;border-radius:12px;background:var(--accent);color:#fff;
+  display:grid;place-items:center;cursor:pointer;box-shadow:0 2px 6px rgba(37,99,235,.32);margin-bottom:8px}
+.rail .compose:hover{background:#1d4ed8}
+.rail-btn{position:relative;width:38px;height:38px;border:0;background:none;border-radius:10px;
+  display:grid;place-items:center;color:var(--ink-2);cursor:pointer}
+.rail-btn:hover{background:var(--surface-2);color:var(--ink)}
+.rail-btn.active{background:var(--accent-soft);color:var(--accent)}
+.rail-btn.active::before{content:"";position:absolute;left:-9px;top:9px;bottom:9px;width:3px;
+  border-radius:0 3px 3px 0;background:var(--accent)}
+.rail-btn .dot{position:absolute;top:7px;right:7px;width:6px;height:6px;border-radius:50%;
+  background:var(--accent);border:1.5px solid var(--surface)}
+.rail-sep{width:22px;height:1px;background:var(--line);margin:6px 0}
+
+/* 列表 */
+.list{display:flex;flex-direction:column;min-height:0;background:var(--surface);
+  border-right:1px solid var(--line)}
+.list-head{display:flex;align-items:center;gap:8px;padding:12px 14px 10px}
+.list-head h1{margin:0;font-size:17px;letter-spacing:-.01em;font-weight:650}
+.list-head .count{font-size:12px;color:var(--ink-3);font-weight:500}
+.list-head .grow{flex:1}
+.list-scroll{overflow-y:auto;padding:0 8px 10px;display:flex;flex-direction:column;gap:6px}
+.card{position:relative;padding:11px 12px 11px 13px;border:1px solid var(--line-2);
+  border-radius:var(--radius);background:var(--surface);cursor:pointer;
+  transition:border-color .12s,box-shadow .12s,background .12s}
+.card:hover{border-color:var(--line);box-shadow:var(--shadow-card)}
+.card.active{border-color:color-mix(in srgb,var(--accent) 55%,transparent);
+  background:var(--accent-soft);box-shadow:0 0 0 1px color-mix(in srgb,var(--accent) 18%,transparent)}
+.card .row1{display:flex;align-items:center;gap:8px;margin-bottom:3px}
+.card .name{font-size:13px;font-weight:600;color:var(--ink);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;flex:1;min-width:0}
+.card .time{font-size:11.5px;color:var(--ink-3);flex:none}
+.card .subject{font-size:13.5px;font-weight:500;margin-bottom:2px;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.card.unread .subject{font-weight:680}
+.card.unread .name{font-weight:700}
+.card .snippet{font-size:12.5px;color:var(--ink-2);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis}
+.card .star{color:var(--ink-3);display:grid;place-items:center;flex:none}
+.card .star.on{color:#f59e0b}
+.card .attach{color:var(--ink-3);display:grid;place-items:center;flex:none}
+
+/* 正文 */
+.reader{min-height:0;overflow-y:auto;background:var(--surface);display:flex;flex-direction:column}
+
+/* 正文顶部工具条：sticky，滚动时始终可见（读长邮件时不用滚回顶部找"回复"） */
+.reader-bar{position:sticky;top:0;z-index:2;display:flex;align-items:center;gap:6px;
+  padding:10px 16px;background:color-mix(in srgb,var(--surface) 88%,transparent);
+  backdrop-filter:blur(8px);border-bottom:1px solid var(--line-2)}
+.reader-bar .grow{flex:1}
+.reader-bar .icon-btn{width:32px;height:32px}
+
+/* **阅读列**：内容自然放宽到 860px 并居中。窄于 760 行宽仍舒适，
+   宽于 900 就不好读——所以用 max-width 而不是让它铺满。 */
+.reader-inner{width:100%;max-width:860px;margin:0 auto;padding:28px 40px 72px}
+
+/* 标题：与上方工具条拉开距离，行高略紧（大字号时 1.35 显得松） */
+.subject{font-size:22px;line-height:1.3;font-weight:680;letter-spacing:-.018em;margin:0 0 20px}
+
+.sender{display:flex;align-items:center;gap:12px;padding-bottom:18px;border-bottom:1px solid var(--line-2)}
+.sender .av{width:38px;height:38px;border-radius:50%;background:#e0e7ff;color:#4338ca;
+  display:grid;place-items:center;font-weight:650;font-size:14px;flex:none}
+.sender .who{min-width:0}
+.sender .who b{font-size:13.5px;font-weight:650}
+.sender .who span{display:block;font-size:12px;color:var(--ink-2)}
+.sender .acts{margin-left:auto;display:flex;gap:4px}
+.chip{display:inline-flex;align-items:center;gap:5px;height:28px;padding:0 11px;border-radius:var(--radius-pill);
+  border:1px solid var(--line);background:var(--surface);color:var(--ink-2);font:12.5px/1 inherit;cursor:pointer}
+.chip:hover{background:var(--surface-2);color:var(--ink)}
+.body{padding:24px 2px 8px;font-size:15px;line-height:1.8;color:#252b33}
+.body p{margin:0 0 16px}
+/* 首段稍大，形成"开头"的视觉锚点 */
+.body > p:first-of-type{font-size:15.5px}
+/* 有序列表：用设计过的缩进，而不是裸数字 */
+.body ol{margin:0 0 16px;padding-left:0;list-style:none;counter-reset:step}
+.body ol li{position:relative;padding-left:30px;margin-bottom:9px;counter-increment:step}
+.body ol li::before{content:counter(step);position:absolute;left:0;top:2px;width:20px;height:20px;
+  border-radius:50%;background:var(--accent-soft);color:var(--accent);font-size:11.5px;
+  font-weight:650;display:grid;place-items:center;line-height:1}
+/* 签名：稍淡一点 */
+.body .sign{color:var(--ink-2);margin-top:4px}
+.attach-box{margin:20px 0 0;padding:12px 14px;border:1px solid var(--line);border-radius:var(--radius);
+  display:flex;align-items:center;gap:11px;background:var(--surface-2);max-width:360px;
+  cursor:pointer;transition:border-color .12s,background .12s}
+.attach-box:hover{border-color:var(--ink-3);background:var(--surface)}
+.attach-box .dl{margin-left:auto;color:var(--ink-3);display:grid;place-items:center}
+.attach-box .fi{width:32px;height:32px;border-radius:7px;background:#fee2e2;color:#b91c1c;
+  display:grid;place-items:center;flex:none}
+.attach-box b{display:block;font-size:12.5px;font-weight:600}
+.attach-box span{font-size:11.5px;color:var(--ink-3)}
+.replybar{display:flex;gap:8px;margin-top:30px;padding-top:22px;border-top:1px solid var(--line-2)}
+.btn-primary{display:inline-flex;align-items:center;gap:6px;height:34px;padding:0 16px;border:0;
+  border-radius:var(--radius-pill);background:var(--accent);color:#fff;font:13px/1 inherit;
+  font-weight:600;cursor:pointer}
+.btn-primary:hover{background:#1d4ed8}
+
+/* 状态栏 */
+.status{display:flex;align-items:center;gap:14px;padding:0 14px;background:var(--surface);
+  border-top:1px solid var(--line);font-size:11.5px;color:var(--ink-3)}
+.status .ok{display:inline-flex;align-items:center;gap:4px;color:#15803d}
+.status .right{margin-left:auto;display:flex;gap:14px}
+svg{width:16px;height:16px;stroke-width:1.9}
+.rail svg{width:18px;height:18px}
+.compose svg{width:18px;height:18px;stroke-width:2}
+</style></head><body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand"><span class="mark"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="16" x="2" y="4" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg></span>Xremail</div>
+    <label class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></svg>
+      <input placeholder="搜索邮件、发件人、附件…"><kbd>⌘K</kbd></label>
+    <div class="top-actions">
+      <button class="icon-btn" title="刷新"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"/><path d="M8 16H3v5"/></svg></button>
+      <button class="icon-btn" title="设置"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></button>
+      <span class="avatar">张</span>
+    </div>
+  </header>
+
+  <div class="main">
+    <!-- 图标轨 -->
+    <nav class="rail">
+      <button class="compose" title="写邮件"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.376 3.622a1 1 0 0 1 3.002 3.002L7.368 18.635a2 2 0 0 1-.855.506l-2.872.838a.5.5 0 0 1-.62-.62l.838-2.872a2 2 0 0 1 .506-.854z"/></svg></button>
+      <button class="rail-btn active" title="收件箱"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg><span class="dot"></span></button>
+      <button class="rail-btn" title="星标"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg></button>
+      <button class="rail-btn" title="已发送"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z"/><path d="m21.854 2.147-10.94 10.939"/></svg></button>
+      <button class="rail-btn" title="草稿"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></svg></button>
+      <div class="rail-sep"></div>
+      <button class="rail-btn" title="归档"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/></svg></button>
+      <button class="rail-btn" title="垃圾箱"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/></svg></button>
+    </nav>
+
+    <!-- 列表 -->
+    <section class="list">
+      <div class="list-head">
+        <h1>收件箱</h1><span class="count">12 封未读</span>
+        <span class="grow"></span>
+        <button class="icon-btn" title="筛选"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></button>
+      </div>
+      <div class="list-scroll">
+
+        <article class="card active unread">
+          <div class="row1"><span class="name">陈静 · 产品</span>
+            <span class="attach"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></span>
+            <span class="star on"><svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg></span>
+            <span class="time">10:24</span></div>
+          <div class="subject">Q4 预算评审的安排与材料清单</div>
+          <div class="snippet">评审定在周三下午两点，3 楼会议室。请提前把材料发我，我会在会前统一整理…</div>
+        </article>
+
+        <article class="card unread">
+          <div class="row1"><span class="name">周报机器人</span>
+            <span class="star"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg></span>
+            <span class="time">09:02</span></div>
+          <div class="subject">上周项目周报已生成</div>
+          <div class="snippet">共 18 条更新、3 个阻塞项、2 个待决策。点击查看完整周报与趋势图。</div>
+        </article>
+
+        <article class="card">
+          <div class="row1"><span class="name">李维</span>
+            <span class="attach"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg></span>
+            <span class="star"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg></span>
+            <span class="time">昨天</span></div>
+          <div class="subject">Re: 接口文档的几处修正</div>
+          <div class="snippet">你说得对，第 3 节的错误码我漏了 429。已经把文档更新到 v1.4，附件是最新的。</div>
+        </article>
+
+        <article class="card">
+          <div class="row1"><span class="name">财务共享中心</span>
+            <span class="star"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg></span>
+            <span class="time">昨天</span></div>
+          <div class="subject">10 月报销单已通过审核</div>
+          <div class="snippet">你的报销单（共 6 张票据，合计 ¥2,847.00）已通过审核，预计 3 个工作日内到账。</div>
+        </article>
+
+        <article class="card">
+          <div class="row1"><span class="name">王敏</span>
+            <span class="star"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg></span>
+            <span class="time">周一</span></div>
+          <div class="subject">下季度排期草案</div>
+          <div class="snippet">先按现在的人力估了一版，重点标了 3 个可能有冲突的交付窗口，你看看。</div>
+        </article>
+
+      </div>
+    </section>
+
+    <!-- 正文 -->
+    <main class="reader">
+      <!-- 顶部工具条：sticky，读长邮件时"回复/归档/删除"始终在眼前 -->
+      <div class="reader-bar">
+        <button class="icon-btn" title="归档"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/></svg></button>
+        <button class="icon-btn" title="删除"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></button>
+        <button class="icon-btn" title="星标"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg></button>
+        <span class="grow"></span>
+        <button class="icon-btn" title="上/下一封"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></button>
+      </div>
+      <div class="reader-inner">
+        <h1 class="subject">Q4 预算评审的安排与材料清单</h1>
+
+        <div class="sender">
+          <span class="av">陈</span>
+          <div class="who">
+            <b>陈静 · 产品</b>
+            <span>chenjing@example.com · 今天 10:24 · 发给 我</span>
+          </div>
+          <div class="acts">
+            <button class="chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>回复</button>
+            <button class="chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 17 20 12 15 7"/><path d="M4 18v-2a4 4 0 0 1 4-4h12"/></svg>转发</button>
+            <button class="icon-btn" title="更多"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/></svg></button>
+          </div>
+        </div>
+
+        <div class="body">
+          <p>你好，</p>
+          <p>Q4 的预算评审定在下<strong>周三下午两点</strong>，地点是 3 楼的大会议室。这次需要各部门先把材料发我汇总，我统一整理后在会前一天发给全体参会人。</p>
+          <p>请重点包含这几项：</p>
+          <ol>
+            <li>本季度已发生与预计剩余的支出</li>
+            <li>下季度的人力与采购计划</li>
+            <li>需要跨部门协调的事项</li>
+          </ol>
+          <p>材料格式不限，但请尽量在周一之前发到我的邮箱，谢谢。</p>
+          <p class="sign">陈静<br>产品部 · 分机 8021</p>
+
+          <div class="attach-box">
+            <span class="fi"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/></svg></span>
+            <div><b>Q4预算评审模板.xlsx</b><span>Excel · 24 KB</span></div>
+            <span class="dl"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg></span>
+          </div>
+        </div>
+
+        <div class="replybar">
+          <button class="btn-primary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7"/><path d="M20 18v-2a4 4 0 0 0-4-4H4"/></svg>回复</button>
+          <button class="chip"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 17 20 12 15 7"/><path d="M4 18v-2a4 4 0 0 1 4-4h12"/></svg>转发</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <footer class="status">
+    <span class="ok"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M21.801 10A10 10 0 1 1 17 3.335"/><path d="m9 11 3 3L22 4"/></svg>已连接</span>
+    <span>上次同步 2 分钟前</span>
+    <span class="right"><span>1 个账户</span><span>本地存储 486 MB</span></span>
+  </footer>
+</div>
+
+
+</body></html>

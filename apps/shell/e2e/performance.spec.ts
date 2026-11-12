@@ -3,6 +3,18 @@ import type { TauriDaemonConfig } from "./daemon";
 import { makeAccount, makeFolders, makeMessageBody, makeMessages } from "./fixtures";
 
 /**
+ * **性能用例必须串行跑**（`mode: "serial"`）。
+ *
+ * 这两条量的是「一次操作花多久」。`fullyParallel: true` 时它会和截图、功能
+ * 用例抢同一个 CPU——并发下某次点击可能被调度到 300ms 以上，于是**偶发红**，
+ * 而产品本身没有退化（实测中位 97ms / 最慢 111ms）。
+ *
+ * 串行化是让这个断言**可复现**：要么真的慢，要么过，不靠"多跑几次"。
+ */
+test.describe.configure({ mode: "serial" });
+
+
+/**
  * 前端性能的量测。
  *
  * ## 为什么要有这个文件

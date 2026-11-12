@@ -1,8 +1,9 @@
 import AccountForm from "./components/AccountForm";
 import AccountList from "./components/AccountList";
+import FolderRail from "./components/FolderRail";
 import AccountSwitcher from "./components/AccountSwitcher";
+import { Settings } from "lucide-react";
 import ComposePanel from "./components/ComposePanel";
-import FolderList from "./components/FolderList";
 import MessageList from "./components/MessageList";
 import MessageView from "./components/MessageView";
 import SearchPanel, { type SearchHit } from "./components/SearchPanel";
@@ -465,6 +466,17 @@ function App() {
           <h1 className="app-title">Xremail</h1>
           <p className="app-subtitle">本地邮件客户端</p>
         </div>
+        {/* 账户切换在顶栏：切换账户是高频动作，不该藏在设置抽屉里。
+            多个账户时横向排开，当前账户高亮。 */}
+        {accounts !== null && (
+          <div className="topbar-accounts">
+            <AccountSwitcher
+              accounts={accounts}
+              selectedId={accountId}
+              onSelect={(account) => setAccountId(account.id)}
+            />
+          </div>
+        )}
         {info && (
           <dl className="app-info">
             <dt>版本</dt>
@@ -484,7 +496,8 @@ function App() {
             className="settings-toggle"
             data-testid="settings-toggle"
           >
-            ⚙ 账户与设置
+            <Settings size={16} strokeWidth={1.9} />
+            <span className="settings-label">账户与设置</span>
           </button>
         </SheetTrigger>
         <SheetContent
@@ -582,28 +595,13 @@ function App() {
           <div className="mail-layout" data-testid="mail-layout">
             {/* 左栏：账户 + 文件夹 + 写信入口。窄、不怎么变，不随滚动重排。 */}
             <aside className="mail-sidebar">
-              <button
-                type="button"
-                className="compose-launch-button"
-                onClick={() => accountId && setComposeAccountId(accountId)}
-                disabled={!accountId}
-              >
-                写邮件
-              </button>
-
-              <AccountSwitcher
-                accounts={accounts}
-                selectedId={accountId}
-                onSelect={(account) => setAccountId(account.id)}
+              <FolderRail
+                folders={folders}
+                selectedId={folderId}
+                onSelect={(folder) => setFolderId(folder.id)}
+                onCompose={() => accountId && setComposeAccountId(accountId)}
+                composeDisabled={!accountId}
               />
-
-              {accountId && (
-                <FolderList
-                  folders={folders}
-                  selectedId={folderId}
-                  onSelect={(folder) => setFolderId(folder.id)}
-                />
-              )}
             </aside>
 
             {/* 中栏：邮件列表。只渲染摘要，点开正文不重建这一列。 */}

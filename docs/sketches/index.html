@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><title>Xremail UI 草图 · 10 版</title>
+<style>
+  :root { --bg:#f7f8fa; --card:#fff; --ink:#1c1f23; --muted:#6b7280; --line:#e5e7eb; --accent:#2563eb; }
+  *{box-sizing:border-box}
+  body{margin:0;font:14px/1.5 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--ink)}
+  .wrap{max-width:1180px;margin:0 auto;padding:32px 24px 80px}
+  h1{font-size:26px;margin:0 0 4px;letter-spacing:-.02em}
+  .sub{color:var(--muted);margin:0 0 28px}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:22px}
+  .item{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden;display:flex;flex-direction:column}
+  .cap{padding:12px 14px;border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:8px}
+  .num{font-weight:700;color:var(--accent);font-variant-numeric:tabular-nums}
+  .name{font-weight:600}
+  .tag{margin-left:auto;font-size:11px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:1px 8px}
+  .desc{padding:10px 14px;color:var(--muted);font-size:12.5px;border-top:1px solid var(--line);min-height:52px}
+  .frame{background:#eef1f5;padding:10px;flex:1}
+  /* ---- 草图通用零件 ---- */
+  .sk{background:#fff;border-radius:6px;height:100%;display:grid;font-size:9px;color:#94a3b8;overflow:hidden;border:1px solid #dbe1e8}
+  .bar{background:#f1f5f9;border-bottom:1px solid #dbe1e8}
+  .box{border:1px dashed #c3ccd6;border-radius:4px;display:flex;align-items:center;justify-content:center;color:#a8b3c1}
+</style></head><body>
+<div class="wrap">
+  <h1>Xremail UI 草图 · 10 版</h1>
+  <p class="sub">每版只是布局草图（非最终视觉）。选一个方向或组合几版，我再做高保真。</p>
+  <div class="grid">
+
+  <!-- 01 Gmail 经典三栏 -->
+  <div class="item"><div class="cap"><span class="num">01</span><span class="name">Gmail 经典三栏</span><span class="tag">稳妥</span></div>
+    <div class="frame"><div class="sk" style="grid-template-rows:34px 1fr">
+      <div class="bar"></div>
+      <div style="display:grid;grid-template-columns:120px 190px 1fr">
+        <div class="box" style="border-radius:0;border-width:0 1px 0 0">文件夹</div>
+        <div class="box" style="border-radius:0;border-width:0 1px 0 0">邮件列表</div>
+        <div class="box" style="border:0">正文</div>
+      </div></div></div>
+    <div class="desc">顶栏 + 左文件夹 + 中列表 + 右正文。信息密度最高，用户最熟悉。缺点：偏"上一代"。</div></div>
+
+  <!-- 02 顶部胶囊工具条 -->
+  <div class="item"><div class="cap"><span class="num">02</span><span class="name">顶部胶囊工具条</span><span class="tag">现代</span></div>
+    <div class="frame"><div class="sk" style="grid-template-rows:44px 1fr">
+      <div class="bar" style="display:flex;align-items:center;padding:0 10px;gap:6px">
+        <div class="box" style="width:64px;height:22px;border-radius:999px">logo</div>
+        <div class="box" style="flex:1;height:22px;border-radius:999px">搜索</div>
+        <div class="box" style="width:22px;height:22px;border-radius:50%"></div>
+      </div>
+      <div style="display:grid;grid-template-columns:110px 1fr">
+        <div class="box" style="border-radius:0;border-width:0 1px 0 0">文件夹</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr">
+          <div class="box" style="border:0;border-right:1px solid #dbe1e8">列表</div>
+          <div class="box" style="border:0">正文</div>
+        </div>
+      </div></div></div>
+    <div class="desc">搜索与操作全收进顶部胶囊条，留白更多。适合「简洁优先」。</div></div>
+
+  <!-- 03 左侧图标轨 -->
+  <div class="item"><div class="cap"><span class="num">03</span><span class="name">左侧图标轨</span><span class="tag">极简</span></div>
+    <div class="frame"><div class="sk" style="grid-template-columns:48px 150px 1fr">
+      <div class="box" style="border-radius:0;border-width:0 1px 0 0;flex-direction:column;gap:6px">
+        <div style="width:24px;height:24px;border-radius:6px;background:#e2e8f0"></div>
+        <div style="width:20px;height:20px;border-radius:4px;background:#eef2f6"></div>
+        <div style="width:20px;height:20px;border-radius:4px;background:#eef2f6"></div>
+      </div>
+      <div class="box" style="border-radius:0;border-width:0 1px 0 0">列表</div>
+      <div class="box" style="border:0">正文</div>
+    </div></div>
+    <div class="desc">最左边一条 48px 图标轨（收件箱/星标/已发送…），腾出横向空间给正文。</div></div>
+
+  <!-- 04 卡片式 -->
+  <div class="item"><div class="cap"><span class="num">04</span><span class="name">卡片流式</span><span class="tag">通透</span></div>
+    <div class="frame"><div class="sk" style="grid-template-rows:36px 1fr;background:#f6f8fa">
+      <div class="bar"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;padding:8px">
+        <div style="display:flex;flex-direction:column;gap:6px">
+          <div class="box" style="height:44px">邮件 1</div>
+          <div class="box" style="height:44px">邮件 2</div>
+          <div class="box" style="height:44px">邮件 3</div>
+        </div>
+        <div class="box" style="border:1px solid #dbe1e8;border-radius:8px">正文（卡片）</div>
+      </div></div></div>
+    <div class="desc">列表项之间留缝、圆角独立，视觉更轻。信息密度低，适合日常少量邮件。</div></div>
+
+  <!-- 05 阅读优先 -->
+  <div class="item"><div class="cap"><span class="num">05</span><span class="name">阅读优先（浮层列表）</span><span class="tag">沉浸</span></div>
+    <div class="frame"><div class="sk" style="grid-template-rows:32px 1fr">
+      <div class="bar"></div>
+      <div style="position:relative">
+        <div class="box" style="border:0;position:absolute;inset:0">正文铺满</div>
+        <div class="box" style="position:absolute;left:8px;top:8px;bottom:8px;width:120px;background:#fff;box-shadow:0 2px 10px rgba(0,0,0,.08)">列表浮层</div>
+      </div></div></div>
+    <div class="desc">正文占满主区，列表作为可收起的浮层。读长邮件最舒服。</div></div>
+
+  <!-- 06 分栏可拖拽 -->
+  <div class="item"><div class="cap"><span class="num">06</span><span class="name">分栏 + 可拖拽</span><span class="tag">专业</span></div>
+    <div class="frame"><div class="sk" style="grid-template-rows:34px 1fr">
+      <div class="bar"></div>
+      <div style="display:grid;grid-template-columns:100px 6px 1fr 6px 1.2fr">
+        <div class="box" style="border:0;border-right:1px solid #dbe1e8">文件夹</div>
+        <div style="background:#cbd5e1"></div>
+        <div class="box" style="border:0">列表</div>
+        <div style="background:#cbd5e1"></div>
+        <div class="box" style="border:0">正文</div>
+      </div></div></div>
+    <div class="desc">栏宽可拖动（灰色分隔条）。重度用户喜欢，但要处理好拖拽手感。</div></div>
+
+  <!-- 07 双栏 -->
+  <div class="item"><div class="cap"><span class="num">07</span><span class="name">双栏（合并文件夹）</span><span class="tag">简洁</span></div>
+    <div class="frame"><div class="sk" style="grid-template-rows:34px 1fr">
+      <div class="bar" style="display:flex;align-items:center;padding:0 10px;gap:6px">
+        <div class="box" style="width:80px;height:20px">文件夹 ▾</div>
+        <div class="box" style="flex:1;height:20px">搜索</div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1.3fr">
+        <div class="box" style="border:0;border-right:1px solid #dbe1e8">列表</div>
+        <div class="box" style="border:0">正文</div>
+      </div></div></div>
+    <div class="desc">文件夹收进顶栏下拉，只剩「列表 + 正文」两栏。屏幕利用率高，窄屏友好。</div></div>
+
+  <!-- 08 底部同步条 -->
+  <div class="item"><div class="cap"><span class="num">08</span><span class="name">三栏 + 底部状态条</span><span class="tag">信息</span></div>
+    <div class="frame"><div class="sk" style="grid-template-rows:34px 1fr 22px">
+      <div class="bar"></div>
+      <div style="display:grid;grid-template-columns:110px 1fr 1.3fr">
+        <div class="box" style="border:0;border-right:1px solid #dbe1e8">文件夹</div>
+        <div class="box" style="border:0;border-right:1px solid #dbe1e8">列表</div>
+        <div class="box" style="border:0">正文</div>
+      </div>
+      <div class="bar" style="border-top:1px solid #dbe1e8;border-bottom:0;display:flex;align-items:center;padding:0 8px;font-size:8px">上次同步 2 分钟前 · 已连接</div>
+    </div></div>
+    <div class="desc">三栏基础上加一条底部状态栏（同步状态、连接状态、错误提示），信息透明。</div></div>
+
+  <!-- 09 命令面板 -->
+  <div class="item"><div class="cap"><span class="num">09</span><span class="name">命令面板优先</span><span class="tag">高效</span></div>
+    <div class="frame"><div class="sk" style="grid-template-rows:34px 1fr">
+      <div class="bar"></div>
+      <div style="position:relative">
+        <div class="box" style="border:0;position:absolute;inset:0">列表 / 正文</div>
+        <div style="position:absolute;inset:14px 40px auto;height:80px;background:#fff;border:1px solid #cbd5e1;border-radius:8px;box-shadow:0 10px 30px rgba(0,0,0,.15);display:flex;align-items:center;padding:0 10px;color:#94a3b8">⌘K 搜索邮件、跳转、写邮件…</div>
+      </div></div></div>
+    <div class="desc">主体不显示搜索框，按 ⌘K 弹命令面板。键盘党最爱，学习成本略高。</div></div>
+
+  <!-- 10 分屏邮件 -->
+  <div class="item"><div class="cap"><span class="num">10</span><span class="name">分屏（对话式）</span><span class="tag">新颖</span></div>
+    <div class="frame"><div class="sk" style="grid-template-rows:30px 1fr">
+      <div class="bar"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:0">
+        <div class="box" style="border:0;border-right:1px solid #dbe1e8;flex-direction:column;gap:4px;padding:6px">
+          <div class="box" style="height:26px;width:100%">邮件 A</div>
+          <div class="box" style="height:26px;width:100%">邮件 B</div>
+        </div>
+        <div class="box" style="border:0;flex-direction:column;gap:4px;padding:6px;align-items:stretch">
+          <div class="box" style="height:40px">正文 A 上</div>
+          <div class="box" style="height:40px">引用/回复</div>
+        </div>
+      </div></div></div>
+    <div class="desc">像聊天软件：左边消息流、右边上下文。适合快速连续回复，但对长邮件不友好。</div></div>
+
+  </div>
+</div></body></html>

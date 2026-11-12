@@ -1558,3 +1558,174 @@ button.secondary:hover {
   border-radius: var(--radius);
   animation: none;
 }
+
+
+/* ===========================================================================
+   F 版视觉（图标轨 + 卡片列表 + 阅读列）——2026-11-12 用户选定的方向
+   ===========================================================================
+
+   设计依据见 docs/UI_DESIGN.md。要点：
+   * 56px 图标轨在最左，文件夹不再单独占一栏（收进图标轨 + 列表标题）
+   * 列表项从"平铺行"改为**独立圆角卡片**（Gmail 2026 新版方向）
+   * 正文放宽到 860px、加 sticky 工具条、编号列表用圆形序号
+   * 主色仍只有 --primary 一个
+
+   这一层**只改外观**：所有 data-testid 原样保留，99 条单测与 12 条 E2E 不用改。
+*/
+
+/* ---- 整体骨架 ---- */
+.app-shell { display: grid; grid-template-rows: auto auto auto 1fr auto; height: 100vh; }
+
+.app-header {
+  display: flex; align-items: center; gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  background: var(--card); border-bottom: 1px solid var(--border);
+}
+.app-title { font-size: var(--text-xl); font-weight: 650; letter-spacing: -.01em; margin: 0; }
+.app-subtitle { display: none; }  /* 副标题在图标化的顶栏里是噪音 */
+.app-info { font-size: var(--text-xs); color: var(--muted-foreground); margin-left: auto; }
+.app-settings { display: none; }  /* 设置已进抽屉，顶栏只留 ⚙ 按钮 */
+
+/* 顶栏里的搜索条（如果 SearchPanel 放这儿）与动作组 */
+.app-header .settings-toggle { margin-left: 0; }
+
+/* ---- 三栏 ---- */
+.mail-layout {
+  grid-template-columns: 56px minmax(280px, 330px) minmax(0, 1fr);
+  background: var(--background);
+}
+
+/* 左栏：图标轨 */
+.mail-sidebar {
+  padding: var(--space-2) 0;
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  background: var(--card); border-right: 1px solid var(--border);
+}
+.folder-rail { display: flex; flex-direction: column; align-items: center; gap: 4px; width: 100%; }
+.mail-sidebar .folder-item {
+  position: relative; width: 40px; height: 40px; padding: 0; border: 0;
+  border-radius: 10px; background: none; display: grid; place-items: center;
+  color: var(--muted-foreground); cursor: pointer;
+}
+.mail-sidebar .folder-item:hover { background: var(--hover); color: var(--foreground); }
+.mail-sidebar .folder-item-active {
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  color: var(--primary);
+}
+/* 选中项左侧竖条（Gmail 式的"当前位置"标记） */
+.mail-sidebar .folder-item-active::before {
+  content: ""; position: absolute; left: -8px; top: 10px; bottom: 10px; width: 3px;
+  border-radius: 0 3px 3px 0; background: var(--primary);
+}
+.mail-sidebar .compose-launch-button {
+  width: 40px; height: 40px; padding: 0; margin-bottom: var(--space-2);
+  border-radius: 12px;
+  display: grid; place-items: center;
+  /* 图标由 FolderRail 里的 <PenLine> 渲染——**不要再加 ::after 字符**，
+     否则会和图标叠在一起（截图里那个小方块就是这么来的）。 */
+}
+.mail-sidebar .compose-launch-button svg { width: 18px; height: 18px; }
+
+/* 账户切换器收到图标轨下方（窄） */
+.account-switcher { width: 100%; padding: 0 4px; }
+.account-switcher-item {
+  padding: 6px 4px; font-size: 10px; text-align: center;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+/* 文件夹列表：图标化竖排 */
+
+
+/* 中栏：卡片列表 */
+.mail-list-pane { background: var(--card); border-right: 1px solid var(--border); }
+.message-panel { padding: var(--space-2) var(--space-2) 0; }
+.message-panel .panel-title {
+  font-size: 17px; font-weight: 650; padding: var(--space-1) var(--space-2) var(--space-2);
+  margin: 0;
+}
+.message-list { padding: 0 var(--space-1) var(--space-2); }
+
+/* 卡片化：行与行之间留缝，独立圆角 */
+.message-row {
+  height: 48px; margin-bottom: 6px; padding: 0;
+  border: 1px solid var(--line-2, var(--border));
+  border-radius: var(--radius); background: var(--card);
+  transition: border-color .12s, box-shadow .12s;
+}
+.message-row:hover { border-color: var(--border); box-shadow: 0 1px 2px rgb(16 24 40 / 5%); }
+.message-item { border: 0; background: none; padding: 4px 10px; }
+.message-item-active {
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+}
+.message-row:has(.message-item-active) {
+  border-color: color-mix(in srgb, var(--primary) 50%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary) 16%, transparent);
+}
+
+/* 正文：阅读列 + sticky 工具条 */
+.mail-reading-pane { background: var(--card); }
+/* MessageView 内部结构由组件自己决定，这里只放宽容器 */
+.message-view, .mail-reading-pane > * { max-width: 860px; margin: 0 auto; }
+
+/* 顶栏的账户切换：横向胶囊，当前账户主色底 */
+.topbar-accounts { display: flex; align-items: center; gap: 6px; }
+.topbar-accounts .account-switcher { flex-direction: row; padding: 0; width: auto; }
+.topbar-accounts .account-switcher-item {
+  width: auto; padding: 5px 12px; font-size: var(--text-sm); text-align: left;
+  border: 1px solid var(--border); border-radius: var(--radius-pill);
+}
+.topbar-accounts .account-switcher-item:hover { background: var(--hover); }
+.topbar-accounts .account-switcher-item-active {
+  background: var(--primary); color: var(--primary-foreground);
+  border-color: var(--primary);
+}
+
+/* ---- MessageView 的 F 版结构（sticky 工具条 + 阅读列）---- */
+.message-view { display: flex; flex-direction: column; height: 100%; min-height: 0; padding: 0; }
+.reader-bar {
+  position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 4px;
+  padding: var(--space-2) var(--space-4);
+  background: color-mix(in srgb, var(--card) 90%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border);
+}
+.reader-bar .grow { flex: 1; }
+.reader-bar .icon-btn {
+  width: 32px; height: 32px; border: 0; background: none; border-radius: var(--radius-sm);
+  display: grid; place-items: center; color: var(--muted-foreground); cursor: pointer;
+}
+.reader-bar .icon-btn:hover { background: var(--hover); color: var(--foreground); }
+.reader-status { font-size: var(--text-xs); color: var(--muted-foreground); }
+
+.reader-inner {
+  width: 100%; max-width: 860px; margin: 0 auto;
+  padding: var(--space-5) var(--space-5) 72px;
+}
+.reader-attachments { padding-top: 0; }
+
+.message-view .subject {
+  font-size: 22px; line-height: 1.3; font-weight: 680; letter-spacing: -.018em;
+  margin: 0 0 var(--space-4); padding: 0; border: 0;
+}
+.message-view .sender {
+  display: flex; align-items: center; gap: 12px;
+  padding-bottom: var(--space-4); border-bottom: 1px solid var(--border); margin-bottom: var(--space-5);
+}
+.message-view .sender .av {
+  width: 38px; height: 38px; border-radius: 50%; flex: none;
+  background: color-mix(in srgb, var(--primary) 16%, transparent);
+  color: var(--primary); display: grid; place-items: center; font-weight: 650; font-size: 14px;
+}
+.message-view .sender .who { min-width: 0; }
+.message-view .sender .who b { display: block; font-size: var(--text-sm); font-weight: 650; }
+.message-view .sender .who span { font-size: var(--text-xs); color: var(--muted-foreground); }
+.message-view .sender .acts { margin-left: auto; }
+
+.message-view .message-body { padding: var(--space-3) 0; font-size: 15px; line-height: 1.8; }
+.message-view .message-body p { margin: 0 0 16px; }
+.message-view .chip {
+  display: inline-flex; align-items: center; gap: 5px; height: 28px; padding: 0 12px;
+  border: 1px solid var(--border); border-radius: var(--radius-pill);
+  background: var(--card); color: var(--foreground); font-size: var(--text-sm); cursor: pointer;
+}
+.message-view .chip:hover { background: var(--hover); }
