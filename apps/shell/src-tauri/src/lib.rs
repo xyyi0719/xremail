@@ -71,6 +71,28 @@ pub fn run() {
 
     builder
         .setup(|app| {
+            // **必须最先初始化 Android Keystore 的凭据构建器**。
+            //
+            // `keyring::Entry` 默认用 keyring 自带的构建器，那不是 Android 的——
+            // 在 Android 上直接 `Entry::new` 会走一条永不成功的路径。`android-keyring`
+            // 提供 `set_android_keyring_credential_builder()` 把默认构建器换成
+            // JNI → Android Keystore 的实现。**只调一次，且必须在任何凭据读写之前**。
+            //
+            // 这里漏了会怎样（2026-11-12 模拟器实测得到的教训）：
+            // `save_credential` 报成功（因为 store 的 set 走了别的路径返回 Ok）、
+            // 账户 `secret_ref` 也写进了库，但 `sync_account` 从钥匙串**取不到**，
+            // 报「这个账户还没保存授权码」——存进去的和读出来的不是同一个地方。
+            #[cfg(target_os = "android")]
+            {
+                if let Err(error) = android_keyring::set_android_keyring_credential_builder() {
+                    // 初始化失败不该让应用起不来，但**必须留痕**：
+                    // 之后每个凭据操作都会失败，日志是唯一线索。
+                    tracing::error!(%error, "Android Keystore 构建器初始化失败，凭据将无法存取");
+                } else {
+                    tracing::info!("Android Keystore 构建器已就绪");
+                }
+            }
+
             let state = init_storage(app.handle())?;
             // 启动后台同步：把「有授权码的账户」交给调度器。
             //
