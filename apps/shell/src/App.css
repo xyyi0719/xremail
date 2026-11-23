@@ -17,9 +17,9 @@ body {
 
 .app-header {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 1rem;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
 }
 
@@ -32,33 +32,6 @@ body {
 .app-subtitle {
   margin-top: 0.25rem;
   opacity: 0.7;
-}
-
-.app-info {
-  display: grid;
-  grid-template-columns: max-content minmax(0, 1fr);
-  gap: 0.25rem 1rem;
-  margin: 0;
-  padding: 0.75rem 1rem;
-  border: 1px solid color-mix(in srgb, currentColor 15%, transparent);
-  border-radius: 0.75rem;
-  font-size: 0.875rem;
-}
-
-.app-info dt {
-  opacity: 0.65;
-}
-
-.app-info dd {
-  margin: 0;
-  font-variant-numeric: tabular-nums;
-}
-
-.app-info-path {
-  max-width: 22rem;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .app-error {
@@ -1583,11 +1556,11 @@ button.secondary:hover {
 }
 .app-title { font-size: var(--text-xl); font-weight: 650; letter-spacing: -.01em; margin: 0; }
 .app-subtitle { display: none; }  /* 副标题在图标化的顶栏里是噪音 */
-.app-info { font-size: var(--text-xs); color: var(--muted-foreground); margin-left: auto; }
 .app-settings { display: none; }  /* 设置已进抽屉，顶栏只留 ⚙ 按钮 */
 
 /* 顶栏里的搜索条（如果 SearchPanel 放这儿）与动作组 */
-.app-header .settings-toggle { margin-left: 0; }
+/* 设置按钮贴右：吃掉剩余空间。 */
+.app-header .settings-toggle { margin-left: auto; }
 
 /* ---- 三栏 ---- */
 .mail-layout {
@@ -1669,6 +1642,8 @@ button.secondary:hover {
 
 /* 顶栏的账户切换：横向胶囊，当前账户主色底 */
 .topbar-accounts { display: flex; align-items: center; gap: 6px; }
+/* 顶栏顺序：标题 · 账户 · [弹性] · 设置。设置按钮吃掉剩余空间实现右对齐。 */
+.settings-toggle { margin-left: auto; }
 .topbar-accounts .account-switcher { flex-direction: row; padding: 0; width: auto; }
 .topbar-accounts .account-switcher-item {
   width: auto; padding: 5px 12px; font-size: var(--text-sm); text-align: left;
@@ -1750,7 +1725,6 @@ button.secondary:hover {
 
   /* 顶栏压缩：版本/数据目录那堆信息在手机上没价值 */
   .app-header { padding: var(--space-2) var(--space-3); gap: var(--space-2); }
-  .app-info { display: none; }
   .topbar-accounts .account-switcher-item { max-width: 8rem; }
 
   .mail-layout {
@@ -1781,6 +1755,9 @@ button.secondary:hover {
   .message-view .message-body { font-size: 16px; line-height: 1.85; }
 
   /* 正文工具条：贴顶、按钮放大到可点 */
+  /* 发件人行在窄屏换行：否则「标记为已读」按钮贴到右边缘还没留白。 */
+  .message-view .sender { flex-wrap: wrap; }
+  .message-view .sender .acts { margin-left: 0; width: 100%; }
   .reader-bar { padding: var(--space-2) var(--space-3); }
   .reader-bar .icon-btn { width: 40px; height: 40px; }
 
@@ -1828,3 +1805,112 @@ button.secondary:hover {
 .vault-ok { background: color-mix(in srgb, #15803d 10%, transparent); color: #15803d; }
 .vault-warn { background: color-mix(in srgb, #b45309 10%, transparent); color: #b45309; }
 .vault-err { background: color-mix(in srgb, var(--danger) 10%, transparent); color: var(--danger); }
+
+/* ===========================================================================
+   Taste 审计修正（2026-11-23）
+   ===========================================================================
+
+   按 taste-skill 的检查清单在 1440/1024/768/390 四档下审出三个结构性缺陷，
+   这一层只修它们，不动已有的视觉系统（token / 组件类都不改）：
+
+   1. `empty-area`：不选邮件时右侧整片空白 → 给空态占位（见 App.tsx）。
+   2. `empty-area`/`section-air`：列表栏在宽屏下太窄（280-330px），右侧空成一片
+      → 列表栏给到随屏宽增长的合理上限，正文区最少占到 45%。
+   3. `section-gaps`：列表卡片间距与面板内边距在宽屏下显得松散 → 收紧。
+*/
+
+/* 1. 三栏比例：图标轨窄、列表随屏增长、正文吃满剩余。 */
+@media (min-width: 1000px) {
+  .mail-layout {
+    grid-template-columns: 56px clamp(300px, 28vw, 420px) minmax(0, 1fr);
+  }
+}
+
+/* 2. 空态占位：居中、克制，不喧宾夺主。 */
+.reading-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: var(--space-2);
+  color: var(--muted-foreground);
+  text-align: center;
+  padding: var(--space-6);
+}
+.reading-empty svg { opacity: .35; }
+.reading-empty-title {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: 600;
+  color: var(--foreground);
+}
+.reading-empty-hint {
+  margin: 0;
+  font-size: var(--text-sm);
+  max-width: 34ch;
+  line-height: 1.6;
+}
+.reading-empty-hint kbd {
+  font: 11px/1 ui-monospace, monospace;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--muted);
+}
+
+/* 3. 列表卡片：宽屏下别拉得太长，内容与边框贴紧。 */
+@media (min-width: 1000px) {
+  .message-list { padding: 0 var(--space-2) var(--space-3); }
+  .message-row { margin-bottom: 5px; }
+}
+
+/* 状态栏：常驻底部，低调。 */
+.app-shell { grid-template-rows: auto 1fr auto !important; }
+.app-statusbar {
+  display: flex; align-items: center; gap: 6px;
+  padding: 4px var(--space-4);
+  font-size: 11px; color: var(--muted-foreground);
+  border-top: 1px solid var(--border); background: var(--card);
+  justify-content: flex-end;
+}
+.app-statusbar-sep { opacity: .5; }
+
+/* ===========================================================================
+   入场动画（纯 CSS，不用 GSAP）
+   ===========================================================================
+
+   ## 为什么最终没用 GSAP
+
+   试用过 GSAP（taste/GSAP skill 都推荐）。但它给产物加了 **+28KB gzip**
+   （112→140KB），只为 3 个淡入效果——而本项目对首屏速度敏感（用户明确要求
+   「页面要快」）。同样的效果用 CSS `@keyframes` 是 **0 字节**。
+   ponytail 第 4 条：不要为几行代码引入依赖。
+
+   ## 做了什么
+
+   1. 邮件列表卡片：入场依次上移淡入（`animation-delay` 做 stagger）。
+   2. 正文：切换时淡入。
+   3. **`prefers-reduced-motion` 下全部静止**（可访问性底线，taste 与 GSAP 都要求）。
+*/
+@keyframes xr-rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+.message-row { animation: none; }
+
+/* 正文入场：**短、且不用 `both` 填充**。
+   用 `both` 会让正文在动画期间保持 opacity:0，切邮件时正文"迟迟不出现"，
+   实测把切邮件最慢耗时从 111ms 拖到 468ms（性能用例抓到的真回归）。
+   去掉 fill 后元素一开始就是最终状态的可交互元素，动画只是视觉糖。 */
+.message-view .reader-inner { animation: xr-rise 0.16s ease-out; }
+
+/* 列表只在**首次挂载**时整体淡入一次。不挂在每一行上：
+   行级动画会在每次切换选中时重播，让刚渲染的卡片短暂不可见，
+   实测把切邮件最慢耗时从 105ms 拖到 463ms（性能用例抓到的真回归）。 */
+.message-list { animation: xr-fade 0.3s ease-out; }
+@keyframes xr-fade { from { opacity: 0; } to { opacity: 1; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .message-list, .message-view .reader-inner { animation: none; }
+}

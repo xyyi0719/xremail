@@ -210,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn ciphertext_does_not_contain_plaintext_secret() {
+    fn ciphertext_has_correct_length_and_is_not_plaintext() {
         let payload = sample();
         let sealed = seal_payload(&payload, b"pw-123456789", KdfParams::DEFAULT).unwrap();
         // 授权码绝不能以明文出现在密文里。
@@ -222,6 +222,18 @@ mod tests {
         // 邮箱地址同理（避免整份配置可被字符串搜索出来）。
         let email = b"a@163.com";
         assert!(!sealed.windows(email.len()).any(|w| w == email));
+
+        // 更强的结构性断言：密文 = header + (明文长度 + 16 字节 tag)。
+        // 否则"密文里没有明文"可能只是因为明文被截断了。
+        // 密文必须**严格长于**明文：至少多出认证标签(16) + 头部开销。
+        // 若长度反而变短，说明加密根本没生效（比如只是 base64 换了层皮）。
+        let plain = payload.to_plaintext().unwrap();
+        assert!(
+            sealed.len() >= plain.len() + 16,
+            "密文({})应比明文({})至少多 16 字节认证标签",
+            sealed.len(),
+            plain.len()
+        );
     }
 
     #[test]
@@ -242,6 +254,20 @@ mod tests {
             open_payload(&sealed, b"pw"),
             Err(VaultError::Open)
         ));
+    }
+
+    #[test]
+    fn tampered_header_is_rejected() {
+        // 翻转 salt 区域的一个字节（在认证头内、不在 tag 里）——
+        // 验证 AAD 覆盖了头部，而不只是密文尾部。
+        let mut sealed = seal_payload(&sample(), b"pw", KdfParams::DEFAULT).unwrap();
+        // header 布局：magic(4) + version(1) + kdf(1) + 4×u32 参数(16) = 22 字节后是 salt。
+        // salt 起始约在 22，翻一个字节应导致解密失败（AAD/salt 变了）。
+        sealed[24] ^= 0xFF;
+        assert!(
+            matches!(open_payload(&sealed, b"pw"), Err(VaultError::Open)),
+            "头部被篡改后必须解密失败"
+        );
     }
 
     #[test]

@@ -21,6 +21,8 @@
 //! 用 HTTP Basic（坚果云要求）。**必须在 HTTPS 之上**——本模块拒绝非 `https://`
 //! 的地址，避免把应用密码以明文 Basic 头发出去。
 
+use std::time::Duration;
+
 use ureq::Agent;
 
 /// WebDAV 连接参数。
@@ -87,7 +89,11 @@ impl WebDavClient {
             format!("{base}{dir}/")
         };
 
-        let agent: Agent = Agent::config_builder().build().into();
+        // 显式超时：ureq 3 默认没有任何超时，服务端挂起会永久阻塞 spawn_blocking 线程。
+        let agent: Agent = Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(30)))
+            .build()
+            .into();
 
         Ok(Self {
             config,
@@ -105,28 +111,29 @@ impl WebDavClient {
         format!("{}:{}", self.config.username, self.config.app_password)
     }
 
-    /// 确保远端目录存在（MKCOL）。已存在（405）视为成功。
+    /// 确保远端目录存在。
+    ///
+    /// **必须用 WebDAV 的 `MKCOL` 方法**——`PUT` 到一个目录 URL 不会建目录
+    /// （那只是"上传一个同名文件"，会失败或造出一个文件而非目录）。
+    /// 已存在时服务端返回 `405 Method Not Allowed`，视为成功。
     pub fn ensure_dir(&self) -> Result<(), WebDavError> {
         if self.config.remote_dir.trim_matches('/').is_empty() {
             return Ok(());
         }
-        let resp = self
-            .agent
-            .put(&self.dir_url)
-            .header("Authorization", &self.basic_header())
-            .send_empty();
-        match resp {
+        let request = ureq::http::Request::builder()
+            .method(ureq::http::Method::from_bytes(b"MKCOL").expect("MKCOL 是合法方法名"))
+            .uri(&self.dir_url)
+            .header("Authorization", self.basic_header())
+            .body(())
+            .map_err(|e| WebDavError::Config(format!("构造 MKCOL 请求失败：{e}")))?;
+        match self.agent.run(request) {
             Ok(_) => Ok(()),
-            Err(ureq::Error::StatusCode(405)) => Ok(()), // 已存在
+            Err(ureq::Error::StatusCode(405)) => Ok(()), // 目录已存在
             Err(ureq::Error::StatusCode(401)) => Err(WebDavError::Unauthorized),
-            Err(ureq::Error::StatusCode(code)) => {
-                // 有些服务端对 MKCOL 用 409（父目录不存在）或 301。
-                // 目录级操作失败不该直接放弃：真正的 PUT 会再暴露问题。
-                Err(WebDavError::Status {
-                    status: code,
-                    detail: format!("建目录 {}", self.dir_url),
-                })
-            }
+            Err(ureq::Error::StatusCode(code)) => Err(WebDavError::Status {
+                status: code,
+                detail: format!("建目录 {}", self.dir_url),
+            }),
             Err(e) => Err(WebDavError::Transport(e.to_string())),
         }
     }

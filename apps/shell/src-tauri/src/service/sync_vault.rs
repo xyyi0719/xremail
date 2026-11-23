@@ -91,7 +91,11 @@ impl SyncVaultService {
         let mut vault_accounts = Vec::with_capacity(accounts.len());
         for account in &accounts {
             let credential = match self.credentials.resolve_credential(account).await? {
-                Some(secret) => String::from_utf8_lossy(secret.as_bytes()).to_string(),
+                // 用 as_str() 无损取（SecretValue 保证是合法 UTF-8）；
+                // 不用 from_utf8_lossy——它在非法字节时会静默替换、改坏授权码。
+                Some(secret) => secret.as_str().map(str::to_string).ok_or_else(|| {
+                    AppError::Invalid(format!("账户 {} 的授权码不是合法文本", account.email))
+                })?,
                 None => {
                     // 没有授权码：跳过。**不报错**——用户可能有些账户就是不想同步。
                     tracing::debug!(account = %account.email, "无授权码，跳过同步该账户");
@@ -124,7 +128,7 @@ impl SyncVaultService {
         })
         .await
         .map_err(|e| AppError::Storage(format!("上传任务失败：{e}")))?
-        .map_err(|e| AppError::Storage(e.to_string()))?;
+        .map_err(map_webdav_error)?;
 
         Ok(UploadSummary {
             account_count: vault_accounts.len(),
@@ -152,7 +156,7 @@ impl SyncVaultService {
         )
         .await
         .map_err(|e| AppError::Storage(format!("下载任务失败：{e}")))?
-        .map_err(|e| AppError::Storage(e.to_string()))?;
+        .map_err(map_webdav_error)?;
 
         let Some(ciphertext) = ciphertext else {
             return Err(AppError::Invalid(
@@ -170,24 +174,42 @@ impl SyncVaultService {
         )?;
 
         let existing = self.accounts.list().await?;
-        let existing_emails: Vec<String> = existing.iter().map(|a| a.email.clone()).collect();
+        // 用 HashSet 并**在循环内持续加入**：既挡住"本机已有"，也挡住
+        // "载荷内部同邮箱多条"（多设备合并会产生重复）。大小写不敏感。
+        let mut seen_emails: std::collections::HashSet<String> =
+            existing.iter().map(|a| a.email.to_lowercase()).collect();
 
         let mut imported = 0usize;
         let mut skipped_existing = Vec::new();
         let mut without_credential = Vec::new();
+        // 收集"建好了但没导全"的错误，**不提前中断**——已经建成的账户不回滚，
+        // 报了错也没法让它"没发生"，所以如实把失败汇总返回，比半途 `?` 好。
+        let mut failed: Vec<String> = Vec::new();
 
         for vault_account in &payload.accounts {
-            // 本机已有同邮箱 → 跳过（不覆盖用户本机配置）。
-            if existing_emails
-                .iter()
-                .any(|e| e.eq_ignore_ascii_case(&vault_account.email))
-            {
+            // 本机已有 / 本批已导入过同邮箱 → 跳过（不覆盖、不重复）。
+            if !seen_emails.insert(vault_account.email.to_lowercase()) {
                 skipped_existing.push(vault_account.email.clone());
                 continue;
             }
 
-            let request = vault_to_new_account_request(vault_account)?;
-            let created = self.accounts.create(request).await?;
+            let request = match vault_to_new_account_request(vault_account) {
+                Ok(r) => r,
+                Err(error) => {
+                    // 载荷字段坏了：记下、跳过，别让一个坏账户拦住其余账户。
+                    tracing::warn!(account = %vault_account.email, %error, "载荷中的账户无法转换");
+                    failed.push(vault_account.email.clone());
+                    continue;
+                }
+            };
+            let created = match self.accounts.create(request).await {
+                Ok(c) => c,
+                Err(error) => {
+                    tracing::warn!(account = %vault_account.email, %error, "导入账户失败");
+                    failed.push(vault_account.email.clone());
+                    continue;
+                }
+            };
             imported += 1;
 
             // 把授权码写进本机钥匙串。写不进去**不阻断**：账户已经建好，
@@ -209,6 +231,11 @@ impl SyncVaultService {
         }
 
         let _ = now_ms;
+        for email in &failed {
+            if !without_credential.contains(email) {
+                without_credential.push(email.clone());
+            }
+        }
         Ok(ImportSummary {
             imported,
             skipped_existing,
@@ -221,7 +248,7 @@ impl SyncVaultService {
 fn to_vault_account(account: &Account, credential: String) -> VaultAccount {
     VaultAccount {
         email: account.email.clone(),
-        provider: provider_to_str(account.provider).to_string(),
+        provider: provider_to_str(account.provider),
         display_name: account.display_name.clone(),
         imap_host: account.server.imap_host.clone(),
         imap_port: account.server.imap_port,
@@ -261,19 +288,21 @@ fn vault_to_new_account_request(
 
 // ---- 枚举 ↔ 字符串（与 core 的 serde 表现保持一致）----
 
-fn provider_to_str(p: ProviderKind) -> &'static str {
-    match serde_json::to_value(p)
+fn provider_to_str(p: ProviderKind) -> String {
+    serde_json::to_value(p)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
-    {
-        Some(s) => Box::leak(s.into_boxed_str()),
-        None => "generic",
-    }
+        .unwrap_or_else(|| "generic".to_string())
 }
 
 fn provider_from_str(s: &str) -> ProviderKind {
-    serde_json::from_value(serde_json::Value::String(s.to_string()))
-        .unwrap_or(ProviderKind::Generic)
+    match serde_json::from_value(serde_json::Value::String(s.to_string())) {
+        Ok(p) => p,
+        Err(_) => {
+            tracing::warn!(provider = s, "未知的 provider 值，回退为自定义 IMAP");
+            ProviderKind::Generic
+        }
+    }
 }
 
 fn tls_to_str(t: TlsMode) -> &'static str {
@@ -321,5 +350,18 @@ fn sync_mode_from_str(s: &str) -> SyncMode {
     match s {
         "idle" => SyncMode::Idle,
         _ => SyncMode::Poll,
+    }
+}
+
+/// 把 WebDAV 错误映射成**语义化**的 AppError——用户能据此判断该改密码还是重试。
+fn map_webdav_error(error: xremail_vault::webdav::WebDavError) -> AppError {
+    use xremail_vault::webdav::WebDavError as W;
+    match error {
+        W::Unauthorized => AppError::Invalid(
+            "坚果云认证失败：请检查账号与「应用密码」是否正确（不是登录密码）".into(),
+        ),
+        W::Config(msg) => AppError::Invalid(msg),
+        W::Transport(msg) => AppError::Storage(format!("网络错误：{msg}")),
+        W::Status { status, detail } => AppError::Storage(format!("服务端返回 {status}：{detail}")),
     }
 }

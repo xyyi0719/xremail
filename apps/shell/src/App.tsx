@@ -2,7 +2,7 @@ import AccountForm from "./components/AccountForm";
 import AccountList from "./components/AccountList";
 import FolderRail from "./components/FolderRail";
 import AccountSwitcher from "./components/AccountSwitcher";
-import { Settings } from "lucide-react";
+import { Settings, Mail } from "lucide-react";
 import ComposePanel from "./components/ComposePanel";
 import MessageList from "./components/MessageList";
 import MessageView from "./components/MessageView";
@@ -478,16 +478,6 @@ function App() {
             />
           </div>
         )}
-        {info && (
-          <dl className="app-info">
-            <dt>版本</dt>
-            <dd>
-              {info.name} {info.version}（{info.platform}）
-            </dd>
-            <dt>数据目录</dt>
-            <dd className="app-info-path">{info.dataDir ?? "—"}</dd>
-          </dl>
-        )}
       {/* 「账户与设置」收进右侧抽屉：设置是低频动作，不该把邮件推走。
           打开时 Sheet 会挂 Portal 并锁列表滚动；关闭即卸载（UI_DESIGN §5.2）。 */}
       <Sheet modal={false} open={settingsOpen} onOpenChange={setSettingsOpen}>
@@ -636,7 +626,7 @@ function App() {
               >
                 ← 返回
               </button>
-              {accountId && folderId && message && (
+              {accountId && folderId && message ? (
                 <MessageView
                   accountId={accountId}
                   folderId={folderId}
@@ -645,6 +635,15 @@ function App() {
                   onError={handleError}
                   onAttachmentError={handleAttachmentError}
                 />
+              ) : (
+                // 空态占位：不选邮件时右侧不是一片空白（taste 的 empty-area）。
+                <div className="reading-empty" data-testid="reading-empty">
+                  <Mail size={40} strokeWidth={1.2} aria-hidden="true" />
+                  <p className="reading-empty-title">选择一封邮件</p>
+                  <p className="reading-empty-hint">
+                    从左侧列表选一封查看正文。按 <kbd>⌘K</kbd> 搜索，<kbd>c</kbd> 写邮件。
+                  </p>
+                </div>
               )}
             </section>
           </div>
@@ -655,6 +654,15 @@ function App() {
               accountEmail={composeAccount.email}
               onClose={() => setComposeAccountId(null)}
             />
+          )}
+          {info && (
+            // 状态栏：版本与平台是「需要时才看」的信息，放底部而不是顶栏。
+            // 数据目录挂在 title 上——排查时悬停可见，正常使用不占视线。
+            <footer className="app-statusbar" title={info.dataDir ?? undefined}>
+              <span>{info.name} {info.version}</span>
+              <span className="app-statusbar-sep">·</span>
+              <span>{info.platform}</span>
+            </footer>
           )}
         </>
       )}

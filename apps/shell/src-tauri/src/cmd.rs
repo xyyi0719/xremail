@@ -1201,7 +1201,9 @@ fn user_error(error: &AppError) -> String {
 // ===========================================================================
 
 /// WebDAV 连接参数（由前端传入，**主密码不在此结构里**）。
-#[derive(Debug, serde::Deserialize)]
+// **不要 derive Debug**：它含明文 `app_password`，一旦有人 `tracing::debug!(?params)`
+// 就会把应用密码写进日志。下面手写一个把敏感字段抹掉的 Debug。
+#[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WebDavParams {
     /// 服务端地址，必须 https。坚果云是 `https://dav.jianguoyun.com/dav/`。
@@ -1216,6 +1218,18 @@ pub struct WebDavParams {
 
 fn default_remote_dir() -> String {
     "xremail".to_string()
+}
+
+impl std::fmt::Debug for WebDavParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 应用密码与主密码以外的字段都安全；密码一律打码。
+        f.debug_struct("WebDavParams")
+            .field("base_url", &self.base_url)
+            .field("username", &self.username)
+            .field("app_password", &"<redacted>")
+            .field("remote_dir", &self.remote_dir)
+            .finish()
+    }
 }
 
 impl WebDavParams {
