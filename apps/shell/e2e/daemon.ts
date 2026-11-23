@@ -114,6 +114,9 @@ export function installDaemon(config: TauriDaemonConfig): void {
     }),
     forget_credential: () => true,
     save_credential: () => undefined,
+    // WebDAV 同步：E2E 不真的连网。上传回一个固定摘要，导入回一个账户。
+    vault_upload: () => ({ accountCount: config.accounts.length, ciphertextBytes: 1024 }),
+    vault_import: () => ({ imported: 1, skippedExisting: [], withoutCredential: [] }),
     create_account: () => ({}),
 
     // ---------------- 写信 ----------------

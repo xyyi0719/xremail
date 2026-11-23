@@ -22,6 +22,7 @@ pub mod message;
 pub mod scheduler;
 pub mod sent_copy;
 pub mod sync;
+pub mod sync_vault;
 
 pub use account::AccountService;
 pub use attachment::{AttachmentDownload, AttachmentService};

@@ -7,6 +7,7 @@ import ComposePanel from "./components/ComposePanel";
 import MessageList from "./components/MessageList";
 import MessageView from "./components/MessageView";
 import SearchPanel, { type SearchHit } from "./components/SearchPanel";
+import VaultSyncPanel from "./components/VaultSyncPanel";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -533,6 +534,7 @@ function App() {
               />
             )}
             <AccountForm onCreated={refresh} />
+            <VaultSyncPanel onImported={refresh} />
             <SearchPanel onOpen={handleOpenHit} onError={handleError} />
           </SheetBody>
         </SheetContent>

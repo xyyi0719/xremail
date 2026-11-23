@@ -13,6 +13,7 @@ members = [
     "crates/xremail-message",
     "crates/xremail-dkim",
     "crates/xremail-diagnostics",
+    "crates/xremail-vault",
     "apps/shell/src-tauri",
 ]
 
@@ -41,6 +42,7 @@ xremail-store = { path = "crates/xremail-store" }
 # 都已就位并有测试，只是还没有调用方。`cargo +nightly clippy` 会报
 # 「unused workspace dependency」——那是**预期**的，不是缺陷。
 xremail-crypto = { path = "crates/xremail-crypto" }
+xremail-vault = { path = "crates/xremail-vault" }
 xremail-api = { path = "crates/xremail-api" }
 xremail-sync = { path = "crates/xremail-sync" }
 xremail-protocol-imap = { path = "crates/xremail-protocol-imap" }
@@ -52,6 +54,10 @@ xremail-testkit = { path = "crates/xremail-testkit" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# WebDAV 同步用的 HTTP 客户端：同步阻塞式，配 tokio::spawn_blocking 使用。
+# 默认走 rustls —— 与项目现有 TLS 栈同一份，不额外拉 OpenSSL。
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 # 字符集解码（UTF-8 / GBK / GB18030 / Big5 / …）。
 encoding_rs = "0.8"
 # MIME 的 base64 传输编码。

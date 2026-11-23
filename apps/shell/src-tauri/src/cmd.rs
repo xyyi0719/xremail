@@ -1195,3 +1195,109 @@ fn user_error(error: &AppError) -> String {
         other => other.to_string(),
     }
 }
+
+// ===========================================================================
+// 账户配置同步（WebDAV + 端到端加密）—— L2/P6 的最小可用子集
+// ===========================================================================
+
+/// WebDAV 连接参数（由前端传入，**主密码不在此结构里**）。
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebDavParams {
+    /// 服务端地址，必须 https。坚果云是 `https://dav.jianguoyun.com/dav/`。
+    pub base_url: String,
+    pub username: String,
+    /// **应用密码**，不是登录密码。
+    pub app_password: String,
+    /// 远端目录，默认 `xremail`。
+    #[serde(default = "default_remote_dir")]
+    pub remote_dir: String,
+}
+
+fn default_remote_dir() -> String {
+    "xremail".to_string()
+}
+
+impl WebDavParams {
+    fn into_config(self) -> xremail_vault::webdav::WebDavConfig {
+        xremail_vault::webdav::WebDavConfig {
+            base_url: self.base_url,
+            username: self.username,
+            app_password: self.app_password,
+            remote_dir: self.remote_dir,
+        }
+    }
+}
+
+/// 上传结果（前端展示用）。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultUploadResult {
+    pub account_count: usize,
+    pub ciphertext_bytes: usize,
+}
+
+/// 把本机全部账户（含授权码）加密后上传到 WebDAV。
+///
+/// * `passphrase`：主密码。**只在本次调用内使用，不落盘、不进日志。**
+/// * 没有授权码的账户会被跳过（同步过去也用不了）。
+#[tauri::command]
+pub async fn vault_upload(
+    state: State<'_, AppState>,
+    params: WebDavParams,
+    passphrase: String,
+) -> Result<VaultUploadResult, String> {
+    let service = crate::service::sync_vault::SyncVaultService::new(state.accounts.clone());
+    let device_id = device_id_for(&state);
+    let summary = service
+        .upload(
+            &params.into_config(),
+            &passphrase,
+            &device_id,
+            current_time_ms(),
+        )
+        .await
+        .map_err(|e| user_error(&e))?;
+    Ok(VaultUploadResult {
+        account_count: summary.account_count,
+        ciphertext_bytes: summary.ciphertext_bytes,
+    })
+}
+
+/// 导入结果。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultImportResult {
+    pub imported: usize,
+    pub skipped_existing: Vec<String>,
+    pub without_credential: Vec<String>,
+}
+
+/// 从 WebDAV 下载并用主密码解密，把账户与授权码导入本机。
+///
+/// 已存在同邮箱的账户会被**跳过**（不覆盖本机配置）。
+#[tauri::command]
+pub async fn vault_import(
+    state: State<'_, AppState>,
+    params: WebDavParams,
+    passphrase: String,
+) -> Result<VaultImportResult, String> {
+    let service = crate::service::sync_vault::SyncVaultService::new(state.accounts.clone());
+    let summary = service
+        .import(&params.into_config(), &passphrase, current_time_ms())
+        .await
+        .map_err(|e| user_error(&e))?;
+    Ok(VaultImportResult {
+        imported: summary.imported,
+        skipped_existing: summary.skipped_existing,
+        without_credential: summary.without_credential,
+    })
+}
+
+/// 设备标识：用数据目录路径的 hash（稳定、不含主机名等敏感信息）。
+fn device_id_for(state: &State<'_, AppState>) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    state.data_dir.hash(&mut h);
+    format!("dev-{:016x}", h.finish())
+}

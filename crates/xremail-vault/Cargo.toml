@@ -1,0 +1,17 @@
+[package]
+name = "xremail-vault"
+description = "Xremail 端到端加密的账户配置同步载荷（L2/P6 的最小可用子集）。"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# 只需要加密封装与序列化：本 crate 不做网络、不碰数据库。
+xremail-crypto = { path = "../xremail-crypto" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ureq = { workspace = true }

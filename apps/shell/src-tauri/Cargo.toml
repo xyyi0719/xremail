@@ -36,6 +36,7 @@ tauri-plugin-dialog = "2"
 xremail-core = { workspace = true }
 xremail-store = { workspace = true }
 xremail-api = { workspace = true }
+xremail-vault = { workspace = true }
 # 同步引擎与 IMAP 协议层。
 xremail-sync = { workspace = true }
 xremail-protocol-imap = { workspace = true }
